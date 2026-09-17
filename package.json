@@ -1,0 +1,37 @@
+{
+  "name": "ganmaoyuan-frontend-shell",
+  "private": true,
+  "version": "0.1.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "test": "vitest run",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "tauri": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-tauri.ps1",
+    "tauri:dev": "tauri dev",
+    "pretauri:build": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-tauri-build.ps1",
+    "tauri:build": "tauri build",
+    "release:diagnostics": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/release-diagnostics.ps1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "7.18.2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/react": "^18.3.23",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "jsdom": "^30.0.1",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.0",
+    "vitest": "^4.1.10"
+  }
+}

@@ -1,0 +1,26 @@
+node_modules
+dist
+.npm-cache
+.DS_Store
+*.log
+*.tsbuildinfo
+
+# Local configuration and private workspace data.
+.env
+.env.*
+!.env.example
+AppData/
+.ganmaoyuan/
+desktop-runtime/
+
+# Rust/Tauri build output and one-off verification artifacts.
+src-tauri/target-context-bridge-verify/
+
+# Generated architecture previews are reproducible and too large for source control.
+docs/archify/
+
+# Never commit local certificates or private keys.
+*.pem
+*.p12
+*.pfx
+*.key

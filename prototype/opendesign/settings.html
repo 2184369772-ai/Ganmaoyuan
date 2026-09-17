@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>感冒院 · 设置</title>
+    <link rel="stylesheet" href="assets/app.css" />
+  </head>
+  <body data-page-id="settings">
+    <section class="main">
+      <header class="titlebar">
+        <div class="titlebar-left">
+          <button class="icon-btn" type="button" data-action="open-side-panel" aria-label="打开菜单">☰</button>
+          <div class="window-dots"><span></span><span></span><span></span></div>
+          <strong class="page-title">设置</strong>
+        </div>
+        <div class="titlebar-right">
+          <button class="btn" type="button" data-action="go-back" data-fallback="workspace-home.html">返回</button>
+          <button class="btn" type="button" data-action="toggle-theme">切换主题</button>
+        </div>
+      </header>
+
+      <main class="content">
+        <section class="settings-layout">
+          <div class="panel">
+            <a class="subnav-link active" href="#">常规</a>
+            <a class="subnav-link" href="#">项目管理</a>
+            <a class="subnav-link" href="#">文件索引</a>
+            <a class="subnav-link" href="#">AI 能力</a>
+            <a class="subnav-link" href="#">隐私与安全</a>
+            <a class="subnav-link" href="#">高级功能</a>
+          </div>
+
+          <div class="panel" data-od-id="settings-panels">
+            <div class="panel-head">
+              <h1 class="section-title">常规</h1>
+              <span class="badge">桌面端优先</span>
+            </div>
+
+            <div class="setting-row">
+              <div><strong>启动时打开的页面</strong><div class="soft">默认显示启动页，再继续进入专注工作页。</div></div>
+              <div class="field" style="display:flex;align-items:center;">启动页</div>
+              <div></div>
+            </div>
+
+            <div class="setting-row">
+              <div><strong>默认视图</strong><div class="soft">正式页面仅保留启动页、专注工作页和设置页。</div></div>
+              <div class="field" style="display:flex;align-items:center;">专注工作模式</div>
+              <div></div>
+            </div>
+
+            <div class="setting-row">
+              <div><strong>主题</strong><div class="soft">默认深色模式，浅色模式同样完整可用。</div></div>
+              <div class="field" style="display:flex;align-items:center;"><span data-theme-label>深色模式</span></div>
+              <div><button class="btn" type="button" data-action="toggle-theme">切换</button></div>
+            </div>
+
+            <div class="setting-row">
+              <div><strong>本地数据库位置</strong><div class="soft">项目索引、摘要和状态都保存在本地。</div></div>
+              <div class="field" style="display:flex;align-items:center;">D:\GanMaoYuan\data</div>
+              <div><button class="btn" type="button" data-action="show-toast" data-message="已请求打开本地数据库位置">打开位置</button></div>
+            </div>
+
+            <div class="setting-row">
+              <div><strong>AI 服务提供方</strong><div class="soft">基础文件整理可以离线使用。</div></div>
+              <div class="field" style="display:flex;align-items:center;">OpenAI Compatible</div>
+              <div><button class="btn" type="button" data-action="show-toast" data-message="已开始连接测试">连接测试</button></div>
+            </div>
+
+            <div class="setting-row">
+              <div><strong>隐私与安全</strong><div class="soft">发送前始终确认，可一键关闭全部外部 AI 请求。</div></div>
+              <div class="field" style="display:flex;align-items:center;">始终确认</div>
+              <div><button class="btn" type="button" data-action="show-toast" data-message="已打开最近发送记录">查看记录</button></div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </section>
+
+    <aside class="side-panel" data-side-panel aria-hidden="true" data-od-id="settings-menu-drawer">
+      <div class="panel-head">
+        <div>
+          <span class="eyebrow">菜单</span>
+          <h2>按需打开</h2>
+        </div>
+        <button class="icon-btn" type="button" data-action="close-side-panel" aria-label="关闭菜单">×</button>
+      </div>
+      <nav class="overlay-nav">
+        <a class="nav-link" href="workspace-home.html">启动页</a>
+        <a class="nav-link" href="project-overview.html">专注工作页</a>
+        <button class="nav-link as-button" type="button" data-action="open-utility-drawer" data-utility-kind="switch-project">切换项目</button>
+        <button class="nav-link as-button" type="button" data-action="open-utility-drawer" data-utility-kind="inbox">待整理资料 <span>3</span></button>
+        <button class="nav-link as-button" type="button" data-action="open-utility-drawer" data-utility-kind="library">全部资料</button>
+        <button class="nav-link as-button" type="button" data-action="open-utility-drawer" data-utility-kind="memory">项目记忆</button>
+      </nav>
+    </aside>
+
+    <aside class="utility-drawer" data-utility-drawer aria-hidden="true" data-od-id="settings-utility-drawer">
+      <div class="panel-head">
+        <div>
+          <span class="eyebrow" data-utility-eyebrow>菜单项</span>
+          <h2 data-utility-title>辅助功能</h2>
+        </div>
+        <button class="icon-btn" type="button" data-action="close-utility-drawer" aria-label="关闭抽屉">×</button>
+      </div>
+      <div class="utility-body" data-utility-body></div>
+      <div class="drawer-actions" data-utility-actions></div>
+    </aside>
+
+    <div class="toast" data-toast><span data-toast-text>操作已记录</span></div>
+    <script src="assets/app.js"></script>
+  </body>
+</html>
