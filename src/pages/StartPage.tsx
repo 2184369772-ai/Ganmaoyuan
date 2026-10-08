@@ -44,6 +44,7 @@ export function StartPage() {
   const [searchParams] = useSearchParams();
   const {
     isDesktopReady,
+    isStartupHydrated,
     projects,
     activeProject,
     openProject,
@@ -111,55 +112,25 @@ export function StartPage() {
     }
   }
 
-  async function runContinueFocusAction() {
-    const focus = todayWorkspace?.continueWorkFocus;
-    if (!focus) return;
-    const action = focus.primaryAction;
-    if (action.type === "refreshFacts") {
-      await refreshTodayWorkspace();
-      return;
-    }
-    if (action.type === "openPendingAction" && action.panel === "inbox") {
-      setMode("inbox");
-      return;
-    }
-    const targetRoot = action.projectRoot || projects.find((project) => project.id === focus.projectId)?.rootDir || currentHistoryRoot;
-    if (targetRoot) {
-      setIsBusy(true);
-      try {
-        await openProject(targetRoot);
-        setSidebarOpen(false);
-        const params = new URLSearchParams();
-        if (action.panel) {
-          params.set("panel", action.panel);
-        }
-        if (
-          ["reviewCodexTask", "acceptCodexResult", "inspectProblem"].includes(action.type) &&
-          action.sourceId
-        ) {
-          params.set("taskId", action.sourceId);
-        }
-        if (action.panel === "work-capture" && action.sourceId) {
-          params.set("actionId", action.sourceId);
-        }
-        const query = params.toString();
-        navigate(`/work${query ? `?${query}` : ""}`);
-      } catch (err) {
-        setError(String(err));
-      } finally {
-        setIsBusy(false);
-      }
-      return;
-    }
-    setMode("continue");
-  }
-
   async function runHomepagePrimaryAction() {
     setMode(projects.length ? "continue" : "new");
   }
 
   function homepagePrimaryLabel() {
     return projects.length ? "开始工作" : "新建项目";
+  }
+
+  if (isDesktopReady && !isStartupHydrated) {
+    return (
+      <AppLayout className="start-shell project-start-shell">
+        <section className="page-shell page-shell-home">
+          <div className="start-center project-start-center">
+            <h1>感冒院</h1>
+            <Feedback tone="warning">正在恢复项目状态…</Feedback>
+          </div>
+        </section>
+      </AppLayout>
+    );
   }
 
   async function continueProject() {
@@ -398,7 +369,11 @@ export function StartPage() {
                 <span className="section-label">今天应该做什么</span>
                 <h2>{todayWorkspace?.status === "ready" ? "从真实进度继续" : "先建立项目记录"}</h2>
               </div>
-              <button type="button" className="btn" onClick={() => void refreshTodayWorkspace()}>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => void refreshTodayWorkspace({ refreshFacts: true })}
+              >
                 刷新
               </button>
             </div>
@@ -421,55 +396,7 @@ export function StartPage() {
                 >
                   导入资料
                 </button>
-                <button type="button" className="btn btn-large btn-ghost" onClick={() => navigate("/work?panel=weekly-review")}>
-                  本周复盘
-                </button>
               </div>
-            </div>
-            {todayWorkspace?.continueWorkFocus ? (
-              <section className="continue-work-focus" aria-label="继续工作焦点">
-                <div className="continue-work-focus-main">
-                  <span className="section-label">继续工作</span>
-                  <h3>{todayWorkspace.continueWorkFocus.title}</h3>
-                  <p>{todayWorkspace.continueWorkFocus.summary}</p>
-                  <small>
-                    {todayWorkspace.continueWorkFocus.reason}
-                    {todayWorkspace.continueWorkFocus.evidenceRefs.length
-                      ? ` · 依据 ${todayWorkspace.continueWorkFocus.evidenceRefs.length} 条事实`
-                      : " · 当前证据不足"}
-                  </small>
-                </div>
-                <div className="continue-work-focus-action">
-                  <span className={`focus-freshness focus-freshness-${todayWorkspace.continueWorkFocus.freshnessStatus || "unknown"}`}>
-                    {formatFreshnessStatus(todayWorkspace.continueWorkFocus.freshnessStatus)}
-                  </span>
-                  <button type="button" className="btn" disabled={isBusy} onClick={() => void runContinueFocusAction()}>
-                    {todayWorkspace.continueWorkFocus.primaryAction.label || "处理当前焦点"}
-                  </button>
-                </div>
-              </section>
-            ) : null}
-            <div className="today-overview-strip">
-              <article className="today-overview-item">
-                <span>重点项目</span>
-                <strong>{todayWorkspace?.focusProjects.length ?? 0}</strong>
-              </article>
-              <article className="today-overview-item">
-                <span>今日建议</span>
-                <strong>{todayWorkspace?.recommendedActions.length ?? 0}</strong>
-              </article>
-              <article className="today-overview-item">
-                <span>待处理</span>
-                <strong>{todayWorkspace?.pendingItems.length ?? 0}</strong>
-              </article>
-              <article className="today-overview-item">
-                <span>Workspace</span>
-                <strong>{todayWorkspace?.workspaceActivity?.newManagedFiles ?? 0}</strong>
-              </article>
-              <article className="today-overview-item">
-                <span>Codex 待验收</span>
-                <strong>{todayWorkspace?.codexTaskSummary?.awaitingAcceptance ?? 0}</strong>
-              </article>
             </div>
             <div className="today-layout">
               <section className="today-primary-column">
@@ -485,25 +412,25 @@ export function StartPage() {
                 <div className="today-section-block">
                   <div className="today-section-head">
                     <div>
-                      <span className="section-label">当前重点项目</span>
-                      <strong>{todayWorkspace?.focusProjects.length ? "继续已有真实项目" : "还没有可继续的项目"}</strong>
+                      <span className="section-label">最近项目</span>
+                      <strong>{projects.length ? "最近进入的项目" : "还没有已注册项目"}</strong>
                     </div>
+                    {projects.length > 5 ? <button type="button" className="btn" onClick={() => setMode("continue")}>查看全部项目</button> : null}
                   </div>
-                  {todayWorkspace?.focusProjects.length ? (
+                  {projects.length ? (
                     <div className="today-focus-list">
-                      {todayWorkspace.focusProjects.map((project) => (
+                      {projects.slice(0, 5).map((project) => (
                         <button
-                          key={project.projectId}
+                          key={project.id}
                           type="button"
                           className="today-focus-item"
-                          onClick={() => void openProjectAndEnter(project.projectRoot)}
+                          onClick={() => void openProjectAndEnter(project.rootDir)}
                         >
                           <div className="today-focus-topline">
-                            <strong>{project.projectName}</strong>
-                            <span>{project.currentStatus || "状态待形成"}</span>
+                            <strong>{project.name}</strong>
+                            <span>{project.lastOpenedAt ? new Date(Number(project.lastOpenedAt)).toLocaleString("zh-CN") : "尚未进入"}</span>
                           </div>
-                          <p>{project.nextStep || project.recentChange || "暂无明确下一步"}</p>
-                          {project.recentChange ? <small>最近变化：{project.recentChange}</small> : null}
+                          <p>{project.nextStep || "打开项目查看当前 Focus"}</p>
                         </button>
                       ))}
                     </div>
@@ -514,6 +441,12 @@ export function StartPage() {
                   )}
                 </div>
 
+                <details className="today-more-details">
+                  <summary>
+                    <span>更多动态</span>
+                    <strong>建议、待关注与文件变化</strong>
+                  </summary>
+                  <div className="today-more-content">
                 <div className="today-section-block today-workspace-activity">
                   <div className="today-section-head">
                     <div>
@@ -543,7 +476,6 @@ export function StartPage() {
                     </div>
                   )}
                 </div>
-              </section>
 
               <section className="today-secondary-column">
                 <div className="today-section-block">
@@ -606,6 +538,9 @@ export function StartPage() {
                     </article>
                   </div>
                 </div>
+              </section>
+                  </div>
+                </details>
               </section>
             </div>
           </div>
@@ -1131,15 +1066,6 @@ function formatWorkspaceActivityKind(kind: string) {
     understood: "已理解",
   };
   return labels[kind] || kind || "记录";
-}
-
-function formatFreshnessStatus(status: string) {
-  const labels: Record<string, string> = {
-    fresh: "事实已刷新",
-    stale: "事实待刷新",
-    unknown: "事实不足",
-  };
-  return labels[status] || "事实不足";
 }
 
 const OWNERSHIP_LABELS: Record<string, string> = {

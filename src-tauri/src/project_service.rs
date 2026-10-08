@@ -7,14 +7,16 @@ use crate::{
     deepseek, inbox_routing,
     models::{
         ActivityProjection, AppRegistry, AtlasAssessment, AtlasSkillAssessment, AuditEvent,
-        CleanupExecutionBatch, CleanupExecutionDocument, CleanupExecutionItem, CleanupPlan,
-        CleanupPlanDocument, CleanupPlanItem, CleanupPlanReviewFilter, CodexCliCapabilityProbe,
-        CodexExternalResult, CodexExternalResultsDocument, CodexPromptRecord, CodexPromptResult,
-        CodexReportApplyResult, CodexReportImportResult, CodexReportRecord,
-        CodexResultBridgeScanResult, CodexRun, CodexRunDocument, CodexTask, CodexTaskAcceptance,
+        ChatAttachmentData, ChatImageAttachmentInput, CleanupExecutionBatch,
+        CleanupExecutionDocument, CleanupExecutionItem, CleanupPlan, CleanupPlanDocument,
+        CleanupPlanItem, CleanupPlanReviewFilter, CodexCliCapabilityProbe, CodexExternalResult,
+        CodexExternalResultsDocument, CodexPromptRecord, CodexPromptResult, CodexReportApplyResult,
+        CodexReportImportResult, CodexReportRecord, CodexResultBridgeScanResult, CodexRun,
+        CodexRunDocument, CodexTask, CodexTaskAcceptance, CodexTaskCreateRequest,
         CodexTaskGitVerification, CodexTaskList, CodexTaskTodayItem, CodexTaskTodaySummary,
-        ContinueWorkFocus, ContinueWorkPrimaryAction, DailyContinueItem, DailyContinueSnapshot,
-        DailySession, DataHealthRecord, DecisionRecord, DecisionTrace, DecisionTraceConfidence,
+        ContinueProjectPreference, ContinueProjectRecommendation, ContinueWorkFocus,
+        ContinueWorkPrimaryAction, DailyContinueItem, DailyContinueSnapshot, DailySession,
+        DataHealthRecord, DecisionRecord, DecisionTrace, DecisionTraceConfidence,
         DecisionTraceEvidence, DeepSeekAuthorization, EvidenceRef, ExecutionRecord, FileAnalysis,
         FileAnalysisDocument, FileProjection, FileRecord, FinishWorkResult, GeneratedFileResult,
         GitChangedFile, GitCommitInfo, GitSnapshot, GlobalFilesDocument, GlobalManagedFile,
@@ -24,17 +26,19 @@ use crate::{
         MessageAttachment, MessageEvidenceItem, MessageResult, MonitoringState,
         PendingActionProjection, PendingReviewItem, PersonalSkill, ProjectActionCandidate,
         ProjectAnalysis, ProjectAttention, ProjectContextActivity, ProjectContextCodexResult,
-        ProjectContextFile, ProjectContextFocus, ProjectContextPacket, ProjectContextPendingAction,
-        ProjectCreateResult, ProjectFactCaptureRequest, ProjectImpactAnalysis,
-        ProjectImpactEvidence, ProjectImpactFinding, ProjectManifest, ProjectStateChange,
-        ProjectStateProposal, ProjectStateSummary, ProjectSummary, RecoveryPoint,
-        SearchIndexDocument, SearchIndexEntry, TaskRecord, TodayBlocker, TodayPendingItem,
-        TodayProjectFocus, TodayWorkspace, V1Readiness, WeeklySkillCandidate, WorkEvent,
-        WorkLedgerDocument, WorkLedgerSnapshot, WorkspaceActivityItem, WorkspaceActivitySummary,
-        WorkspaceConfig, WorkspaceDraft, WorkspaceMessage, WorkspaceScanBatch,
-        WorkspaceScanDocument, WorkspaceScanFile, ANALYSIS_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION,
-        MATERIAL_INBOX_ANALYSIS_VERSION, MATERIAL_INBOX_SCHEMA_VERSION,
-        SEARCH_INDEX_SCHEMA_VERSION, WORKSPACE_CONFIG_SCHEMA_VERSION,
+        ProjectContextDecision, ProjectContextFile, ProjectContextFocus, ProjectContextFreshness,
+        ProjectContextGitCommit, ProjectContextGitFacts, ProjectContextPacket,
+        ProjectContextPendingAction, ProjectCreateResult, ProjectFactCaptureRequest,
+        ProjectFactSyncResult, ProjectImpactAnalysis, ProjectImpactEvidence, ProjectImpactFinding,
+        ProjectManifest, ProjectStateChange, ProjectStateProposal, ProjectStateSummary,
+        ProjectSummary, RecoveryPoint, SearchIndexDocument, SearchIndexEntry, TaskRecord,
+        TodayBlocker, TodayPendingItem, TodayProjectFocus, TodayWorkspace, V1Readiness,
+        WeeklySkillCandidate, WorkEvent, WorkLedgerDocument, WorkLedgerSnapshot,
+        WorkspaceActivityItem, WorkspaceActivitySummary, WorkspaceConfig, WorkspaceDraft,
+        WorkspaceMessage, WorkspaceScanBatch, WorkspaceScanDocument, WorkspaceScanFile,
+        ANALYSIS_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION, MATERIAL_INBOX_ANALYSIS_VERSION,
+        MATERIAL_INBOX_SCHEMA_VERSION, SEARCH_INDEX_SCHEMA_VERSION,
+        WORKSPACE_CONFIG_SCHEMA_VERSION,
     },
     storage::{
         append_json_line, canonical_existing_file, canonical_project_root, global_data_dir,
@@ -42,6 +46,7 @@ use crate::{
         write_text_atomic,
     },
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "windows")]
@@ -49,11 +54,11 @@ use std::os::windows::process::CommandExt;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::{Mutex, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::Runtime;
 
@@ -63,6 +68,45 @@ static PROJECT_MONITOR_HASH_CACHE: OnceLock<Mutex<HashMap<String, ProjectMonitor
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+// A restarted desktop process no longer owns the child handle. Keep the result bridge
+// available long enough for a real Codex result to arrive before asking for review.
+const CODEX_RESTART_RESULT_GRACE_MS: u128 = 2 * 60 * 1000;
+// `codex exec --json` can continuously emit events. Drain both pipes while it runs
+// and stop a run only after the bounded, user-visible execution window for its task
+// type. Coding tasks need a longer window for real repository work; short analysis
+// and verification tasks keep the original guard against a hung CLI.
+const CODEX_STANDARD_RUN_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+const CODEX_CODING_RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const CODEX_RUN_POLL_INTERVAL: Duration = Duration::from_millis(200);
+// A real bridge result is sufficient task evidence. Give Codex a short chance to
+// exit naturally, then stop only its lingering process instead of timing out the task.
+const CODEX_RESULT_EXIT_GRACE: Duration = Duration::from_secs(10);
+const AI_REFERENCE_FILE_LIMIT: usize = 3;
+const AI_REFERENCE_EXCERPT_CHARS: usize = 1800;
+const CHAT_IMAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const CHAT_IMAGE_MAX_COUNT: usize = 4;
+const CHAT_IMAGE_MAX_TOTAL_BYTES: usize = 20 * 1024 * 1024;
+
+#[derive(Debug)]
+struct CodexProcessOutput {
+    exit_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+    result_received: bool,
+    stopped_after_result: bool,
+    last_activity_at: String,
+    recent_activity: Vec<String>,
+}
+
+const CODEX_LIVE_ACTIVITY_LIMIT: usize = 20;
+const CODEX_LIVE_ACTIVITY_MAX_CHARS: usize = 240;
+
+#[derive(Debug, Default)]
+struct LiveCodexOutput {
+    recent_activity: Vec<String>,
+    last_activity_at: String,
+}
 
 pub(crate) fn project_write_lock() -> &'static Mutex<()> {
     PROJECT_WRITE_LOCK.get_or_init(|| Mutex::new(()))
@@ -1013,6 +1057,22 @@ pub fn load_project(project_root: &str) -> Result<ProjectManifest, String> {
     read_and_repair_manifest(&root)
 }
 
+pub fn mark_project_opened<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_root: String,
+) -> Result<ProjectSummary, String> {
+    let root = PathBuf::from(project_root);
+    let _guard = project_write_lock()
+        .lock()
+        .map_err(|_| "项目存储锁已损坏，请重启感冒院。".to_string())?;
+    let mut manifest = read_and_repair_manifest(&root)?;
+    manifest.project.last_opened_at = now_string();
+    let summary = manifest.project.clone();
+    persist_project(&root, &manifest, None)?;
+    upsert_project(app, summary.clone())?;
+    Ok(summary)
+}
+
 pub fn create_project<R: Runtime>(
     app: &tauri::AppHandle<R>,
     name: String,
@@ -1228,6 +1288,7 @@ fn import_files_internal(
             file_id: file.id.clone(),
             file_name: file.file_name.clone(),
             managed_path: file.managed_path.clone(),
+            ..MessageAttachment::default()
         })
         .collect();
     let mut messages = vec![location_message];
@@ -1288,6 +1349,7 @@ pub fn prepare_project_message<R: Runtime>(
     app: &tauri::AppHandle<R>,
     project_root: String,
     text: String,
+    image_attachments: Vec<ChatImageAttachmentInput>,
 ) -> Result<MessageResult, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1306,7 +1368,9 @@ pub fn prepare_project_message<R: Runtime>(
     if selected_model.trim().is_empty() {
         return Err("请先在设置页保存 DeepSeek API Key 并测试连接。".to_string());
     }
-    let user_message = workspace_message("user", "requirement", trimmed.to_string(), "user");
+    let mut user_message = workspace_message("user", "requirement", trimmed.to_string(), "user");
+    user_message.attachments =
+        persist_chat_image_attachments(&root, &user_message.id, image_attachments)?;
     let question = trimmed.to_string();
     let evidence_items = collect_answer_evidence(&manifest, &question);
     let mut assistant_message = workspace_message_with_status(
@@ -1322,17 +1386,233 @@ pub fn prepare_project_message<R: Runtime>(
     record_message_derivatives(&mut manifest, &assistant_message);
     manifest.messages.push(user_message.clone());
     manifest.messages.push(assistant_message.clone());
+    let recorded_decision = extract_explicit_recorded_decision(&user_message.text)
+        .map(|decision| {
+            record_user_decision_event_in_manifest(
+                &root,
+                &mut manifest,
+                &decision,
+                None,
+                Some(&user_message.id),
+            )
+        })
+        .transpose()?;
+    let recorded_next_step = if recorded_decision.is_none() {
+        extract_explicit_recorded_next_step(&user_message.text)
+            .map(|next_step| {
+                record_user_next_step_event_in_manifest(
+                    &root,
+                    &mut manifest,
+                    &next_step,
+                    None,
+                    Some(&user_message.id),
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
     manifest.project.last_opened_at = now_string();
     manifest.draft.text.clear();
     manifest.draft.updated_at = now_string();
     persist_project(&root, &manifest, None)?;
     append_workspace_event(&root, &user_message)?;
     append_workspace_event(&root, &assistant_message)?;
+    if let Some(write) = recorded_decision.filter(|write| write.is_new) {
+        append_audit_event(&root, manifest.audit.last().expect("audit event exists"))?;
+        append_work_event_if_new(&root, write.event.clone())?
+            .ok_or_else(|| "该决定事实已存在。".to_string())?;
+    }
+    if let Some(write) = recorded_next_step.filter(|write| write.is_new) {
+        append_audit_event(&root, manifest.audit.last().expect("audit event exists"))?;
+        append_work_event_if_new(&root, write.event.clone())?
+            .ok_or_else(|| "该下一步事实已存在。".to_string())?;
+    }
     Ok(MessageResult {
         project: manifest.project,
         messages: vec![user_message, assistant_message.clone()],
         stream_message_id: assistant_message.id,
     })
+}
+
+fn chat_attachment_dir(root: &Path, message_id: &str) -> PathBuf {
+    root.join(".ganmaoyuan")
+        .join("chat-attachments")
+        .join(message_id)
+}
+
+fn chat_image_content_type(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn safe_chat_file_name(value: &str, content_type: &str) -> String {
+    let raw = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .trim();
+    let fallback = match content_type {
+        "image/png" => "pasted-image.png",
+        "image/jpeg" => "pasted-image.jpg",
+        _ => "pasted-image.webp",
+    };
+    let candidate = if raw.is_empty() { fallback } else { raw };
+    let mut safe = candidate
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    if safe == "." || safe == ".." || safe.trim().is_empty() {
+        safe = fallback.to_string();
+    }
+    safe.chars().take(120).collect()
+}
+
+fn parse_chat_image_data_url(
+    input: &ChatImageAttachmentInput,
+) -> Result<(&'static str, Vec<u8>), String> {
+    let (header, payload) = input
+        .data_url
+        .split_once(',')
+        .ok_or_else(|| "图片附件数据格式无效。".to_string())?;
+    if !header.to_ascii_lowercase().starts_with("data:")
+        || !header.to_ascii_lowercase().contains(";base64")
+    {
+        return Err("图片附件必须使用 base64 data URL。".to_string());
+    }
+    let encoded_type = header
+        .trim_start_matches("data:")
+        .split(';')
+        .next()
+        .unwrap_or_default();
+    let content_type = chat_image_content_type(&input.content_type)
+        .or_else(|| chat_image_content_type(encoded_type))
+        .ok_or_else(|| "仅支持 PNG、JPG/JPEG 和 WebP 图片。".to_string())?;
+    if let Some(input_type) = chat_image_content_type(&input.content_type) {
+        if input_type != content_type {
+            return Err("图片附件类型与数据内容不一致。".to_string());
+        }
+    }
+    let bytes = BASE64_STANDARD
+        .decode(payload)
+        .map_err(|_| "图片附件数据无法解析。".to_string())?;
+    if bytes.is_empty() || bytes.len() > CHAT_IMAGE_MAX_BYTES {
+        return Err("单张图片不能超过 8 MB。".to_string());
+    }
+    let valid_signature = match content_type {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        _ => false,
+    };
+    if !valid_signature {
+        return Err("图片附件内容与声明格式不匹配。".to_string());
+    }
+    Ok((content_type, bytes))
+}
+
+fn persist_chat_image_attachments(
+    root: &Path,
+    message_id: &str,
+    inputs: Vec<ChatImageAttachmentInput>,
+) -> Result<Vec<MessageAttachment>, String> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if inputs.len() > CHAT_IMAGE_MAX_COUNT {
+        return Err(format!("一条消息最多附加 {CHAT_IMAGE_MAX_COUNT} 张图片。"));
+    }
+    let mut total_bytes = 0_usize;
+    let mut decoded = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let (content_type, bytes) = parse_chat_image_data_url(&input)?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > CHAT_IMAGE_MAX_TOTAL_BYTES {
+            return Err("一条消息的图片附件总大小不能超过 20 MB。".to_string());
+        }
+        let file_name = safe_chat_file_name(&input.file_name, content_type);
+        decoded.push((content_type, file_name, bytes));
+    }
+
+    let directory = chat_attachment_dir(root, message_id);
+    fs::create_dir_all(&directory).map_err(|err| format!("创建聊天图片附件目录失败：{err}"))?;
+    let mut attachments = Vec::with_capacity(decoded.len());
+    for (content_type, file_name, bytes) in decoded {
+        let attachment_id = new_id();
+        let file_path = directory.join(format!("{attachment_id}-{file_name}"));
+        fs::write(&file_path, &bytes).map_err(|err| format!("保存聊天图片附件失败：{err}"))?;
+        let relative_path = file_path
+            .strip_prefix(root)
+            .map(path_to_string)
+            .unwrap_or_else(|_| path_to_string(&file_path));
+        attachments.push(MessageAttachment {
+            file_id: attachment_id,
+            file_name,
+            managed_path: String::new(),
+            attachment_type: "image".to_string(),
+            content_type: content_type.to_string(),
+            relative_path,
+        });
+    }
+    Ok(attachments)
+}
+
+fn read_chat_attachment_data(
+    root: &Path,
+    relative_path: &str,
+) -> Result<ChatAttachmentData, String> {
+    let root = canonical_project_root(root)?;
+    let relative = PathBuf::from(relative_path);
+    if relative.is_absolute() || relative_path.trim().is_empty() {
+        return Err("聊天附件路径无效。".to_string());
+    }
+    let path = root.join(relative);
+    let canonical = canonical_existing_file(&path)?;
+    if !canonical.starts_with(&root) {
+        return Err("聊天附件不属于当前项目。".to_string());
+    }
+    let content_type = canonical
+        .extension()
+        .and_then(|value| value.to_str())
+        .and_then(|value| match value.to_ascii_lowercase().as_str() {
+            "png" => Some("image/png"),
+            "jpg" | "jpeg" => Some("image/jpeg"),
+            "webp" => Some("image/webp"),
+            _ => None,
+        })
+        .ok_or_else(|| "聊天附件格式不受支持。".to_string())?;
+    let metadata =
+        fs::metadata(&canonical).map_err(|err| format!("读取聊天附件信息失败：{err}"))?;
+    if metadata.len() as usize > CHAT_IMAGE_MAX_BYTES {
+        return Err("聊天附件超过允许读取大小。".to_string());
+    }
+    let bytes = fs::read(&canonical).map_err(|err| format!("读取聊天附件失败：{err}"))?;
+    let data_url = format!(
+        "data:{content_type};base64,{}",
+        BASE64_STANDARD.encode(bytes)
+    );
+    Ok(ChatAttachmentData {
+        data_url,
+        content_type: content_type.to_string(),
+    })
+}
+
+pub fn read_chat_attachment(
+    project_root: String,
+    relative_path: String,
+) -> Result<ChatAttachmentData, String> {
+    read_chat_attachment_data(Path::new(&project_root), &relative_path)
 }
 
 pub async fn run_project_message_stream<R: Runtime>(
@@ -1347,7 +1627,7 @@ pub async fn run_project_message_stream<R: Runtime>(
             .lock()
             .map_err(|_| "项目存储锁已损坏，请重试。".to_string())?;
         let manifest = read_and_repair_manifest(&root)?;
-        build_deepseek_context(&manifest, &message_id)
+        build_deepseek_context(&manifest, &message_id, &model_id)
     }?;
     let cancel_flag = deepseek::start_stream_guard(&project_root)?;
     let result = deepseek::stream_chat(
@@ -1529,7 +1809,7 @@ pub fn finish_project_work(
         completed.trim().to_string()
     };
     let next_step = if next_step.trim().is_empty() {
-        manifest.project.next_step.clone()
+        String::new()
     } else {
         next_step.trim().to_string()
     };
@@ -1586,8 +1866,7 @@ pub fn generate_codex_prompt(project_root: String) -> Result<CodexPromptResult, 
     let related_task = active_task_title(&snapshot);
     let task_type =
         infer_codex_task_type(&format!("{}\n{}", related_task, snapshot.project.next_step));
-    let expected_result_path =
-        codex_result_bridge_dir(&root).join(format!("{task_id}-result.json"));
+    let expected_result_path = canonical_codex_result_path(&root, &task_id);
     let prompt_text = build_codex_prompt(
         &snapshot,
         &task_id,
@@ -1641,12 +1920,73 @@ pub fn generate_codex_prompt(project_root: String) -> Result<CodexPromptResult, 
     Ok(CodexPromptResult { prompt, manifest })
 }
 
+pub fn create_codex_task(
+    project_root: String,
+    request: CodexTaskCreateRequest,
+) -> Result<CodexTask, String> {
+    let root = PathBuf::from(&project_root);
+    ensure_project_dirs(&root)?;
+    let snapshot = load_project(&project_root)?;
+    let title = request.title.trim();
+    let instructions = request.instructions.trim();
+    if title.is_empty() {
+        return Err("请填写 Codex 任务标题。".to_string());
+    }
+    if title.chars().count() > 160 {
+        return Err("Codex 任务标题不能超过 160 个字符。".to_string());
+    }
+    if instructions.is_empty() {
+        return Err("请填写 Codex 要执行的任务说明。".to_string());
+    }
+    if instructions.chars().count() > 8_000 || instructions.contains('\0') {
+        return Err("Codex 任务说明无效或过长。".to_string());
+    }
+    let task_type = normalize_codex_task_type(&request.task_type);
+    if !matches!(
+        task_type.as_str(),
+        "analysis" | "coding" | "verification" | "fileOperation"
+    ) {
+        return Err(
+            "Codex 任务类型必须是 analysis、coding、verification 或 fileOperation。".to_string(),
+        );
+    }
+
+    let task_id = new_id();
+    let expected_result_path = canonical_codex_result_path(&root, &task_id);
+    let created_at = now_string();
+    let repository_path = preferred_project_repository_path(&root, &snapshot);
+    let task = CodexTask {
+        task_id: task_id.clone(),
+        project_id: snapshot.project.id,
+        title: title.to_string(),
+        task_type: task_type.clone(),
+        prompt: build_explicit_codex_task_prompt(
+            &task_id,
+            &task_type,
+            title,
+            instructions,
+            &path_to_string(&expected_result_path),
+        ),
+        created_at: created_at.clone(),
+        status: "ready".to_string(),
+        repository_path,
+        expected_result_path: path_to_string(&expected_result_path),
+        evidence_refs: vec!["taskOrigin:explicit".to_string()],
+        updated_at: created_at,
+        ..CodexTask::default()
+    };
+    validate_codex_task_prompt_binding(&task)?;
+    write_codex_task(&root, &task)?;
+    Ok(task)
+}
+
 pub fn list_codex_tasks(project_root: String) -> Result<CodexTaskList, String> {
     let root = PathBuf::from(project_root);
-    recover_stale_codex_runs(&root)?;
+    // The bridge performs restart recovery before reading result files so a late, real
+    // result can advance the same task instead of being turned into a failed retry.
+    scan_codex_result_bridge(path_to_string(&root))?;
     repair_codex_run_failure_messages(&root)?;
     sync_failed_codex_runs_to_tasks(&root)?;
-    scan_codex_result_bridge(path_to_string(&root))?;
     Ok(CodexTaskList {
         tasks: read_codex_tasks(&root)?,
         runs: read_codex_runs(&root)?,
@@ -1676,9 +2016,7 @@ pub fn rebind_codex_task_prompt(
         task.task_type =
             infer_codex_task_type(&format!("{}\n{}", task.title, snapshot.project.next_step));
     }
-    task.expected_result_path = path_to_string(
-        &codex_result_bridge_dir(&root).join(format!("{}-result.json", task.task_id)),
-    );
+    task.expected_result_path = path_to_string(&canonical_codex_result_path(&root, &task.task_id));
     task.prompt = build_codex_prompt(
         &snapshot,
         &task.task_id,
@@ -1724,55 +2062,34 @@ pub fn start_codex_task_run(project_root: String, task_id: String) -> Result<Cod
         ));
     }
     let run_id = new_id();
-    let run_prompt = codex_prompt_for_run(&task, &run_id);
+    let (git_head_before, git_worktree_status_before, git_dirty_files_before) =
+        capture_codex_run_git_baseline(&repository_path, &task)?;
     let started_at = now_string();
     let output_last_message_path = codex_run_output_path(&root, &run_id);
+    let result_directory = codex_task_result_directory(&root, &task)?;
     if let Some(parent) = output_last_message_path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("创建 CodexRun 输出目录失败：{err}"))?;
     }
-    let capability_probe = probe_codex_cli_capabilities();
-    if !capability_probe.available {
-        return Err(format!(
-            "Codex CLI 不可用：{}",
-            empty_label(&capability_probe.failure_reason, "未找到 codex 命令")
-        ));
-    }
-    let args = codex_exec_args(
-        &repository_path,
-        &root,
-        &output_last_message_path,
-        &capability_probe,
-    )?;
-    let executable = codex_command_name().to_string();
-    let mut child = hidden_command(&executable)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("启动 codex exec 失败，请确认 Codex CLI 已安装并登录：{err}"))?;
-    let pid = child.id();
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(run_prompt.as_bytes())
-            .map_err(|err| format!("写入 Codex prompt 失败：{err}"))?;
-    }
+    let executable = codex_command_name();
     let run = CodexRun {
         id: run_id.clone(),
         task_id: task.task_id.clone(),
         project_id: task.project_id.clone(),
         repository_path: path_to_string(&repository_path),
-        command_executable: executable,
-        command_args: args.clone(),
-        capability_probe,
+        command_executable: executable.clone(),
+        status: "starting".to_string(),
         working_directory: path_to_string(&repository_path),
+        git_head_before,
+        git_worktree_status_before,
+        git_dirty_files_before,
         stdin_prompt_summary: first_line(&task.prompt, 320),
-        status: "running".to_string(),
         started_at: started_at.clone(),
-        pid,
+        last_activity_at: started_at.clone(),
+        recent_activity: vec!["已创建 CodexRun，等待 Codex CLI 启动。".to_string()],
         output_last_message_path: path_to_string(&output_last_message_path),
         ..CodexRun::default()
     };
+    let run_prompt = codex_prompt_for_run(&task, &run);
     upsert_codex_run(&root, run.clone())?;
     if matches!(
         task.status.as_str(),
@@ -1785,27 +2102,127 @@ pub fn start_codex_task_run(project_root: String, task_id: String) -> Result<Cod
     }
     let root_for_thread = root.clone();
     let run_for_thread = run.clone();
+    let task_type_for_thread = task.task_type.clone();
+    let repository_for_thread = repository_path.clone();
+    let result_directory_for_thread = result_directory.clone();
+    let output_for_thread = output_last_message_path.clone();
     std::thread::spawn(move || {
-        let output = child.wait_with_output();
-        let mut next =
-            read_codex_run(&root_for_thread, &run_id).unwrap_or_else(|_| run_for_thread.clone());
+        let capability_probe = probe_codex_cli_capabilities(&run_for_thread.command_executable);
+        if !capability_probe.available {
+            mark_codex_run_start_failed(
+                &root_for_thread,
+                &run_for_thread,
+                format!(
+                    "Codex CLI 不可用：{}",
+                    empty_label(&capability_probe.failure_reason, "未找到 codex 命令")
+                ),
+            );
+            return;
+        }
+        let args = match codex_exec_args(
+            &repository_for_thread,
+            &result_directory_for_thread,
+            &output_for_thread,
+            &capability_probe,
+            is_native_codex_executable(&run_for_thread.command_executable),
+        ) {
+            Ok(args) => args,
+            Err(error) => {
+                mark_codex_run_start_failed(&root_for_thread, &run_for_thread, error);
+                return;
+            }
+        };
+        if read_codex_run(&root_for_thread, &run_for_thread.id)
+            .map(|current| current.status == "cancelled")
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let mut child = match hidden_command(&run_for_thread.command_executable)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                mark_codex_run_start_failed(
+                    &root_for_thread,
+                    &run_for_thread,
+                    format!("启动 codex exec 失败，请确认 Codex CLI 已安装并登录：{error}"),
+                );
+                return;
+            }
+        };
+        let pid = child.id();
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(error) = stdin.write_all(run_prompt.as_bytes()) {
+                let _ = child.kill();
+                mark_codex_run_start_failed(
+                    &root_for_thread,
+                    &run_for_thread,
+                    format!("写入 Codex prompt 失败：{error}"),
+                );
+                return;
+            }
+        }
+        let mut running = read_codex_run(&root_for_thread, &run_for_thread.id)
+            .unwrap_or_else(|_| run_for_thread.clone());
+        if running.status == "cancelled" {
+            let _ = child.kill();
+            return;
+        }
+        running.command_args = args;
+        running.capability_probe = capability_probe;
+        running.pid = pid;
+        running.status = "running".to_string();
+        running.process_alive = true;
+        running.last_activity_at = now_string();
+        running.recent_activity = vec!["Codex CLI 进程已启动。".to_string()];
+        let _ = upsert_codex_run(&root_for_thread, running.clone());
+        let output = wait_for_codex_process(
+            &mut child,
+            pid,
+            &root_for_thread,
+            &run_for_thread.task_id,
+            &run_for_thread,
+            &task_type_for_thread,
+        );
+        let real_result_received = output
+            .as_ref()
+            .map(|output| output.result_received)
+            .unwrap_or(false);
+        let mut next = read_codex_run(&root_for_thread, &run_for_thread.id).unwrap_or(running);
         if next.status == "cancelled" {
             return;
         }
         next.ended_at = now_string();
+        next.process_alive = false;
         match output {
             Ok(output) => {
-                next.exit_code = output.status.code();
+                next.exit_code = output.exit_code;
                 next.stdout_summary = summarize_process_output(&output.stdout);
                 next.stderr_summary = summarize_process_output(&output.stderr);
-                next.status = if output.status.success() {
+                next.last_activity_at = output.last_activity_at;
+                next.recent_activity = output.recent_activity;
+                next.status = if output.result_received {
+                    if output.stopped_after_result {
+                        next.error = "已收到本次真实 Codex 结果；Codex CLI 未在宽限期内自行退出，已停止残留进程。"
+                            .to_string();
+                    }
+                    "exited".to_string()
+                } else if output.timed_out {
+                    next.error = codex_timeout_error(&task_type_for_thread);
+                    "failed".to_string()
+                } else if output.exit_code == Some(0) {
                     "exited".to_string()
                 } else {
                     "failed".to_string()
                 };
-                if !output.status.success() {
+                if !output.result_received && !output.timed_out && output.exit_code != Some(0) {
                     next.error = codex_run_failure_reason(
-                        output.status.code(),
+                        output.exit_code,
                         &next.stderr_summary,
                         &next.stdout_summary,
                     );
@@ -1816,7 +2233,8 @@ pub fn start_codex_task_run(project_root: String, task_id: String) -> Result<Cod
                 next.error = format!("等待 codex exec 结束失败：{err}");
             }
         }
-        let successful_exit = next.status == "exited" && next.exit_code == Some(0);
+        let successful_exit =
+            real_result_received || (next.status == "exited" && next.exit_code == Some(0));
         let failed_reason = if next.status == "failed" {
             Some(next.error.clone())
         } else {
@@ -1829,45 +2247,159 @@ pub fn start_codex_task_run(project_root: String, task_id: String) -> Result<Cod
                 runs.into_iter()
                     .find(|run| run.task_id == run_for_thread.task_id)
             })
-            .map(|run| run.id != run_id)
+            .map(|run| run.id != run_for_thread.id)
             .unwrap_or(true)
         {
             return;
         }
         if let Some(reason) = failed_reason {
-            let _ = mark_codex_task_run_failed(&root_for_thread, &run_for_thread.task_id, &reason);
+            if is_codex_timeout_error(&next.error) {
+                let _ = mark_codex_task_restart_recovery_expired(
+                    &root_for_thread,
+                    &run_for_thread.task_id,
+                    &reason,
+                );
+            } else {
+                let _ =
+                    mark_codex_task_run_failed(&root_for_thread, &run_for_thread.task_id, &reason);
+            }
         }
-        if successful_exit {
+        if successful_exit && !real_result_received {
             if let Err(error) = finish_codex_result_handoff(&root_for_thread, &next) {
                 next.error = error;
                 let _ = upsert_codex_run(&root_for_thread, next);
             }
-        } else {
+        } else if !real_result_received {
             let _ = scan_codex_result_bridge(path_to_string(&root_for_thread));
         }
     });
     Ok(run)
 }
 
+fn mark_codex_run_start_failed(root: &Path, run: &CodexRun, reason: String) {
+    let mut failed = read_codex_run(root, &run.id).unwrap_or_else(|_| run.clone());
+    if failed.status == "cancelled" {
+        return;
+    }
+    failed.status = "failed".to_string();
+    failed.ended_at = now_string();
+    failed.error = reason.clone();
+    let _ = upsert_codex_run(root, failed);
+    let _ = mark_codex_task_run_failed(root, &run.task_id, &reason);
+}
+
 fn finish_codex_result_handoff(root: &Path, run: &CodexRun) -> Result<(), String> {
     let result = (|| {
         mark_codex_task_awaiting_result(root, &run.task_id)?;
-        ensure_codex_runner_fallback_result(root, &run.task_id, Some(run), true)?;
+        wait_for_matching_codex_result(root, &run.task_id, run, true)?;
         scan_codex_result_bridge(path_to_string(root))?;
         Ok(())
     })();
     result.map_err(|error: String| {
         let reason = format!("Codex 已退出，但结果回流失败：{error}");
-        // Process success is not task success. Keep the handoff error visible.
-        let _ = mark_codex_task_run_failed(root, &run.task_id, &reason);
+        // A successful process is not a completed task. Never manufacture a result
+        // from stdout; keep the missing handoff actionable until a real result arrives.
+        let _ = mark_codex_task_missing_result(root, &run.task_id, &reason);
         reason
     })
 }
 
-fn codex_prompt_for_run(task: &CodexTask, run_id: &str) -> String {
+fn mark_codex_task_missing_result(root: &Path, task_id: &str, reason: &str) -> Result<(), String> {
+    let mut task = read_codex_task(root, task_id)?;
+    if matches!(
+        task.status.as_str(),
+        "resultReceived" | "gitVerified" | "awaitingAcceptance" | "completed" | "cancelled"
+    ) {
+        return Ok(());
+    }
+    task.status = "needsReview".to_string();
+    task.updated_at = now_string();
+    if !task
+        .remaining_issues
+        .iter()
+        .any(|issue| issue.trim() == reason.trim())
+    {
+        task.remaining_issues.push(reason.to_string());
+    }
+    write_codex_task(root, &task)
+}
+
+fn capture_codex_run_git_baseline(
+    repository_path: &Path,
+    task: &CodexTask,
+) -> Result<(String, String, Vec<GitChangedFile>), String> {
+    if !codex_task_git_required(task) {
+        return Ok((String::new(), String::new(), Vec::new()));
+    }
+    let head = run_git(repository_path, &["rev-parse", "HEAD"]).map_err(|error| {
+        format!("coding 任务必须在可用 Git 仓库中启动，无法读取任务启动前 HEAD：{error}")
+    })?;
+    let status = run_git(repository_path, &["status", "--porcelain"])
+        .map_err(|error| format!("无法读取 coding 任务启动前 Git 工作区状态：{error}"))?;
+    let diff = run_git(repository_path, &["diff", "--name-status"]).unwrap_or_default();
+    let dirty_files = parse_git_changed_files(&status, &diff);
+    Ok((
+        head.trim().to_string(),
+        if dirty_files.is_empty() {
+            "clean".to_string()
+        } else {
+            "dirty".to_string()
+        },
+        dirty_files,
+    ))
+}
+
+fn codex_prompt_for_run(task: &CodexTask, run: &CodexRun) -> String {
+    let file_operation_guardrail = if task.task_type == "fileOperation" {
+        "\n执行约束：这是一个文件操作任务。对于文本或 JSON 的创建、修改与删除，优先使用 Codex 专用 apply_patch 文件工具；不要使用 terminal、shell、PowerShell 或 cmd。只有任务明确需要执行程序时，才说明无法完成的原因，不要伪造执行结果。\n"
+    } else {
+        ""
+    };
+    // The native Windows Codex sandbox can hang when the agent selects PowerShell.
+    // Keep file operations on apply_patch; every other task must use cmd.exe explicitly.
+    let windows_command_guardrail = if cfg!(target_os = "windows")
+        && task.task_type != "fileOperation"
+    {
+        "\nWindows 执行约束：如果需要读取文件、运行测试或调用 Git，必须显式选择 C:\\Windows\\System32\\cmd.exe 作为命令 shell，并使用 /d /s /c。不要使用 PowerShell、pwsh 或任何 PowerShell profile；不要把 cmd.exe 再包进带引号的嵌套 shell 命令。\n"
+    } else {
+        ""
+    };
+    let coding_commit_contract = if codex_task_git_required(task) {
+        codex_coding_commit_contract(run)
+    } else {
+        String::new()
+    };
     format!(
-        "{}\n\n本次执行结果绑定：resultRunId: {run_id}\n写入结果 JSON 时必须包含 resultRunId=\"{run_id}\"；Markdown 结果必须包含独立一行 resultRunId: {run_id}。这是本次执行的标识，不要复用旧结果中的执行标识。taskId 仍为 {}，结果文件仍写入 {}。\n",
-        task.prompt, task.task_id, task.expected_result_path
+        "{}{}{}{}\n本次执行结果绑定：resultRunId: {run_id}\n写入结果 JSON 时必须包含 resultRunId=\"{run_id}\"；Markdown 结果必须包含独立一行 resultRunId: {run_id}。这是本次执行的标识，不要复用旧结果中的执行标识。taskId 仍为 {task_id}，结果文件仍写入 {expected_result_path}。\n",
+        task.prompt,
+        file_operation_guardrail,
+        windows_command_guardrail,
+        coding_commit_contract,
+        run_id = run.id,
+        task_id = task.task_id,
+        expected_result_path = task.expected_result_path,
+    )
+}
+
+fn codex_coding_commit_contract(run: &CodexRun) -> String {
+    let dirty_paths = run
+        .git_dirty_files_before
+        .iter()
+        .map(|file| file.path.trim())
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    let baseline = if dirty_paths.is_empty() {
+        "任务启动前工作区干净。".to_string()
+    } else {
+        format!(
+            "任务启动前已有未提交修改（禁止触碰、暂存或提交）：{}。",
+            dirty_paths.join("、")
+        )
+    };
+    format!(
+        "\nCoding Git 提交约束：本任务启动前 HEAD 为 {head}。{baseline}\n完成代码修改后，先运行本任务必要测试。只有测试通过、且能明确区分本任务修改时，才可创建 commit。必须只用 `git add -- <本任务文件路径>` 精确暂存；禁止 `git add .`、`git add -A`、`git commit -a`，禁止提交任务启动前已有的修改或无关文件。提交后运行 `git rev-parse HEAD`。\n如果测试失败、没有修改、修改与启动前脏文件重叠，或无法安全判断归属：不要提交、不要伪造 commit 或 Git 核验；结果写 status=\"needsReview\" 并在 remainingIssues 说明原因。\n结果 JSON 的 `coding` 对象必须如实包含 `changedFiles`、`commits`（完整 commit SHA）、`tests`、`gitHead`、`gitStatus`、`gitModifiedFiles`。\n",
+        head = empty_label(&run.git_head_before, "未知"),
+        baseline = baseline,
     )
 }
 
@@ -1902,12 +2434,42 @@ fn validate_codex_task_prompt_binding(task: &CodexTask) -> Result<(), String> {
     Ok(())
 }
 
+fn codex_task_result_directory(root: &Path, task: &CodexTask) -> Result<PathBuf, String> {
+    let expected_directory = codex_result_bridge_dir(root);
+    let expected_path = codex_result_path_for_task(root, task, "json");
+    let expected_name = format!("{}-result.json", task.task_id);
+    fs::create_dir_all(&expected_directory)
+        .map_err(|err| format!("创建 Codex Result Bridge 目录失败：{err}"))?;
+    let canonical_expected_directory = expected_directory.canonicalize().map_err(|err| {
+        format!(
+            "规范化 Codex Result Bridge 目录失败：{}：{err}",
+            path_to_string(&expected_directory)
+        )
+    })?;
+    let parent = expected_path
+        .parent()
+        .ok_or_else(|| "CodexTask 结果路径缺少目录。".to_string())?;
+    let same_directory = parent
+        .canonicalize()
+        .map(|directory| directory == canonical_expected_directory)
+        .unwrap_or(false);
+    if expected_path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
+        || !same_directory
+    {
+        return Err("CodexTask 结果路径必须位于当前项目的 Result Bridge 目录。".to_string());
+    }
+    Ok(expected_directory)
+}
+
 pub fn cancel_codex_task_run(project_root: String, task_id: String) -> Result<CodexRun, String> {
     let root = PathBuf::from(project_root);
     let mut run = active_codex_run_for_task(&root, &task_id)?
         .ok_or_else(|| "没有正在运行的 Codex 进程。".to_string())?;
-    terminate_process(run.pid)?;
+    if run.pid != 0 {
+        terminate_process_if_running(run.pid)?;
+    }
     run.status = "cancelled".to_string();
+    run.process_alive = false;
     run.ended_at = now_string();
     run.error = "已停止 Codex 进程，仓库可能存在未提交修改，请查看 Git 事实。".to_string();
     upsert_codex_run(&root, run.clone())?;
@@ -1999,15 +2561,36 @@ fn review_codex_task(
     if contract.task_id != task_id {
         return Err("结果与当前任务不匹配，不能验收。".to_string());
     }
-    if let Some(run) = read_codex_runs(&root)?
-        .into_iter()
-        .find(|run| run.task_id == task_id)
+    if !task.result_run_id.is_empty()
+        && !contract.result_run_id.is_empty()
+        && task.result_run_id != contract.result_run_id
     {
+        return Err("结果对应的执行记录已变化，不能验收。".to_string());
+    }
+    let expected_run_id = if !task.result_run_id.is_empty() {
+        task.result_run_id.clone()
+    } else {
+        contract.result_run_id.clone()
+    };
+    let runs = read_codex_runs(&root)?;
+    let matching_run = if expected_run_id.is_empty() {
+        runs.iter()
+            .filter(|run| run.task_id == task_id)
+            .max_by(|left, right| left.started_at.cmp(&right.started_at))
+    } else {
+        runs.iter()
+            .find(|run| run.id == expected_run_id && run.task_id == task_id)
+    };
+    if !expected_run_id.is_empty() && matching_run.is_none() {
+        return Err("当前结果没有匹配的执行记录，请刷新后重试。".to_string());
+    }
+    if let Some(run) = matching_run {
         if matches!(
             run.status.as_str(),
             "starting" | "running" | "failed" | "cancelled"
-        ) || run.exit_code.map(|code| code != 0).unwrap_or(false)
-            || !codex_result_file_matches_run(Path::new(&report.evidence_managed_path), &run)
+        ) || (run.exit_code.map(|code| code != 0).unwrap_or(false)
+            && !codex_run_finished_with_bound_result(run, Path::new(&report.evidence_managed_path)))
+            || !codex_result_file_matches_run(Path::new(&report.evidence_managed_path), run)
         {
             return Err("当前执行尚未成功结束，或结果属于旧执行，请刷新后检查。".to_string());
         }
@@ -2017,8 +2600,8 @@ fn review_codex_task(
     if task.status == final_status && task.acceptance.status == decision {
         return Ok(task);
     }
-    if task.status != "awaitingAcceptance" {
-        return Err("当前任务不处于等待人工验收状态，请刷新任务。".to_string());
+    if !matches!(task.status.as_str(), "awaitingAcceptance" | "needsReview") {
+        return Err("当前任务不处于可人工验收状态，请刷新任务。".to_string());
     }
     let original = task.clone();
     if approved {
@@ -2192,7 +2775,9 @@ pub fn scan_codex_result_bridge(
 ) -> Result<CodexResultBridgeScanResult, String> {
     let root = PathBuf::from(&project_root);
     ensure_project_dirs(&root)?;
-    ensure_successful_codex_runs_have_results(&root)?;
+    // This command also backs the background bridge poll after restart, so it must
+    // keep incomplete runs recoverable even when no WorkPage is currently open.
+    recover_stale_codex_runs(&root)?;
     let result_dir = codex_result_bridge_dir(&root);
     let mut entries = fs::read_dir(&result_dir)
         .map_err(|err| {
@@ -2355,6 +2940,70 @@ pub fn get_work_ledger(project_root: String) -> Result<WorkLedgerSnapshot, Strin
     })
 }
 
+pub fn synchronize_project_facts<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_root: String,
+) -> Result<ProjectFactSyncResult, String> {
+    let reconciled = reconcile_current_project_facts(project_root.clone())?;
+    let today_workspace = build_today_workspace(app, false)?;
+    Ok(ProjectFactSyncResult {
+        manifest: reconciled.manifest,
+        work_ledger: reconciled.work_ledger,
+        today_workspace,
+        file_facts_changed: reconciled.file_facts_changed,
+        imported_codex_results: reconciled.imported_codex_results,
+    })
+}
+
+struct ReconciledProjectFacts {
+    manifest: ProjectManifest,
+    work_ledger: WorkLedgerSnapshot,
+    file_facts_changed: bool,
+    imported_codex_results: usize,
+}
+
+fn reconcile_current_project_facts(project_root: String) -> Result<ReconciledProjectFacts, String> {
+    let root = PathBuf::from(&project_root);
+    let (_, file_facts_changed, _) = scan_project_workspace(&project_root)?;
+    let bridge = scan_codex_result_bridge(project_root.clone())?;
+    let manifest_after_bridge = bridge.manifest;
+
+    let repository_path =
+        configured_repository_path(&manifest_after_bridge.project).or_else(|| {
+            read_git_snapshot(&root)
+                .ok()
+                .flatten()
+                .and_then(|snapshot| {
+                    (!snapshot.repository_path.trim().is_empty())
+                        .then(|| PathBuf::from(snapshot.repository_path))
+                })
+        });
+    if let Some(repository_path) = repository_path {
+        if repository_path.is_dir() {
+            let _ =
+                refresh_git_snapshot(project_root.clone(), Some(path_to_string(&repository_path)))?;
+        }
+    }
+
+    let mut manifest = read_and_repair_manifest(&root)?;
+    update_daily_continue_snapshot(&mut manifest);
+    persist_project(&root, &manifest, None)?;
+    let work_ledger = get_work_ledger(project_root)?;
+    Ok(ReconciledProjectFacts {
+        manifest,
+        work_ledger,
+        file_facts_changed,
+        imported_codex_results: bridge.imported_count,
+    })
+}
+
+pub fn get_current_project_context_packet(
+    project_root: String,
+) -> Result<ProjectContextPacket, String> {
+    reconcile_current_project_facts(project_root.clone())?;
+    get_project_context_packet(project_root)
+}
+
 pub fn get_project_context_packet(project_root: String) -> Result<ProjectContextPacket, String> {
     let root = PathBuf::from(project_root);
     // This command intentionally reads raw persisted state. Generating a handoff must not repair,
@@ -2369,22 +3018,12 @@ pub fn get_project_context_packet(project_root: String) -> Result<ProjectContext
         &ledger.events,
     ));
 
-    let focus = pending_actions
-        .first()
-        .map(|action| ProjectContextFocus {
-            title: context_text(&action.title, 120),
-            summary: context_text(&action.reason, 220),
-            reason: "来自当前待处理事项。".to_string(),
-            evidence: context_evidence_labels(&action.evidence_refs, 3),
-        })
-        .or_else(|| {
-            activities.first().map(|activity| ProjectContextFocus {
-                title: "查看最近真实进展".to_string(),
-                summary: context_text(&activity.summary, 220),
-                reason: "当前没有待处理事项，以下内容来自最近工作事实。".to_string(),
-                evidence: context_evidence_labels(&activity.evidence_refs, 3),
-            })
-        });
+    let focus = pending_actions.first().map(|action| ProjectContextFocus {
+        title: context_text(&action.title, 120),
+        summary: context_text(&action.reason, 220),
+        reason: "来自当前待处理事项。".to_string(),
+        evidence: context_evidence_labels(&action.evidence_refs, 3),
+    });
 
     let recent_activity = activities
         .iter()
@@ -2414,9 +3053,57 @@ pub fn get_project_context_packet(project_root: String) -> Result<ProjectContext
         .collect::<Vec<_>>();
     let codex_result = codex_tasks
         .iter()
-        .find(|task| !matches!(task.status.as_str(), "completed" | "cancelled"))
-        .or_else(|| codex_tasks.first())
+        .filter(|task| !codex_task_is_superseded_by_accepted_target(task, &codex_tasks))
+        .max_by(|left, right| {
+            let left_time = if left.updated_at.trim().is_empty() {
+                &left.created_at
+            } else {
+                &left.updated_at
+            };
+            let right_time = if right.updated_at.trim().is_empty() {
+                &right.created_at
+            } else {
+                &right.updated_at
+            };
+            left_time.cmp(right_time)
+        })
         .map(context_codex_result);
+    let decisions = manifest
+        .decisions
+        .iter()
+        .rev()
+        .filter(|decision| is_user_confirmed_context_decision(&manifest, &ledger.events, decision))
+        .take(5)
+        .map(|decision| ProjectContextDecision {
+            summary: context_text(&decision.summary, 180),
+            created_at: decision.created_at.clone(),
+        })
+        .filter(|decision| !decision.summary.is_empty())
+        .collect::<Vec<_>>();
+    let git_snapshot = read_git_snapshot(&root)?.filter(|snapshot| {
+        snapshot.project_id.is_empty() || snapshot.project_id == manifest.project.id
+    });
+    let git_facts = git_snapshot.as_ref().map(context_git_facts);
+    let risks = manifest
+        .project_state_summary
+        .blockers
+        .iter()
+        .chain(manifest.project_state_summary.current_risks.iter())
+        .map(|risk| context_text(risk, 180))
+        .filter(|risk| !risk.is_empty())
+        .take(5)
+        .collect::<Vec<_>>();
+    let next_step = if !manifest.project.next_step.trim().is_empty()
+        && !is_system_generated_next_step(&manifest, &manifest.project.next_step)
+    {
+        context_text(&manifest.project.next_step, 180)
+    } else {
+        focus
+            .as_ref()
+            .map(|item| item.title.clone())
+            .filter(|item| !item.is_empty())
+            .unwrap_or_default()
+    };
     let sparse = focus.is_none()
         && recent_activity.is_empty()
         && context_pending_actions.is_empty()
@@ -2426,18 +3113,105 @@ pub fn get_project_context_packet(project_root: String) -> Result<ProjectContext
     let mut packet = ProjectContextPacket {
         project_id: manifest.project.id,
         project_name: context_text(&manifest.project.name, 120),
-        generated_at,
+        project_description: context_text(&manifest.project.description, 280),
+        current_phase: context_text(&manifest.project_state_summary.current_phase, 120),
+        generated_at: generated_at.clone(),
         privacy_notice: "仅包含感冒院中的事实摘要与相对资料位置；不包含原文件正文、绝对路径、提示词、技术日志或凭据。".to_string(),
         focus,
         recent_activity,
         pending_actions: context_pending_actions,
         files,
         codex_result,
+        decisions,
+        git_facts,
+        risks,
+        next_step,
+        freshness: ProjectContextFreshness {
+            generated_at: generated_at.clone(),
+            facts_synced_at: manifest
+                .daily_continue_snapshots
+                .last()
+                .map(|snapshot| snapshot.generated_at.clone())
+                .filter(|value| !value.is_empty())
+                .or_else(|| git_snapshot.as_ref().map(|snapshot| snapshot.captured_at.clone()))
+                .unwrap_or_else(|| generated_at.clone()),
+            status: "current".to_string(),
+        },
         sparse,
         markdown: String::new(),
     };
     packet.markdown = format_project_context_markdown(&packet);
     Ok(packet)
+}
+
+fn context_git_facts(snapshot: &GitSnapshot) -> ProjectContextGitFacts {
+    ProjectContextGitFacts {
+        branch: context_text(&snapshot.branch, 80),
+        head_short: context_text(&snapshot.head_short, 16),
+        subject: snapshot
+            .recent_commits
+            .first()
+            .map(|commit| context_text(&commit.subject, 160))
+            .unwrap_or_default(),
+        recent_commits: snapshot
+            .recent_commits
+            .iter()
+            .take(5)
+            .map(|commit| ProjectContextGitCommit {
+                short_hash: context_text(&commit.short_hash, 16),
+                subject: context_text(&commit.subject, 160),
+            })
+            .filter(|commit| !commit.short_hash.is_empty() && !commit.subject.is_empty())
+            .collect(),
+        is_dirty: snapshot.is_dirty,
+        changed_files: snapshot
+            .changed_files
+            .iter()
+            .take(8)
+            .map(|file| context_text(&file.path, 160))
+            .filter(|path| !path.is_empty())
+            .collect(),
+        captured_at: snapshot.captured_at.clone(),
+        status: snapshot.status.clone(),
+    }
+}
+
+fn codex_task_is_superseded_by_accepted_target(task: &CodexTask, tasks: &[CodexTask]) -> bool {
+    if !matches!(task.status.as_str(), "needsReview" | "failed")
+        || !task.remaining_issues.is_empty()
+        || task.target_files.is_empty()
+    {
+        return false;
+    }
+    tasks.iter().any(|candidate| {
+        candidate.task_id != task.task_id
+            && candidate.status == "completed"
+            && candidate.acceptance.status == "approved"
+            && candidate.created_at > task.created_at
+            && target_files_overlap(&task.target_files, &candidate.target_files)
+    })
+}
+
+fn target_files_overlap(left: &[String], right: &[String]) -> bool {
+    left.iter().any(|left_path| {
+        let left_key = normalize_target_path(left_path);
+        !left_key.is_empty()
+            && right.iter().any(|right_path| {
+                let right_key = normalize_target_path(right_path);
+                !right_key.is_empty()
+                    && (left_key == right_key
+                        || left_key.ends_with(&format!("/{right_key}"))
+                        || right_key.ends_with(&format!("/{left_key}")))
+            })
+    })
+}
+
+fn normalize_target_path(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_ascii_lowercase()
 }
 
 fn context_file_from_projection(projection: FileProjection) -> ProjectContextFile {
@@ -2446,8 +3220,28 @@ fn context_file_from_projection(projection: FileProjection) -> ProjectContextFil
         document_purpose: context_text(&projection.metadata.document_purpose, 64),
         lifecycle_status: context_text(&projection.metadata.lifecycle_status, 64),
         location: context_text(&projection.location.workspace_relative_path, 180),
-        summary: context_text(&projection.summary, 180),
+        summary: context_file_summary(&projection.summary),
     }
+}
+
+fn context_file_summary(value: &str) -> String {
+    let normalized = value.to_ascii_lowercase();
+    if [
+        "taskid",
+        "runid",
+        "resultid",
+        "prompt",
+        "stdout",
+        "stderr",
+        "exitcode",
+        "runnerfallback",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+    {
+        return "资料摘要包含技术执行记录，已隐藏详细内容。".to_string();
+    }
+    context_text(value, 180)
 }
 
 fn context_codex_result(task: &CodexTask) -> ProjectContextCodexResult {
@@ -2514,6 +3308,102 @@ fn context_evidence_labels(evidence: &[EvidenceRef], limit: usize) -> Vec<String
         .filter(|label| !label.is_empty())
         .take(limit)
         .collect()
+}
+
+fn is_user_confirmed_context_decision(
+    manifest: &ProjectManifest,
+    work_events: &[WorkEvent],
+    decision: &DecisionRecord,
+) -> bool {
+    let summary = decision.summary.trim();
+    if summary.is_empty() {
+        return false;
+    }
+    if is_legacy_decision_pollution(summary) {
+        return false;
+    }
+    let lower = summary.to_lowercase();
+    let system_fact_markers = [
+        "项目目录扫描",
+        "待确认事项",
+        "发现新文件",
+        "inbox",
+        "git ",
+        "git:",
+        "codex",
+        "result bridge",
+        "诊断",
+        "错误",
+        "刷新项目事实",
+    ];
+    if system_fact_markers
+        .iter()
+        .any(|marker| lower.contains(&marker.to_lowercase()))
+    {
+        return false;
+    }
+
+    if !decision.source_message_id.trim().is_empty() {
+        return manifest
+            .messages
+            .iter()
+            .find(|message| message.id == decision.source_message_id)
+            .map(|message| {
+                message.author == "user"
+                    && extract_explicit_recorded_decision(&message.text)
+                        .map(|value| normalize_user_text(&value) == normalize_user_text(summary))
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+    }
+
+    let decision_ref = format!("decision:{}", decision.id);
+    work_events.iter().any(|event| {
+        event.project_id == manifest.project.id
+            && event.source_type == "user"
+            && event.event_type == "user.decisionRecorded"
+            && (event
+                .evidence_refs
+                .iter()
+                .any(|reference| reference == &decision_ref)
+                || event
+                    .summary
+                    .strip_prefix("用户确认决定：")
+                    .map(|value| normalize_user_text(value) == normalize_user_text(summary))
+                    .unwrap_or(false))
+    })
+}
+
+// Historical AI/system records sometimes stored a Markdown section heading as
+// a DecisionRecord summary. Treat those records as analysis history, not as a
+// user-confirmed decision, even if an old ledger entry happens to reference it.
+fn is_legacy_decision_pollution(summary: &str) -> bool {
+    let first_line = summary
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '-' | '*' | '#')
+        })
+        .trim();
+    let lower = first_line.to_lowercase();
+    let legacy_analysis_prefixes = [
+        "已知事实",
+        "ai总结",
+        "建议",
+        "项目说明",
+        "初始化登记",
+        "拟记录条目",
+        "本会话已整理为 decision trace",
+    ];
+    legacy_analysis_prefixes
+        .iter()
+        .any(|marker| lower.starts_with(&marker.to_lowercase()))
+}
+
+fn normalize_user_text(value: &str) -> String {
+    value.split_whitespace().collect::<String>()
 }
 
 fn context_text(value: &str, max_chars: usize) -> String {
@@ -2597,9 +3487,46 @@ fn format_project_context_markdown(packet: &ProjectContextPacket) -> String {
             lines.push(format!("- 依据：{}", focus.evidence.join("；")));
         }
     }
+    if !packet.current_phase.is_empty() || !packet.next_step.is_empty() {
+        lines.extend([String::new(), "## 当前状态".to_string()]);
+        if !packet.current_phase.is_empty() {
+            lines.push(format!("- 阶段：{}", packet.current_phase));
+        }
+        if !packet.next_step.is_empty() {
+            lines.push(format!("- 下一步：{}", packet.next_step));
+        }
+    }
     append_context_activity_markdown(&mut lines, &packet.recent_activity);
     append_context_pending_markdown(&mut lines, &packet.pending_actions);
     append_context_file_markdown(&mut lines, &packet.files);
+    if !packet.decisions.is_empty() {
+        lines.extend([String::new(), "## 已确认决定".to_string()]);
+        for decision in &packet.decisions {
+            lines.push(format!("- {}", decision.summary));
+        }
+    }
+    if let Some(git) = &packet.git_facts {
+        lines.extend([String::new(), "## Git 事实".to_string()]);
+        lines.push(format!(
+            "- {} {}{}",
+            git.branch,
+            git.head_short,
+            if git.subject.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", git.subject)
+            }
+        ));
+        for commit in &git.recent_commits {
+            lines.push(format!("- {} · {}", commit.short_hash, commit.subject));
+        }
+    }
+    if !packet.risks.is_empty() {
+        lines.extend([String::new(), "## 已知风险或阻塞".to_string()]);
+        for risk in &packet.risks {
+            lines.push(format!("- {}", risk));
+        }
+    }
     if let Some(result) = &packet.codex_result {
         lines.extend([
             String::new(),
@@ -2710,9 +3637,49 @@ pub fn record_user_decision_event(
         return Err("决定内容不能为空。".to_string());
     }
     let root = PathBuf::from(&project_root);
+    let _guard = project_write_lock()
+        .lock()
+        .map_err(|_| "项目存储锁已损坏，请重启感冒院。".to_string())?;
     let mut manifest = read_and_repair_manifest(&root)?;
+    let write = record_user_decision_event_in_manifest(
+        &root,
+        &mut manifest,
+        &decision,
+        reason.as_deref(),
+        None,
+    )?;
+    if !write.is_new {
+        return Ok(write.event);
+    }
+    persist_project(&root, &manifest, None)?;
+    append_audit_event(&root, manifest.audit.last().expect("audit event exists"))?;
+    append_work_event_if_new(&root, write.event.clone())?
+        .ok_or_else(|| "该决定事实已存在。".to_string())
+}
+
+struct DecisionEventWrite {
+    event: WorkEvent,
+    is_new: bool,
+}
+
+#[derive(Debug)]
+struct NextStepEventWrite {
+    event: WorkEvent,
+    is_new: bool,
+}
+
+fn record_user_decision_event_in_manifest(
+    root: &Path,
+    manifest: &mut ProjectManifest,
+    decision: &str,
+    reason: Option<&str>,
+    source_message_id: Option<&str>,
+) -> Result<DecisionEventWrite, String> {
+    let decision = decision.trim();
+    if decision.is_empty() {
+        return Err("决定内容不能为空。".to_string());
+    }
     let reason_text = reason
-        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("");
@@ -2721,10 +3688,13 @@ pub fn record_user_decision_event(
         manifest.project.id, decision, reason_text
     ));
     let event_key = work_event_key("user", &source_ref, "user.decisionRecorded");
-    if let Some(existing) = read_work_ledger(&root)?.events.into_iter().find(|event| {
+    if let Some(existing) = read_work_ledger(root)?.events.into_iter().find(|event| {
         work_event_key(&event.source_type, &event.source_ref, &event.event_type) == event_key
     }) {
-        return Ok(existing);
+        return Ok(DecisionEventWrite {
+            event: existing,
+            is_new: false,
+        });
     }
     let now = now_string();
     let decision_record = manifest
@@ -2734,8 +3704,8 @@ pub fn record_user_decision_event(
         .cloned()
         .unwrap_or_else(|| DecisionRecord {
             id: new_id(),
-            summary: decision.clone(),
-            source_message_id: String::new(),
+            summary: decision.to_string(),
+            source_message_id: source_message_id.unwrap_or_default().to_string(),
             created_at: now.clone(),
         });
     let trace = new_decision_trace(
@@ -2747,7 +3717,7 @@ pub fn record_user_decision_event(
             label: "用户手动记录".to_string(),
             summary: first_line(
                 if reason_text.is_empty() {
-                    &decision
+                    decision
                 } else {
                     reason_text
                 },
@@ -2756,7 +3726,7 @@ pub fn record_user_decision_event(
             source_id: decision_record.id.clone(),
         }],
         "用户确认的项目决定。".to_string(),
-        decision.clone(),
+        decision.to_string(),
         trace_confidence(100),
     );
     if !manifest
@@ -2770,12 +3740,10 @@ pub fn record_user_decision_event(
         "workLedger.userDecision",
         &manifest.project.id,
         "success",
-        decision.clone(),
+        decision.to_string(),
         false,
         true,
     ));
-    persist_project(&root, &manifest, None)?;
-    append_audit_event(&root, manifest.audit.last().expect("audit event exists"))?;
     let mut event = fact_event(
         &manifest.project.id,
         "user",
@@ -2787,7 +3755,72 @@ pub fn record_user_decision_event(
     );
     event.decision_trace_id = trace.id.clone();
     event.decision_trace = trace;
-    append_work_event_if_new(&root, event.clone())?.ok_or_else(|| "该决定事实已存在。".to_string())
+    Ok(DecisionEventWrite {
+        event,
+        is_new: true,
+    })
+}
+
+fn record_user_next_step_event_in_manifest(
+    root: &Path,
+    manifest: &mut ProjectManifest,
+    next_step: &str,
+    reason: Option<&str>,
+    source_message_id: Option<&str>,
+) -> Result<NextStepEventWrite, String> {
+    let next_step = next_step.trim();
+    if next_step.is_empty() {
+        return Err("下一步内容不能为空。".to_string());
+    }
+    let reason_text = reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    let source_ref =
+        captured_fact_source_ref(&manifest.project.id, "nextAction", next_step, reason_text);
+    let event_key = work_event_key("user", &source_ref, "user.nextActionRecorded");
+
+    // The manifest is the canonical current next-step surface. Re-assert it
+    // even for a duplicate submission so a repaired/older manifest converges
+    // without creating another ledger event.
+    manifest.project.next_step = next_step.to_string();
+    manifest.project.last_opened_at = now_string();
+
+    if let Some(existing) = read_work_ledger(root)?.events.into_iter().find(|event| {
+        work_event_key(&event.source_type, &event.source_ref, &event.event_type) == event_key
+    }) {
+        return Ok(NextStepEventWrite {
+            event: existing,
+            is_new: false,
+        });
+    }
+
+    manifest.audit.push(audit_event(
+        "workLedger.userNextStep",
+        &manifest.project.id,
+        "success",
+        next_step.to_string(),
+        false,
+        true,
+    ));
+    let mut evidence_refs = vec![format!("userCapture:{source_ref}")];
+    if let Some(message_id) = source_message_id.filter(|value| !value.trim().is_empty()) {
+        evidence_refs.push(format!("message:{message_id}"));
+    }
+    let mut event = fact_event(
+        &manifest.project.id,
+        "user",
+        &source_ref,
+        "user.nextActionRecorded",
+        format!("用户记录下一步：{next_step}"),
+        evidence_refs,
+        100,
+    );
+    event.fact_kind = "userConfirmed".to_string();
+    Ok(NextStepEventWrite {
+        event,
+        is_new: true,
+    })
 }
 
 pub fn capture_project_fact(
@@ -2808,6 +3841,26 @@ pub fn capture_project_fact(
     let ledger = read_work_ledger(&root)?;
     let content = first_line(&request.content, 240);
     let reason = first_line(&request.reason, 240);
+    if capture_type == "nextAction" {
+        if content.is_empty() {
+            return Err("请说明下一步要做什么。".to_string());
+        }
+        let mut manifest = manifest;
+        let write = record_user_next_step_event_in_manifest(
+            &root,
+            &mut manifest,
+            &content,
+            (!reason.is_empty()).then_some(reason.as_str()),
+            None,
+        )?;
+        persist_project(&root, &manifest, None)?;
+        if write.is_new {
+            append_audit_event(&root, manifest.audit.last().expect("audit event exists"))?;
+            append_work_event_if_new(&root, write.event.clone())?
+                .ok_or_else(|| "该下一步事实已存在。".to_string())?;
+        }
+        return Ok(write.event);
+    }
     let (event_type, summary, source_ref) = match capture_type {
         "progress" => {
             if content.is_empty() {
@@ -2826,16 +3879,6 @@ pub fn capture_project_fact(
             (
                 "user.blockerRecorded",
                 format!("用户记录阻塞：{content}"),
-                captured_fact_source_ref(&manifest.project.id, capture_type, &content, &reason),
-            )
-        }
-        "nextAction" => {
-            if content.is_empty() {
-                return Err("请说明下一步要做什么。".to_string());
-            }
-            (
-                "user.nextActionRecorded",
-                format!("用户记录下一步：{content}"),
                 captured_fact_source_ref(&manifest.project.id, capture_type, &content, &reason),
             )
         }
@@ -2874,6 +3917,20 @@ pub fn capture_project_fact(
             return Err("不支持的工作记录类型。".to_string());
         }
     };
+    let resolves_current_next_step = event_type == "user.actionResolved"
+        && ledger.events.iter().any(|event| {
+            event.project_id == manifest.project.id
+                && event.source_type == "user"
+                && event.source_ref == source_ref
+                && event.event_type == "user.nextActionRecorded"
+                && event
+                    .summary
+                    .strip_prefix("用户记录下一步：")
+                    .map(str::trim)
+                    .is_some_and(|value| {
+                        normalize_key(value) == normalize_key(&manifest.project.next_step)
+                    })
+        });
 
     if let Some(existing) = ledger.events.into_iter().find(|event| {
         work_event_key(&event.source_type, &event.source_ref, &event.event_type)
@@ -2896,6 +3953,9 @@ pub fn capture_project_fact(
         .ok_or_else(|| "该工作事实已存在。".to_string())?;
 
     let mut manifest = manifest;
+    if resolves_current_next_step {
+        manifest.project.next_step.clear();
+    }
     manifest.audit.push(audit_event(
         "workLedger.userFactCaptured",
         &manifest.project.id,
@@ -3200,9 +4260,12 @@ fn codex_result_contract_from_text(report: &CodexReportRecord, raw: &str) -> Cod
             ),
             result_source: json_string_field(&value, &["resultSource", "result_source"]),
             result_run_id: json_string_field(&value, &["resultRunId", "runId", "result_run_id"]),
-            changed_files: json_string_array_field(&value, &["changedFiles", "changed_files"]),
-            commits: json_string_array_field(&value, &["commits"]),
-            tests: json_string_array_field(&value, &["tests"]),
+            changed_files: json_coding_string_array_field(
+                &value,
+                &["changedFiles", "changed_files"],
+            ),
+            commits: json_coding_string_array_field(&value, &["commits"]),
+            tests: json_coding_display_array_field(&value, &["tests"]),
             findings: json_string_array_field(&value, &["findings"]),
             recommendations: json_string_array_field(&value, &["recommendations"]),
             questions: json_string_array_field(&value, &["questions"]),
@@ -3394,11 +4457,10 @@ fn codex_task_git_required(task: &CodexTask) -> bool {
     match normalize_codex_task_type(&task.task_type).as_str() {
         "analysis" => false,
         "coding" => true,
-        "verification" | "fileOperation" => {
-            !task.reported_commits.is_empty()
-                || !task.changed_files.is_empty()
-                || !task.target_files.is_empty()
-        }
+        // File operations can intentionally create non-committed artifacts, such as
+        // a user-approved document or the Golden Path verification file. Git only
+        // becomes a completion gate when the Codex result explicitly reports commits.
+        "verification" | "fileOperation" => !task.reported_commits.is_empty(),
         _ => !task.reported_commits.is_empty(),
     }
 }
@@ -3492,9 +4554,7 @@ fn upsert_codex_task_from_report(
         title: first_line(&report.summary, 80),
         created_at: now.clone(),
         status: "resultReceived".to_string(),
-        expected_result_path: path_to_string(
-            &codex_result_bridge_dir(root).join(format!("{task_id}-result.json")),
-        ),
+        expected_result_path: path_to_string(&canonical_codex_result_path(root, &task_id)),
         ..CodexTask::default()
     });
     // Scanning an immutable report again must not replay its state transition.
@@ -3668,6 +4728,15 @@ fn verify_codex_task_against_git(root: &Path, task: &mut CodexTask) {
         };
         return;
     }
+    if let Err(reason) = verify_codex_task_commit_baseline(root, task, &repo) {
+        task.git_verification = CodexTaskGitVerification {
+            status: "mismatch".to_string(),
+            repository_path: path_to_string(&repo),
+            checked_at: now_string(),
+            reason,
+        };
+        return;
+    }
     let head = run_git(&repo, &["rev-parse", "HEAD"]);
     let mut verified = Vec::new();
     let mut missing = Vec::new();
@@ -3713,34 +4782,76 @@ fn verify_codex_task_against_git(root: &Path, task: &mut CodexTask) {
     };
 }
 
-fn ensure_successful_codex_runs_have_results(root: &Path) -> Result<(), String> {
-    let runs = read_codex_runs(root)?;
-    let mut seen_tasks = HashSet::new();
-    for run in runs {
-        if !seen_tasks.insert(run.task_id.clone()) {
+fn verify_codex_task_commit_baseline(
+    root: &Path,
+    task: &CodexTask,
+    repository_path: &Path,
+) -> Result<(), String> {
+    if task.result_run_id.trim().is_empty() {
+        return Ok(());
+    }
+    let run = read_codex_runs(root)?
+        .into_iter()
+        .find(|run| run.id == task.result_run_id && run.task_id == task.task_id)
+        .ok_or_else(|| "Codex 结果没有匹配的任务启动 Git 基线。".to_string())?;
+    // Existing runs predate baseline persistence. They remain compatible, while every
+    // newly started coding run must prove its reported commit descended from its start.
+    if run.git_head_before.trim().is_empty() {
+        return Ok(());
+    }
+    let baseline_paths = run
+        .git_dirty_files_before
+        .iter()
+        .map(|file| normalize_key(&file.path))
+        .filter(|path| !path.is_empty())
+        .collect::<HashSet<_>>();
+    for commit in &task.reported_commits {
+        if run_git(
+            repository_path,
+            &["merge-base", "--is-ancestor", &run.git_head_before, commit],
+        )
+        .is_err()
+        {
+            return Err(format!(
+                "报告的 commit {commit} 不在本任务启动前 HEAD {} 之后，不能作为本次任务证据。",
+                run.git_head_before
+            ));
+        }
+        if baseline_paths.is_empty() {
             continue;
         }
-        if run.status == "exited" && run.exit_code == Some(0) {
-            ensure_codex_runner_fallback_result(root, &run.task_id, Some(&run), false)?;
+        let commit_files = run_git(
+            repository_path,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", commit],
+        )?;
+        let overlaps = commit_files
+            .lines()
+            .map(str::trim)
+            .filter(|path| baseline_paths.contains(&normalize_key(path)))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if !overlaps.is_empty() {
+            return Err(format!(
+                "本次任务开始前已存在未提交修改，报告的 commit 包含这些文件：{}。为避免混入无关改动，不能通过 Git 核验。",
+                overlaps.join("、")
+            ));
         }
     }
     Ok(())
 }
 
-fn ensure_codex_runner_fallback_result(
+fn wait_for_matching_codex_result(
     root: &Path,
     task_id: &str,
-    run: Option<&CodexRun>,
+    run: &CodexRun,
     wait_for_result_file: bool,
-) -> Result<Option<PathBuf>, String> {
-    if let Some(run) = run {
-        if let Some(latest) = read_codex_runs(root)?
-            .into_iter()
-            .find(|item| item.task_id == task_id)
-        {
-            if latest.id != run.id {
-                return Ok(None);
-            }
+) -> Result<(), String> {
+    if let Some(latest) = read_codex_runs(root)?
+        .into_iter()
+        .find(|item| item.task_id == task_id)
+    {
+        if latest.id != run.id {
+            return Err("当前执行已被更新的 CodexRun 替代，不能接收旧执行结果。".to_string());
         }
     }
     let task = read_codex_task(root, task_id)?;
@@ -3749,69 +4860,27 @@ fn ensure_codex_runner_fallback_result(
     let has_current_result = || {
         [json_path.as_path(), markdown_path.as_path()]
             .into_iter()
-            .any(|path| {
-                run.map(|run| codex_result_file_matches_run(path, run))
-                    .unwrap_or_else(|| path.is_file())
-            })
+            .any(|path| codex_result_file_matches_run(path, run))
     };
     if has_current_result() {
-        return Ok(None);
+        return Ok(());
     }
     if wait_for_result_file {
-        for _ in 0..5 {
+        for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(250));
             if has_current_result() {
-                return Ok(None);
+                return Ok(());
             }
         }
     }
 
     if json_path.exists() || markdown_path.exists() {
-        mark_codex_task_run_failed(
-            root,
-            task_id,
-            "本次执行未生成可匹配的结果；现有结果属于旧执行或无法解析，已保留，请检查后重试。",
-        )?;
-        return Ok(None);
+        return Err(
+            "本次执行未生成可匹配的结果；现有结果属于旧执行或无法解析，已保留，请检查后重试。"
+                .to_string(),
+        );
     }
-
-    let last_message = run
-        .and_then(|item| read_optional_text(Path::new(&item.output_last_message_path)))
-        .filter(|text| !text.trim().is_empty())
-        .or_else(|| run.map(|item| item.stdout_summary.clone()))
-        .unwrap_or_default();
-    let has_useful_output = last_message.trim().chars().count() >= 20;
-    let summary = if has_useful_output {
-        format!(
-            "Codex CLI 已正常退出，Result Bridge 使用 runnerFallback 整理执行结果：{}",
-            first_line(&last_message, 220)
-        )
-    } else {
-        "Codex CLI 已正常退出，但当前 run 没有足够输出；需要人工检查结果。".to_string()
-    };
-    let completed_at = run
-        .map(|item| item.ended_at.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(now_string);
-    let fallback = json!({
-        "taskId": task.task_id,
-        "taskType": empty_label(&task.task_type, "analysis"),
-        "status": "needsReview",
-        "summary": summary,
-        "resultText": last_message,
-        "changedFiles": [],
-        "commits": [],
-        "tests": [],
-        "remainingIssues": [],
-        "manualAcceptance": [],
-        "completedAt": completed_at,
-        "resultSource": "runnerFallback",
-        "resultRunId": run.map(|item| item.id.clone()).unwrap_or_default(),
-    });
-    let text = serde_json::to_string_pretty(&fallback)
-        .map_err(|err| format!("生成 Codex fallback result 失败：{err}"))?;
-    write_text_atomic(&json_path, &text)?;
-    Ok(Some(json_path))
+    Err("Codex 已退出，但没有在当前项目 Result Bridge 目录写入匹配本次运行的结果。".to_string())
 }
 
 fn codex_result_path_for_task(root: &Path, task: &CodexTask, extension: &str) -> PathBuf {
@@ -3819,6 +4888,10 @@ fn codex_result_path_for_task(root: &Path, task: &CodexTask, extension: &str) ->
         return PathBuf::from(task.expected_result_path.trim());
     }
     codex_result_bridge_dir(root).join(format!("{}-result.{extension}", task.task_id))
+}
+
+fn canonical_codex_result_path(root: &Path, task_id: &str) -> PathBuf {
+    codex_result_bridge_dir(root).join(format!("{task_id}-result.json"))
 }
 
 fn read_optional_text(path: &Path) -> Option<String> {
@@ -3908,42 +4981,212 @@ fn preferred_project_repository_path(root: &Path, manifest: &ProjectManifest) ->
 }
 
 fn active_codex_run_for_task(root: &Path, task_id: &str) -> Result<Option<CodexRun>, String> {
-    Ok(read_codex_runs(root)?
-        .into_iter()
-        .find(|run| run.task_id == task_id && run.status == "running" && process_exists(run.pid)))
+    Ok(read_codex_runs(root)?.into_iter().find(|run| {
+        run.task_id == task_id
+            && (run.status == "starting" || (run.status == "running" && process_exists(run.pid)))
+    }))
 }
 
 fn recover_stale_codex_runs(root: &Path) -> Result<(), String> {
     let mut runs = read_codex_runs(root)?;
     let mut changed = false;
+    let mut awaiting_result = Vec::new();
+    let mut timed_out_tasks = Vec::new();
+    let latest_run_ids = latest_codex_run_ids(&runs);
     for run in &mut runs {
-        if run.status == "running" && !process_exists(run.pid) {
+        if matches!(run.status.as_str(), "starting" | "running") {
+            let process_alive = run.pid != 0 && process_exists(run.pid);
+            if run.process_alive != process_alive {
+                run.process_alive = process_alive;
+                changed = true;
+            }
+        }
+        // Result Bridge is authoritative once a result is already bound to this run.
+        // A concurrent list refresh can otherwise mistake the short CLI exit window
+        // for an application restart and surface a false recovery warning.
+        if matches!(
+            run.status.as_str(),
+            "starting" | "running" | "unknownAfterRestart"
+        ) && codex_result_exists_for_run(root, run)
+        {
+            run.status = "exited".to_string();
+            run.process_alive = false;
+            if run.ended_at.trim().is_empty() {
+                run.ended_at = now_string();
+            }
+            run.error.clear();
+            changed = true;
+            continue;
+        }
+        // A test may use the host PID as a liveness sentinel. A real Codex child
+        // can never be the desktop process itself, so never terminate the host.
+        let task_type = read_codex_task(root, &run.task_id)
+            .map(|task| task.task_type)
+            .unwrap_or_default();
+        let execution_timed_out = run.status == "running"
+            && run.pid != std::process::id()
+            && process_exists(run.pid)
+            && codex_run_execution_timed_out(run, &task_type)
+            && !codex_result_exists_for_run(root, run);
+        if execution_timed_out {
+            if process_exists(run.pid) {
+                let _ = terminate_process(run.pid);
+            }
+            run.status = "failed".to_string();
+            run.process_alive = false;
+            run.ended_at = now_string();
+            run.error = codex_timeout_error(&task_type);
+            changed = true;
+            if latest_run_ids
+                .get(&run.task_id)
+                .is_some_and(|latest_id| latest_id == &run.id)
+            {
+                timed_out_tasks.push(run.task_id.clone());
+            }
+            continue;
+        }
+        let lost_running_process = run.status == "running" && !process_exists(run.pid);
+        let expired_startup = run.status == "starting" && codex_startup_window_expired(run);
+        if lost_running_process || expired_startup {
             run.status = "unknownAfterRestart".to_string();
+            run.process_alive = false;
             run.ended_at = now_string();
             run.error =
                 "应用重启后未检测到原 Codex 进程；请等待 Result Bridge 或查看仓库 Git 事实。"
                     .to_string();
             changed = true;
+            if latest_run_ids
+                .get(&run.task_id)
+                .is_some_and(|latest_id| latest_id == &run.id)
+                && read_codex_task(root, &run.task_id).is_ok()
+                && !codex_result_exists_for_run(root, run)
+            {
+                awaiting_result.push(run.task_id.clone());
+            }
         }
     }
     if changed {
         write_codex_runs(root, runs)?;
     }
+    for task_id in awaiting_result {
+        mark_codex_task_awaiting_result(root, &task_id)?;
+    }
+    for task_id in timed_out_tasks {
+        let task_type = read_codex_task(root, &task_id)
+            .map(|task| task.task_type)
+            .unwrap_or_default();
+        mark_codex_task_restart_recovery_expired(root, &task_id, &codex_timeout_error(&task_type))?;
+    }
     sync_failed_codex_runs_to_tasks(root)
 }
 
 fn codex_expected_result_exists(root: &Path, task_id: &str) -> bool {
-    let result_dir = codex_result_bridge_dir(root);
-    let latest = read_codex_runs(root)
-        .ok()
-        .and_then(|runs| runs.into_iter().find(|run| run.task_id == task_id));
-    ["json", "md"].into_iter().any(|extension| {
-        let path = result_dir.join(format!("{task_id}-result.{extension}"));
-        latest
-            .as_ref()
-            .map(|run| codex_result_file_matches_run(&path, run))
-            .unwrap_or_else(|| path.is_file())
-    })
+    let latest = read_codex_runs(root).ok().and_then(|runs| {
+        runs.into_iter()
+            .filter(|run| run.task_id == task_id)
+            .max_by_key(codex_run_started_at)
+    });
+    latest
+        .as_ref()
+        .map(|run| codex_result_exists_for_run(root, run))
+        .unwrap_or(false)
+}
+
+fn codex_run_started_at(run: &CodexRun) -> u128 {
+    run.started_at.parse::<u128>().unwrap_or_default()
+}
+
+fn codex_startup_window_expired(run: &CodexRun) -> bool {
+    let now = now_string().parse::<u128>().unwrap_or_default();
+    now.saturating_sub(codex_run_started_at(run)) >= 30_000
+}
+
+fn codex_run_timeout(task_type: &str) -> Duration {
+    if normalize_codex_task_type(task_type) == "coding" {
+        CODEX_CODING_RUN_TIMEOUT
+    } else {
+        CODEX_STANDARD_RUN_TIMEOUT
+    }
+}
+
+fn codex_timeout_error(task_type: &str) -> String {
+    let timeout = codex_run_timeout(task_type).as_secs() / 60;
+    if normalize_codex_task_type(task_type) == "coding" {
+        format!(
+            "Codex 代码任务执行超过 {timeout} 分钟仍未结束，已停止该任务进程。请检查 Codex 登录、审批、网络或仓库状态后重新执行。"
+        )
+    } else {
+        format!(
+            "Codex 任务执行超过 {timeout} 分钟仍未结束，已停止该任务进程。请检查 Codex 登录、审批、网络或仓库状态后重新执行。"
+        )
+    }
+}
+
+fn is_codex_timeout_error(error: &str) -> bool {
+    error.contains("Codex 代码任务执行超过")
+        || error.contains("Codex 任务执行超过")
+        || error.contains("Codex 执行超过 3 分钟")
+}
+
+fn codex_run_execution_timed_out(run: &CodexRun, task_type: &str) -> bool {
+    let now = now_string().parse::<u128>().unwrap_or_default();
+    now.saturating_sub(codex_run_started_at(run)) >= codex_run_timeout(task_type).as_millis()
+}
+
+fn latest_codex_run_ids(runs: &[CodexRun]) -> HashMap<String, String> {
+    let mut latest = HashMap::new();
+    for run in runs {
+        let replace = latest
+            .get(&run.task_id)
+            .and_then(|run_id: &String| runs.iter().find(|item| item.id == *run_id))
+            .is_none_or(|current| codex_run_started_at(run) >= codex_run_started_at(current));
+        if replace {
+            latest.insert(run.task_id.clone(), run.id.clone());
+        }
+    }
+    latest
+}
+
+fn codex_result_exists_for_run(root: &Path, run: &CodexRun) -> bool {
+    let Ok(task) = read_codex_task(root, &run.task_id) else {
+        return false;
+    };
+    ["json", "md"]
+        .into_iter()
+        .map(|extension| codex_result_path_for_task(root, &task, extension))
+        .any(|path| codex_result_file_matches_run(&path, run))
+}
+
+fn codex_restart_result_grace_expired(run: &CodexRun) -> bool {
+    let recovered_at = run.ended_at.parse::<u128>().ok();
+    let now = now_string().parse::<u128>().unwrap_or_default();
+    recovered_at
+        .map(|value| now.saturating_sub(value) >= CODEX_RESTART_RESULT_GRACE_MS)
+        .unwrap_or(false)
+}
+
+fn mark_codex_task_restart_recovery_expired(
+    root: &Path,
+    task_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let mut task = read_codex_task(root, task_id)?;
+    if matches!(
+        task.status.as_str(),
+        "resultReceived" | "awaitingAcceptance" | "completed" | "cancelled"
+    ) {
+        return Ok(());
+    }
+    task.status = "needsReview".to_string();
+    task.updated_at = now_string();
+    if !task
+        .remaining_issues
+        .iter()
+        .any(|item| item.trim() == reason.trim())
+    {
+        task.remaining_issues.push(reason.to_string());
+    }
+    write_codex_task(root, &task)
 }
 
 fn codex_result_file_matches_run(path: &Path, run: &CodexRun) -> bool {
@@ -3951,6 +5194,13 @@ fn codex_result_file_matches_run(path: &Path, run: &CodexRun) -> bool {
         return false;
     };
     codex_result_text_matches_run(path, &text, run)
+}
+
+fn codex_run_finished_with_bound_result(run: &CodexRun, result_path: &Path) -> bool {
+    run.status == "exited"
+        && run.exit_code.map(|code| code != 0).unwrap_or(false)
+        && run.error.contains("已收到本次真实 Codex 结果")
+        && codex_result_file_matches_run(result_path, run)
 }
 
 fn codex_result_text_matches_run(path: &Path, text: &str, run: &CodexRun) -> bool {
@@ -4012,26 +5262,44 @@ fn repair_codex_run_failure_messages(root: &Path) -> Result<(), String> {
 
 fn sync_failed_codex_runs_to_tasks(root: &Path) -> Result<(), String> {
     let runs = read_codex_runs(root)?;
-    let mut latest_by_task: HashMap<String, CodexRun> = HashMap::new();
-    for run in runs {
-        latest_by_task.entry(run.task_id.clone()).or_insert(run);
-    }
+    let latest_ids = latest_codex_run_ids(&runs);
+    let latest_by_task: HashMap<String, CodexRun> = runs
+        .into_iter()
+        .filter(|run| latest_ids.get(&run.task_id).is_some_and(|id| id == &run.id))
+        .map(|run| (run.task_id.clone(), run))
+        .collect();
     for (task_id, run) in latest_by_task {
         if !matches!(run.status.as_str(), "failed" | "unknownAfterRestart") {
-            continue;
-        }
-        if run.status == "unknownAfterRestart" && codex_expected_result_exists(root, &task_id) {
             continue;
         }
         let task = match read_codex_task(root, &task_id) {
             Ok(task) => task,
             Err(_) => continue,
         };
+        if run.status == "unknownAfterRestart" {
+            if codex_expected_result_exists(root, &task_id) {
+                continue;
+            }
+            if !codex_restart_result_grace_expired(&run) {
+                mark_codex_task_awaiting_result(root, &task_id)?;
+                continue;
+            }
+            mark_codex_task_restart_recovery_expired(
+                root,
+                &task_id,
+                "应用重启后未收到匹配的 Codex 结果；恢复窗口已结束，请检查仓库后重新执行。",
+            )?;
+            continue;
+        }
         if matches!(
             task.status.as_str(),
             "resultReceived" | "awaitingAcceptance" | "completed" | "cancelled"
         ) || (!task.result_id.trim().is_empty() && task.status != "running")
         {
+            continue;
+        }
+        if is_codex_timeout_error(&run.error) {
+            mark_codex_task_restart_recovery_expired(root, &task_id, &run.error)?;
             continue;
         }
         mark_codex_task_run_failed(root, &task_id, &run.error)?;
@@ -4045,12 +5313,28 @@ fn codex_command_name() -> String {
         if let Some(path) = discover_native_codex_exe() {
             return path_to_string(&path);
         }
+        if let Some(path) = discover_path_codex_cmd() {
+            return path_to_string(&path);
+        }
         return "codex.cmd".to_string();
     }
     #[cfg(not(target_os = "windows"))]
     {
         "codex".to_string()
     }
+}
+
+#[cfg(target_os = "windows")]
+fn discover_path_codex_cmd() -> Option<PathBuf> {
+    let output = hidden_command("where.exe").arg("codex.cmd").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
 }
 
 #[cfg(target_os = "windows")]
@@ -4079,9 +5363,10 @@ fn discover_native_codex_exe() -> Option<PathBuf> {
 
 fn codex_exec_args(
     repo: &Path,
-    project_root: &Path,
+    result_directory: &Path,
     output_last_message: &Path,
     probe: &CodexCliCapabilityProbe,
+    native_executable: bool,
 ) -> Result<Vec<String>, String> {
     let mut missing = Vec::new();
     if !probe.supports_cd {
@@ -4096,7 +5381,7 @@ fn codex_exec_args(
     if !probe.supports_output_last_message {
         missing.push("--output-last-message");
     }
-    if !probe.supports_sandbox {
+    if !native_executable && !probe.supports_sandbox {
         missing.push("--sandbox");
     }
     if !probe.supports_stdin {
@@ -4108,70 +5393,62 @@ fn codex_exec_args(
             missing.join(", ")
         ));
     }
-    Ok(vec![
+    let mut args = vec![
         "exec".to_string(),
         "-C".to_string(),
         path_to_string(repo),
         "--add-dir".to_string(),
-        path_to_string(project_root),
+        path_to_string(result_directory),
         "--json".to_string(),
         "--output-last-message".to_string(),
         path_to_string(output_last_message),
-        "--sandbox".to_string(),
-        "workspace-write".to_string(),
-        "-".to_string(),
-    ])
+    ];
+    if native_executable {
+        // Current native Codex supports this safe workspace-write approval mode,
+        // while combining it with --sandbox is rejected by the CLI.
+        args.extend([
+            "--approve-for-me".to_string(),
+            "--ignore-user-config".to_string(),
+        ]);
+    } else {
+        args.extend(["--sandbox".to_string(), "workspace-write".to_string()]);
+    }
+    args.push("-".to_string());
+    Ok(args)
 }
 
-fn probe_codex_cli_capabilities() -> CodexCliCapabilityProbe {
+fn probe_codex_cli_capabilities(executable: &str) -> CodexCliCapabilityProbe {
     let checked_at = now_string();
-    let executable = codex_command_name();
-    let version_output = hidden_command(&executable).arg("--version").output();
-    let version = match version_output {
-        Ok(output) if output.status.success() => {
-            first_line(&String::from_utf8_lossy(&output.stdout), 120)
-        }
-        Ok(output) => {
-            return CodexCliCapabilityProbe {
-                available: false,
-                checked_at,
-                failure_reason: first_line(&String::from_utf8_lossy(&output.stderr), 240),
-                ..CodexCliCapabilityProbe::default()
-            };
-        }
-        Err(err) => {
-            return CodexCliCapabilityProbe {
-                available: false,
-                checked_at,
-                failure_reason: format!("执行 codex --version 失败：{err}"),
-                ..CodexCliCapabilityProbe::default()
-            };
-        }
-    };
-    let help_output = hidden_command(&executable)
-        .args(["exec", "--help"])
-        .output();
+    let help_output = hidden_command(executable).args(["exec", "--help"]).output();
     match help_output {
         Ok(output) if output.status.success() => parse_codex_cli_capability_probe(
-            &version,
+            "Codex CLI（exec 能力已验证）",
             &String::from_utf8_lossy(&output.stdout),
             checked_at,
         ),
         Ok(output) => CodexCliCapabilityProbe {
             available: false,
-            version,
+            version: "Codex CLI".to_string(),
             checked_at,
             failure_reason: first_line(&String::from_utf8_lossy(&output.stderr), 240),
             ..CodexCliCapabilityProbe::default()
         },
         Err(err) => CodexCliCapabilityProbe {
             available: false,
-            version,
+            version: "Codex CLI".to_string(),
             checked_at,
             failure_reason: format!("执行 codex exec --help 失败：{err}"),
             ..CodexCliCapabilityProbe::default()
         },
     }
+}
+
+fn is_native_codex_executable(executable: &str) -> bool {
+    Path::new(executable)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("exe"))
+        .unwrap_or(false)
 }
 
 fn parse_codex_cli_capability_probe(
@@ -4280,6 +5557,231 @@ fn summarize_process_output(bytes: &[u8]) -> String {
     first_line(&text, 1800)
 }
 
+fn spawn_codex_output_reader<R>(
+    mut reader: R,
+    live: Arc<Mutex<LiveCodexOutput>>,
+    stream: &'static str,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let mut pending = String::new();
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            pending.push_str(&String::from_utf8_lossy(&buffer[..count]));
+            let has_trailing_newline = pending.ends_with('\n');
+            let mut lines = pending.split('\n').map(str::to_string).collect::<Vec<_>>();
+            if !has_trailing_newline {
+                pending = lines.pop().unwrap_or_default();
+            } else {
+                pending.clear();
+            }
+            for line in lines {
+                record_codex_live_activity(&live, stream, &line);
+            }
+        }
+        if !pending.trim().is_empty() {
+            record_codex_live_activity(&live, stream, &pending);
+        }
+        Ok(bytes)
+    })
+}
+
+fn record_codex_live_activity(live: &Arc<Mutex<LiveCodexOutput>>, stream: &str, raw: &str) {
+    let text = humanize_codex_output_line(raw);
+    if text.is_empty() {
+        return;
+    }
+    let activity = format!("{stream}：{text}");
+    let Ok(mut live) = live.lock() else {
+        return;
+    };
+    if live
+        .recent_activity
+        .last()
+        .is_some_and(|previous| previous == &activity)
+    {
+        return;
+    }
+    live.recent_activity.push(activity);
+    if live.recent_activity.len() > CODEX_LIVE_ACTIVITY_LIMIT {
+        let excess = live.recent_activity.len() - CODEX_LIVE_ACTIVITY_LIMIT;
+        live.recent_activity.drain(..excess);
+    }
+    live.last_activity_at = now_string();
+}
+
+fn humanize_codex_output_line(raw: &str) -> String {
+    let trimmed =
+        raw.trim_matches(|character: char| character.is_whitespace() || character == '\0');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let text = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|value| {
+            let object = value.as_object()?;
+            [
+                "message", "text", "summary", "event", "type", "command", "cmd", "path", "file",
+            ]
+            .into_iter()
+            .filter_map(|key| object.get(key).and_then(|item| item.as_str()))
+            .find(|item| !item.trim().is_empty())
+            .map(str::to_string)
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+    first_line(&text, CODEX_LIVE_ACTIVITY_MAX_CHARS)
+}
+
+fn persist_live_codex_activity(root: &Path, run_id: &str, live: &Arc<Mutex<LiveCodexOutput>>) {
+    let Ok(snapshot) = live.lock().map(|value| {
+        (
+            value.last_activity_at.clone(),
+            value.recent_activity.clone(),
+        )
+    }) else {
+        return;
+    };
+    let Ok(mut run) = read_codex_run(root, run_id) else {
+        return;
+    };
+    if !matches!(run.status.as_str(), "starting" | "running") {
+        return;
+    }
+    if run.last_activity_at == snapshot.0 && run.recent_activity == snapshot.1 {
+        return;
+    }
+    run.last_activity_at = snapshot.0;
+    run.recent_activity = snapshot.1;
+    let _ = upsert_codex_run(root, run);
+}
+
+fn wait_for_codex_process(
+    child: &mut Child,
+    pid: u32,
+    root: &Path,
+    task_id: &str,
+    run: &CodexRun,
+    task_type: &str,
+) -> Result<CodexProcessOutput, String> {
+    // `--json` can produce enough events to fill an unread pipe. Reader threads keep
+    // Codex unblocked while the main thread owns the timeout and process-tree cleanup.
+    let live = Arc::new(Mutex::new(LiveCodexOutput {
+        recent_activity: run.recent_activity.clone(),
+        last_activity_at: run.last_activity_at.clone(),
+    }));
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_codex_output_reader(stdout, Arc::clone(&live), "stdout"));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_codex_output_reader(stderr, Arc::clone(&live), "stderr"));
+
+    let started = Instant::now();
+    let run_timeout = codex_run_timeout(task_type);
+    let mut result_received_at = None;
+    let mut stopped_after_result = false;
+    let mut last_activity_persisted = Instant::now();
+    let (status, timed_out) = loop {
+        if last_activity_persisted.elapsed() >= Duration::from_secs(1) {
+            persist_live_codex_activity(root, &run.id, &live);
+            last_activity_persisted = Instant::now();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) => {
+                // The result file is the task's fact boundary. Some Windows CLI runs keep
+                // their parent process alive after writing it, so import it before waiting
+                // for process exit and avoid misclassifying a completed task as a timeout.
+                if result_received_at.is_none()
+                    && wait_for_matching_codex_result(root, task_id, run, false).is_ok()
+                {
+                    let _ = scan_codex_result_bridge(path_to_string(root));
+                    if read_codex_task(root, task_id)
+                        .map(|task| {
+                            !task.result_received_at.is_empty() && task.result_run_id == run.id
+                        })
+                        .unwrap_or(false)
+                    {
+                        result_received_at = Some(Instant::now());
+                    }
+                }
+                if result_received_at
+                    .map(|received_at| received_at.elapsed() >= CODEX_RESULT_EXIT_GRACE)
+                    .unwrap_or(false)
+                {
+                    if process_exists(pid) {
+                        let _ = terminate_process(pid);
+                    }
+                    if process_exists(pid) {
+                        let _ = child.kill();
+                    }
+                    let status = child
+                        .wait()
+                        .map_err(|error| format!("停止已回流结果的 Codex 进程失败：{error}"))?;
+                    stopped_after_result = true;
+                    break (status, false);
+                }
+                if started.elapsed() >= run_timeout {
+                    terminate_process_if_running(pid)?;
+                    let status = child
+                        .wait()
+                        .map_err(|error| format!("停止超时的 Codex 进程失败：{error}"))?;
+                    break (status, true);
+                }
+                std::thread::sleep(CODEX_RUN_POLL_INTERVAL);
+            }
+            Err(error) => {
+                if process_exists(pid) {
+                    let _ = terminate_process(pid);
+                }
+                return Err(format!("读取 Codex 进程状态失败：{error}"));
+            }
+        }
+    };
+
+    let read_pipe = |reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>| {
+        reader
+            .map(|reader| {
+                reader
+                    .join()
+                    .map_err(|_| "读取 Codex 输出线程异常退出。".to_string())?
+                    .map_err(|error| format!("读取 Codex 输出失败：{error}"))
+            })
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+    };
+    let recent_activity = live
+        .lock()
+        .map(|value| {
+            (
+                value.last_activity_at.clone(),
+                value.recent_activity.clone(),
+            )
+        })
+        .unwrap_or_default();
+
+    Ok(CodexProcessOutput {
+        exit_code: status.code(),
+        stdout: read_pipe(stdout_reader)?,
+        stderr: read_pipe(stderr_reader)?,
+        timed_out,
+        result_received: result_received_at.is_some(),
+        stopped_after_result,
+        last_activity_at: recent_activity.0,
+        recent_activity: recent_activity.1,
+    })
+}
+
 fn process_exists(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -4321,6 +5823,17 @@ fn terminate_process(pid: u32) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("停止 Codex 进程失败，退出码：{:?}", status.code()))
+    }
+}
+
+fn terminate_process_if_running(pid: u32) -> Result<(), String> {
+    if !process_exists(pid) {
+        return Ok(());
+    }
+    match terminate_process(pid) {
+        Ok(()) => Ok(()),
+        Err(_error) if !process_exists(pid) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -4505,6 +6018,7 @@ pub fn register_generated_file(
         file_id: record.id.clone(),
         file_name: record.file_name.clone(),
         managed_path: record.managed_path.clone(),
+        ..MessageAttachment::default()
     }];
     record_message_derivatives(&mut manifest, &message);
     record_imported_files_in_session(&mut manifest, vec![record.id.clone()]);
@@ -6049,13 +7563,30 @@ fn build_codex_prompt(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "taskId：{task_id}\ntaskType：{task_type}\n当前任务：{current_task}\n目标：{goal}\n已完成内容：{completed}\n相关资料与文件位置：\n{materials}\n项目约束和已有决定：\n{decisions}\n验收要求：完成后必须写入固定结果文件。分析任务不需要虚构 commit/tests；代码任务需要报告真实 changedFiles、commits、tests。\nGit 要求：只提交本轮相关改动，提交信息保持清晰；若本任务没有 Git 改动，请明确说明 Git 不适用。\n停止条件：完成功能、通过必要验证后停止，不扩展其他功能。\n\nCodex Result Bridge：\n请在任务完成后由你主动写入这个绝对路径的结果文件：{expected_result_path}\n项目内相对位置：.ganmaoyuan/codex/results/{task_id}-result.json\nJSON 字段：taskId、taskType、status、summary、resultText、completedAt、remainingIssues、manualAcceptance、resultSource。\n请将 resultSource 写为 \"codex\"，不要写 runnerFallback；analysis 可包含：findings、recommendations、questions。\ncoding 可包含：changedFiles、commits、tests。\nverification 可包含：checks、passed、failed。\nfileOperation 可包含：artifacts、targetFiles。\n如果无法写 JSON，也可以写入同目录下：{task_id}-result.md，并保留同等字段。\n不要只在对话中汇报，必须写入结果文件；不要把 API Key、凭据或无关私密正文写入结果文件。",
+        "taskId：{task_id}\ntaskType：{task_type}\n当前任务：{current_task}\n目标：{goal}\n已完成内容：{completed}\n相关资料与文件位置：\n{materials}\n项目约束和已有决定：\n{decisions}\n验收要求：完成后必须写入固定结果文件。分析任务不需要虚构 commit/tests；代码任务需要报告真实 changedFiles、commits、tests。\nGit 要求：代码任务必须先通过必要测试，再只提交本轮明确归属的改动；若无法安全区分已有脏改动，不能提交，必须标记 needsReview。\n停止条件：完成功能、通过必要验证后停止，不扩展其他功能。\n\nCodex Result Bridge：\n请在任务完成后由你主动写入这个绝对路径的结果文件：{expected_result_path}\n项目内相对位置：.ganmaoyuan/codex/results/{task_id}-result.json\nJSON 字段：taskId、taskType、status、summary、resultText、completedAt、remainingIssues、manualAcceptance、resultSource。\n请将 resultSource 写为 \"codex\"，不要写 runnerFallback；analysis 可包含：findings、recommendations、questions。\ncoding 必须如实包含：changedFiles、commits（完整 SHA）、tests、gitHead、gitStatus、gitModifiedFiles。\nverification 可包含：checks、passed、failed。\nfileOperation 可包含：artifacts、targetFiles。\n如果无法写 JSON，也可以写入同目录下：{task_id}-result.md，并保留同等字段。\n不要只在对话中汇报，必须写入结果文件；不要把 API Key、凭据或无关私密正文写入结果文件。",
         task_id = task_id,
         task_type = task_type,
         goal = empty_label(&manifest.project.next_step, "继续推进当前项目"),
         completed = empty_label(&completed, "暂无明确成果"),
         materials = if materials.is_empty() { "- 暂无资料".to_string() } else { materials },
         decisions = if decisions.is_empty() { "- 暂无关键决定".to_string() } else { decisions },
+        expected_result_path = expected_result_path,
+    )
+}
+
+fn build_explicit_codex_task_prompt(
+    task_id: &str,
+    task_type: &str,
+    title: &str,
+    instructions: &str,
+    expected_result_path: &str,
+) -> String {
+    format!(
+        "taskId：{task_id}\ntaskType：{task_type}\n任务标题：{title}\n\n本次明确任务：\n{instructions}\n\n执行边界：仅处理本次任务明确涉及的仓库内容和文件。不要读取、修改或引用任何无关目录、历史任务、外部项目或凭据。不要扩展任务范围。\n\nCodex Result Bridge：\n完成后必须由你主动写入这个绝对路径的结果文件：{expected_result_path}\n项目内相对位置：.ganmaoyuan/codex/results/{task_id}-result.json\nJSON 字段：taskId、taskType、status、summary、resultText、completedAt、remainingIssues、manualAcceptance、resultSource。\n请将 resultSource 写为 \"codex\"，不要写 runnerFallback。fileOperation 可包含 artifacts、targetFiles；analysis 可包含 findings、recommendations、questions；coding 必须如实包含 changedFiles、commits（完整 SHA）、tests、gitHead、gitStatus、gitModifiedFiles；verification 可包含 checks、passed、failed。\n代码任务必须先通过必要测试，再只提交本任务可明确归属的文件；若存在无法区分的既有脏改动，不得提交或伪造 Git 核验，必须写 needsReview 和真实原因。结果必须如实记录；不要虚构 commit、测试或文件变更。不要只在对话中汇报，必须写入结果文件。",
+        task_id = task_id,
+        task_type = task_type,
+        title = title,
+        instructions = instructions,
         expected_result_path = expected_result_path,
     )
 }
@@ -6286,9 +7817,13 @@ fn normalize_codex_bridge_result_text(raw_text: &str, extension: &str) -> String
     let status = json_string_field(&value, &["status"]);
     let summary = json_string_field(&value, &["summary"]);
     let result_text = json_string_field(&value, &["resultText", "result_text"]);
-    let changed_files = json_string_array_field(&value, &["changedFiles", "changed_files"]);
-    let commits = json_string_array_field(&value, &["commits"]);
-    let tests = json_string_array_field(&value, &["tests"]);
+    let changed_files = json_coding_string_array_field(&value, &["changedFiles", "changed_files"]);
+    let commits = json_coding_string_array_field(&value, &["commits"]);
+    let tests = json_coding_display_array_field(&value, &["tests"]);
+    let git_head = json_coding_string_field(&value, &["gitHead", "git_head"]);
+    let git_status = json_coding_string_field(&value, &["gitStatus", "git_status"]);
+    let git_modified_files =
+        json_coding_string_array_field(&value, &["gitModifiedFiles", "git_modified_files"]);
     let findings = json_string_array_field(&value, &["findings"]);
     let recommendations = json_string_array_field(&value, &["recommendations"]);
     let questions = json_string_array_field(&value, &["questions"]);
@@ -6332,6 +7867,15 @@ fn normalize_codex_bridge_result_text(raw_text: &str, extension: &str) -> String
     }
     for item in tests {
         lines.push(format!("测试：{item}"));
+    }
+    if !git_head.is_empty() {
+        lines.push(format!("Git HEAD：{git_head}"));
+    }
+    if !git_status.is_empty() {
+        lines.push(format!("Git 状态：{git_status}"));
+    }
+    for item in git_modified_files {
+        lines.push(format!("Git 修改：{item}"));
     }
     for item in findings {
         lines.push(format!("发现：{item}"));
@@ -6392,6 +7936,105 @@ fn json_string_array_field(value: &serde_json::Value, keys: &[&str]) -> Vec<Stri
             _ => json_value_to_string(item).into_iter().collect(),
         })
         .unwrap_or_default()
+}
+
+fn json_nested_value<'a>(
+    value: &'a serde_json::Value,
+    section: &str,
+    keys: &[&str],
+) -> Option<&'a serde_json::Value> {
+    value
+        .get(section)
+        .and_then(|nested| keys.iter().find_map(|key| nested.get(*key)))
+}
+
+fn json_coding_string_field(value: &serde_json::Value, keys: &[&str]) -> String {
+    let top_level = json_string_field(value, keys);
+    if !top_level.is_empty() {
+        return top_level;
+    }
+    json_nested_value(value, "coding", keys)
+        .and_then(json_value_to_string)
+        .unwrap_or_default()
+}
+
+fn json_coding_string_array_field(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    let top_level = json_string_array_field(value, keys);
+    if !top_level.is_empty() {
+        return top_level;
+    }
+    json_nested_value(value, "coding", keys)
+        .map(json_value_to_string_array)
+        .unwrap_or_default()
+}
+
+fn json_coding_display_array_field(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    let top_level = json_display_array_field(value, keys);
+    if !top_level.is_empty() {
+        return top_level;
+    }
+    json_nested_value(value, "coding", keys)
+        .map(json_value_to_display_array)
+        .unwrap_or_default()
+}
+
+fn json_display_array_field(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .map(json_value_to_display_array)
+        .unwrap_or_default()
+}
+
+fn json_value_to_string_array(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(json_value_to_string)
+            .filter(|text| !text.trim().is_empty())
+            .collect(),
+        _ => json_value_to_string(value).into_iter().collect(),
+    }
+}
+
+fn json_value_to_display_array(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(json_value_to_display_string)
+            .filter(|text| !text.trim().is_empty())
+            .collect(),
+        _ => json_value_to_display_string(value).into_iter().collect(),
+    }
+}
+
+fn json_value_to_display_string(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = json_value_to_string(value) {
+        return Some(text);
+    }
+    let serde_json::Value::Object(object) = value else {
+        return None;
+    };
+    let name = object
+        .get("name")
+        .and_then(json_value_to_string)
+        .unwrap_or_default();
+    let status = object
+        .get("status")
+        .and_then(json_value_to_string)
+        .unwrap_or_default();
+    let details = object
+        .get("details")
+        .and_then(json_value_to_string)
+        .unwrap_or_default();
+    let mut result = first_non_empty(&[name, status]);
+    if !details.is_empty() {
+        result = if result.is_empty() {
+            details
+        } else {
+            format!("{result}（{details}）")
+        };
+    }
+    (!result.is_empty()).then_some(result)
 }
 
 fn json_value_to_string(value: &serde_json::Value) -> Option<String> {
@@ -6466,10 +8109,12 @@ fn hash_text(text: &str) -> String {
 }
 
 fn upsert_pending_review(items: &mut Vec<PendingReviewItem>, next: PendingReviewItem) {
-    if let Some(existing) = items
-        .iter_mut()
-        .find(|item| item.key == next.key && item.status != "resolved")
-    {
+    if let Some(existing) = items.iter_mut().find(|item| item.key == next.key) {
+        // An explicit resolution is authoritative for this exact fact. A
+        // materially changed observation must produce a different key.
+        if matches!(existing.status.as_str(), "resolved" | "ignored") {
+            return;
+        }
         *existing = next;
         return;
     }
@@ -6485,7 +8130,16 @@ pub fn scan_project_workspace(
         .map_err(|_| "项目写入锁已被占用，请稍后重试。".to_string())?;
     let mut manifest = read_and_repair_manifest(&root)?;
     let original = manifest.clone();
-    let observed = collect_observed_project_files(&root)?;
+    // Git already provides the authoritative change index for an associated
+    // repository. Walking and hashing that same tree on every project open is
+    // both redundant and expensive, especially for database/build artifacts.
+    let repository_root = configured_repository_path(&manifest.project)
+        .or_else(|| {
+            let project_root = PathBuf::from(&manifest.project.root_dir);
+            project_root.join(".git").exists().then_some(project_root)
+        })
+        .and_then(|path| canonical_existing_directory(&path).ok());
+    let observed = collect_observed_project_files(&root, repository_root.as_deref())?;
     let mut findings = Vec::new();
     let mut seen_keys = HashSet::new();
     let tracked_by_hash = manifest
@@ -6509,6 +8163,9 @@ pub fn scan_project_workspace(
         .iter()
         .map(|file| normalize_key(&file.managed_path))
         .collect::<HashSet<_>>();
+    // An associated repository is an existing project source, not an Inbox
+    // import. Keep observing it for project facts, but do not turn every
+    // untracked source/config file into a manual material-review action.
     // Older scans turned an unavailable original import path into both a
     // source-missing review and a generic "needs review" flag. A managed copy
     // is the project's durable record, so that provenance gap must not keep
@@ -6651,6 +8308,12 @@ pub fn scan_project_workspace(
     for item in &observed {
         let path_key = normalize_key(&item.path);
         if managed_paths.contains(&path_key) || tracked_source_paths.contains(&path_key) {
+            continue;
+        }
+        if repository_root
+            .as_ref()
+            .is_some_and(|repository| path_is_within(repository, Path::new(&item.path)))
+        {
             continue;
         }
         let key = format!("observed|{}", path_key);
@@ -6799,17 +8462,27 @@ pub fn scan_project_workspace(
     Ok((manifest, changed, summary))
 }
 
-fn collect_observed_project_files(root: &Path) -> Result<Vec<ObservedProjectFile>, String> {
+fn collect_observed_project_files(
+    root: &Path,
+    repository_root: Option<&Path>,
+) -> Result<Vec<ObservedProjectFile>, String> {
     let mut files = Vec::new();
-    collect_observed_project_files_recursive(root, root, &mut files)?;
+    collect_observed_project_files_recursive(root, root, repository_root, &mut files)?;
     Ok(files)
 }
 
 fn collect_observed_project_files_recursive(
     root: &Path,
     current: &Path,
+    repository_root: Option<&Path>,
     files: &mut Vec<ObservedProjectFile>,
 ) -> Result<(), String> {
+    if repository_root.is_some_and(|repository| {
+        normalize_key(&path_to_string(current)) == normalize_key(&path_to_string(repository))
+            || path_is_within(current, repository)
+    }) {
+        return Ok(());
+    }
     let entries = fs::read_dir(current)
         .map_err(|err| format!("读取项目目录失败：{}；{}", path_to_string(current), err))?;
     for entry in entries {
@@ -6836,7 +8509,7 @@ fn collect_observed_project_files_recursive(
             if should_exclude_scan_directory(root, &path) {
                 continue;
             }
-            collect_observed_project_files_recursive(root, &path, files)?;
+            collect_observed_project_files_recursive(root, &path, repository_root, files)?;
             continue;
         }
         if !file_type.is_file() {
@@ -6890,6 +8563,24 @@ fn monitored_file_hash(path: &Path) -> Result<String, String> {
     Ok(hash)
 }
 
+fn canonical_existing_directory(path: &Path) -> Result<PathBuf, String> {
+    if !path.exists() {
+        return Err(format!("目录不存在：{}", path_to_string(path)));
+    }
+    if !path.is_dir() {
+        return Err(format!("路径不是目录：{}", path_to_string(path)));
+    }
+    path.canonicalize()
+        .map_err(|err| format!("规范化目录路径失败：{}：{err}", path_to_string(path)))
+}
+
+fn path_is_within(root: &Path, candidate: &Path) -> bool {
+    candidate
+        .canonicalize()
+        .ok()
+        .is_some_and(|path| path.starts_with(root))
+}
+
 fn normalize_key(value: &str) -> String {
     value.trim().replace('/', "\\").to_lowercase()
 }
@@ -6929,8 +8620,16 @@ fn update_next_step_and_auto_recovery(
     manifest: &mut ProjectManifest,
     completed: &str,
 ) {
-    let next_step = build_monitoring_next_step(manifest);
-    manifest.project.next_step = next_step.clone();
+    let suggested_next_step = build_monitoring_next_step(manifest);
+    if !suggested_next_step.trim().is_empty()
+        && (manifest.project.next_step.trim().is_empty()
+            || is_system_generated_next_step(manifest, &manifest.project.next_step))
+    {
+        manifest.project.next_step = suggested_next_step;
+    } else if suggested_next_step.trim().is_empty() {
+        clear_non_user_next_step(manifest);
+    }
+    let next_step = manifest.project.next_step.clone();
     manifest.project.last_opened_at = now_string();
     let should_create_recovery = manifest
         .recovery_points
@@ -6963,20 +8662,11 @@ fn update_next_step_and_auto_recovery(
 }
 
 fn build_monitoring_next_step(manifest: &ProjectManifest) -> String {
-    if let Some(item) = manifest
-        .pending_reviews
-        .iter()
-        .find(|item| item.status != "resolved" && !looks_garbled_or_meaningless(&item.title))
-    {
+    if let Some(item) = manifest.pending_reviews.iter().find(|item| {
+        !matches!(item.status.as_str(), "resolved" | "ignored")
+            && !looks_garbled_or_meaningless(&item.title)
+    }) {
         return format!("请先处理待确认事项：{}", item.title);
-    }
-    if let Some(next) = manifest
-        .project_analysis
-        .next_steps
-        .iter()
-        .find(|item| !item.trim().is_empty() && !looks_garbled_or_meaningless(item))
-    {
-        return next.clone();
     }
     if let Some(task) = manifest
         .tasks
@@ -6986,10 +8676,44 @@ fn build_monitoring_next_step(manifest: &ProjectManifest) -> String {
     {
         return format!("继续推进当前任务：{}", task.title);
     }
-    "继续整理项目资料，确认下一步工作。".to_string()
+    String::new()
+}
+
+fn clear_non_user_next_step(manifest: &mut ProjectManifest) -> bool {
+    let current = manifest.project.next_step.trim();
+    if current.is_empty() {
+        return false;
+    }
+    if is_system_generated_next_step(manifest, current) {
+        let replacement = build_monitoring_next_step(manifest);
+        manifest.project.next_step = replacement;
+        return true;
+    }
+    false
+}
+
+fn is_system_generated_next_step(manifest: &ProjectManifest, value: &str) -> bool {
+    let current = value.trim();
+    current == INITIAL_PROJECT_NEXT_STEP
+        || current == GENERATED_NEXT_STEP_PLACEHOLDER
+        || current == FACTS_ONLY_NEXT_STEP_PLACEHOLDER
+        || current.starts_with("请先处理待确认事项：")
+        || current.starts_with("继续推进当前任务：")
+        || manifest
+            .project_analysis
+            .next_steps
+            .iter()
+            .any(|item| item.trim() == current)
 }
 
 fn repair_garbled_project_display_text(manifest: &mut ProjectManifest) -> bool {
+    if manifest.project.next_step.trim().is_empty() {
+        return false;
+    }
+    if manifest.project.next_step.trim() == GENERATED_NEXT_STEP_PLACEHOLDER {
+        manifest.project.next_step.clear();
+        return true;
+    }
     if !looks_garbled_or_meaningless(&manifest.project.next_step) {
         return false;
     }
@@ -7073,6 +8797,20 @@ fn repair_garbled_pending_reviews(manifest: &mut ProjectManifest) -> bool {
                 "new_file" => "项目目录中发现未登记文件，需要确认是否纳入感冒院管理。".to_string(),
                 _ => "该事项需要人工确认后再处理。".to_string(),
             };
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn demote_analysis_generated_pending_reviews(manifest: &mut ProjectManifest) -> bool {
+    let mut changed = false;
+    for item in &mut manifest.pending_reviews {
+        if item.kind == "projectState.proposal"
+            && !matches!(item.status.as_str(), "resolved" | "ignored")
+        {
+            item.status = "ignored".to_string();
+            item.updated_at = now_string();
             changed = true;
         }
     }
@@ -7473,6 +9211,16 @@ pub(crate) fn read_and_repair_manifest(root: &Path) -> Result<ProjectManifest, S
     let mut manifest: ProjectManifest = read_json(&path)?;
     let mut changed = manifest.schema_version != MANIFEST_SCHEMA_VERSION;
     manifest.schema_version = MANIFEST_SCHEMA_VERSION;
+    // Projects created before a user entered a real next step carried this
+    // initializer text forever. Treat only that exact system placeholder as
+    // unset; preserve every other user-provided value.
+    if manifest.project.next_step.trim() == INITIAL_PROJECT_NEXT_STEP {
+        manifest.project.next_step.clear();
+        changed = true;
+    }
+    if clear_non_user_next_step(&mut manifest) {
+        changed = true;
+    }
     if manifest.project.created_at.is_empty() {
         manifest.project.created_at = if manifest.project.last_opened_at.is_empty() {
             now_string()
@@ -7507,10 +9255,13 @@ pub(crate) fn read_and_repair_manifest(root: &Path) -> Result<ProjectManifest, S
         manifest.monitoring.status = "idle".to_string();
         changed = true;
     }
+    if demote_analysis_generated_pending_reviews(&mut manifest) {
+        changed = true;
+    }
     manifest.monitoring.pending_count = manifest
         .pending_reviews
         .iter()
-        .filter(|item| item.status != "resolved")
+        .filter(|item| !matches!(item.status.as_str(), "resolved" | "ignored"))
         .count();
     if manifest.daily_sessions.is_empty() && !manifest.messages.is_empty() {
         let message_ids = manifest
@@ -7616,6 +9367,10 @@ pub(crate) fn read_and_repair_manifest(root: &Path) -> Result<ProjectManifest, S
     }
     Ok(manifest)
 }
+
+const INITIAL_PROJECT_NEXT_STEP: &str = "查看资料分析结果，补充项目目标与当前任务。";
+const GENERATED_NEXT_STEP_PLACEHOLDER: &str = "继续整理项目资料，确认下一步工作。";
+const FACTS_ONLY_NEXT_STEP_PLACEHOLDER: &str = "根据当前项目事实继续下一步工作。";
 
 pub(crate) fn persist_project(
     root: &Path,
@@ -7740,6 +9495,7 @@ pub(crate) fn read_registry<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<App
         return Ok(AppRegistry {
             schema_version: MANIFEST_SCHEMA_VERSION,
             projects: Vec::new(),
+            continue_preferences: Vec::new(),
         });
     }
     read_json(&path)
@@ -8296,7 +10052,8 @@ fn workspace_config_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBu
 }
 
 fn default_workspace_root<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
-    if Path::new(r"D:\").exists() {
+    let existing_legacy_root = Path::new(r"D:\GanMaoYuan_Workspace");
+    if existing_legacy_root.exists() {
         return Ok(PathBuf::from(r"D:\GanMaoYuan_Workspace"));
     }
     let global = global_data_dir(app)?;
@@ -9810,7 +11567,7 @@ pub fn codex_results_path(root: &Path) -> PathBuf {
 }
 
 pub fn codex_result_bridge_dir(root: &Path) -> PathBuf {
-    root.join(".ganmaoyuan/codex/results")
+    root.join(".ganmaoyuan").join("codex").join("results")
 }
 
 pub fn codex_tasks_dir(root: &Path) -> PathBuf {
@@ -11200,8 +12957,7 @@ fn analyze_routed_file_impact(project_root: &str, file: &FileRecord) -> Result<(
 
     let impact = build_local_project_impact(&manifest, file);
     let candidates = build_action_candidates_from_impact(&impact);
-    let mut proposal = build_project_state_proposal(&manifest, file, &impact);
-    maybe_auto_apply_state_proposal(&mut manifest, &mut proposal);
+    let proposal = build_project_state_proposal(&manifest, file, &impact);
     upsert_pending_reviews_for_impact(&mut manifest, &impact, &candidates, &proposal);
     manifest.project_impact_analyses.push(impact);
     for candidate in candidates {
@@ -11673,9 +13429,9 @@ fn ensure_state_proposal_trace(proposal: &mut ProjectStateProposal, project_id: 
 
 fn upsert_pending_reviews_for_impact(
     manifest: &mut ProjectManifest,
-    impact: &ProjectImpactAnalysis,
+    _impact: &ProjectImpactAnalysis,
     candidates: &[ProjectActionCandidate],
-    proposal: &ProjectStateProposal,
+    _proposal: &ProjectStateProposal,
 ) {
     for candidate in candidates {
         let key = format!(
@@ -11700,35 +13456,10 @@ fn upsert_pending_reviews_for_impact(
             updated_at: now_string(),
         });
     }
-    if !proposal.proposed_changes.is_empty() {
-        let key = format!("state-proposal:{}", impact.source_hash);
-        if !manifest.pending_reviews.iter().any(|item| item.key == key) {
-            manifest.pending_reviews.push(PendingReviewItem {
-                id: new_id(),
-                key,
-                kind: "projectState.proposal".to_string(),
-                title: "项目状态更新提案".to_string(),
-                detail: proposal
-                    .proposed_changes
-                    .iter()
-                    .map(|change| {
-                        format!("{}：{} -> {}", change.field, change.before, change.after)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("；"),
-                file_id: impact.source_file_id.clone(),
-                path: String::new(),
-                suggested_managed_path: String::new(),
-                suggested_category: "projectState".to_string(),
-                status: "pending".to_string(),
-                detected_at: now_string(),
-                updated_at: now_string(),
-            });
-        }
-    }
 }
 
 fn update_daily_continue_snapshot(manifest: &mut ProjectManifest) {
+    clear_non_user_next_step(manifest);
     update_data_health_records(manifest);
     update_project_state_summary(manifest);
     update_project_attentions(manifest);
@@ -11740,6 +13471,15 @@ fn update_daily_continue_snapshot(manifest: &mut ProjectManifest) {
         .map(|item| item.title.clone())
         .take(8)
         .collect::<Vec<_>>();
+    // Repository scan findings are derived prompts, not durable user intent.
+    // Once all reviews are cleared, keep their audit history but stop carrying
+    // an obsolete "new file" prompt into the next Continue Work snapshot.
+    if pending_confirmations.is_empty()
+        && (manifest.project.next_step.contains("待确认事项")
+            || manifest.project.next_step.contains("发现新文件"))
+    {
+        manifest.project.next_step.clear();
+    }
     let blockers = manifest
         .project_action_candidates
         .iter()
@@ -11757,6 +13497,7 @@ fn update_daily_continue_snapshot(manifest: &mut ProjectManifest) {
                 task.status.as_str(),
                 "done" | "completed" | "closed" | "resolved"
             ) && !unhealthy_source(manifest, "task", &task.id)
+                && task_is_confirmed_project_task(manifest, task)
         })
         .rev()
         .take(3)
@@ -12275,6 +14016,7 @@ fn update_project_attentions(manifest: &mut ProjectManifest) {
             task.status.as_str(),
             "done" | "completed" | "closed" | "resolved"
         ) && !unhealthy_source(manifest, "task", &task.id)
+            && task_is_confirmed_project_task(manifest, task)
             && task
                 .created_at
                 .parse::<u128>()
@@ -12811,13 +14553,14 @@ fn build_v1_readiness(root: &Path, manifest: &ProjectManifest) -> Result<V1Readi
         "D:\\Atlas 保持只读访问。".to_string(),
         "prototype/opendesign 仅作为设计证据保留。".to_string(),
     ];
+    let build_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let installer_paths = vec![
-        path_to_string(&PathBuf::from(
-            r"D:\GanMaoYuan\Website-Clone\src-tauri\target\release\bundle\nsis\Ganmaoyuan_0.1.1_x64-setup.exe",
-        )),
-        path_to_string(&PathBuf::from(
-            r"D:\GanMaoYuan\Website-Clone\src-tauri\target\release\bundle\msi\Ganmaoyuan_0.1.1_x64_en-US.msi",
-        )),
+        path_to_string(
+            &build_root.join("src-tauri/target/release/bundle/nsis/Ganmaoyuan_0.1.1_x64-setup.exe"),
+        ),
+        path_to_string(
+            &build_root.join("src-tauri/target/release/bundle/msi/Ganmaoyuan_0.1.1_x64_en-US.msi"),
+        ),
     ];
     let overview_path = dir.join("system-capability-overview.md");
     let usage_guide_path = dir.join("v1-usage-guide.md");
@@ -12960,45 +14703,6 @@ fn revert_state_proposal_changes(manifest: &mut ProjectManifest, proposal: &Proj
             manifest.project.next_step = change.before.clone();
         }
     }
-}
-
-// 高置信自动应用：默认关闭。仅当开启且满足安全约束才应用，且始终可撤销。
-fn maybe_auto_apply_state_proposal(
-    manifest: &mut ProjectManifest,
-    proposal: &mut ProjectStateProposal,
-) {
-    if !manifest.project_state_auto_apply {
-        return;
-    }
-    if proposal.confidence < 0.85 {
-        return;
-    }
-    if proposal.proposed_changes.is_empty() {
-        return;
-    }
-    let safe = proposal
-        .proposed_changes
-        .iter()
-        .all(|change| change.field == "nextStep" && !change.after.trim().is_empty())
-        && proposal.proposed_changes.iter().all(|change| {
-            manifest.project_state_proposals.iter().all(|existing| {
-                existing.id == proposal.id
-                    || existing.status != "applied"
-                    || existing
-                        .proposed_changes
-                        .iter()
-                        .all(|ec| ec.field != change.field)
-            })
-        });
-    if !safe {
-        return;
-    }
-    apply_state_proposal_changes(manifest, proposal);
-    proposal.status = "autoApplied".to_string();
-    proposal.applied_at = now_string();
-    proposal.decision_trace.execution = "executed".to_string();
-    proposal.decision_trace.execution_note = "已按启用的安全自动应用规则执行。".to_string();
-    proposal.decision_trace.updated_at = now_string();
 }
 
 fn resolve_pending_review_for_candidate(
@@ -13331,9 +15035,76 @@ pub fn regenerate_daily_continue<R: Runtime>(
 pub fn get_today_workspace<R: Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Result<TodayWorkspace, String> {
-    let _guard = project_write_lock()
-        .lock()
-        .map_err(|_| "项目存储锁已损坏，请重启感冒院。".to_string())?;
+    build_today_workspace(app, false)
+}
+
+pub fn refresh_today_workspace<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<TodayWorkspace, String> {
+    build_today_workspace(app, true)
+}
+
+pub fn update_continue_project_preference<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: String,
+    pinned: Option<bool>,
+    snoozed_until: Option<String>,
+) -> Result<TodayWorkspace, String> {
+    let mut registry = read_registry(app)?;
+    if !registry
+        .projects
+        .iter()
+        .any(|project| project.id == project_id)
+    {
+        return Err("项目不存在，无法更新继续工作偏好。".to_string());
+    }
+    let preference = if let Some(existing) = registry
+        .continue_preferences
+        .iter_mut()
+        .find(|item| item.project_id == project_id)
+    {
+        existing
+    } else {
+        registry
+            .continue_preferences
+            .push(ContinueProjectPreference {
+                project_id: project_id.clone(),
+                ..ContinueProjectPreference::default()
+            });
+        registry
+            .continue_preferences
+            .last_mut()
+            .expect("preference exists")
+    };
+    if let Some(value) = pinned {
+        preference.pinned = value;
+    }
+    if let Some(value) = snoozed_until {
+        preference.snoozed_until = value;
+    }
+    preference.updated_at = now_string();
+    registry
+        .continue_preferences
+        .retain(|item| item.pinned || !item.snoozed_until.is_empty());
+    write_registry(app, &registry)?;
+    build_today_workspace(app, false)
+}
+
+// Today normally reads durable projections only. Git capture and daily snapshot
+// generation are explicit refresh work because they may touch multiple projects.
+fn build_today_workspace<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    refresh_facts: bool,
+) -> Result<TodayWorkspace, String> {
+    let _guard = if refresh_facts {
+        Some(
+            project_write_lock()
+                .lock()
+                .map_err(|_| "项目存储锁已损坏，请重启感冒院。".to_string())?,
+        )
+    } else {
+        None
+    };
     let registry = read_registry(app)?;
     let mut project_manifests = Vec::new();
     for project in registry.projects.iter().take(12) {
@@ -13345,8 +15116,10 @@ pub fn get_today_workspace<R: Runtime>(
             Ok(value) => value,
             Err(_) => continue,
         };
-        update_daily_continue_snapshot(&mut manifest);
-        persist_project(&root, &manifest, None)?;
+        if refresh_facts {
+            update_daily_continue_snapshot(&mut manifest);
+            persist_project(&root, &manifest, None)?;
+        }
         project_manifests.push(manifest);
     }
     let mut focus_projects = Vec::new();
@@ -13360,7 +15133,11 @@ pub fn get_today_workspace<R: Runtime>(
     let mut freshness_checks = Vec::new();
     for manifest in &project_manifests {
         let project_root = Path::new(&manifest.project.root_dir);
-        let freshness = refresh_project_git_facts_for_today(project_root, manifest);
+        let freshness = if refresh_facts {
+            refresh_project_git_facts_for_today(project_root, manifest)
+        } else {
+            read_project_git_facts_for_today(project_root, manifest)
+        };
         freshness_checks.push(freshness);
         focus_projects.push(TodayProjectFocus {
             project_id: manifest.project.id.clone(),
@@ -13548,6 +15325,37 @@ pub fn get_today_workspace<R: Runtime>(
         &workspace_activity,
         &freshness_checks,
     );
+    let continue_projects = build_continue_project_recommendations(
+        &project_manifests,
+        &focus_projects,
+        &pending_actions,
+        &activity_timeline,
+        &freshness_checks,
+        &read_registry(app)?.continue_preferences,
+    );
+    // Keep the secondary project list on the same derived facts as Continue
+    // Work. The persisted project_state_summary is historical and can retain
+    // an obsolete repository-scan prompt after reviews are cleared.
+    for project in &mut focus_projects {
+        if let Some(recommendation) = continue_projects
+            .iter()
+            .find(|item| item.project_id == project.project_id)
+        {
+            if let Some(focus) = &recommendation.focus {
+                project.next_step = focus.summary.clone();
+            } else if !project.recent_change.trim().is_empty() {
+                project.next_step = project.recent_change.clone();
+            } else {
+                project.next_step = "当前没有待处理事项。".to_string();
+            }
+        } else if !project.recent_change.trim().is_empty() {
+            // Do not fall back to persisted nextMilestone when the current
+            // fact set has no actionable focus.
+            project.next_step = project.recent_change.clone();
+        } else {
+            project.next_step = "当前没有待处理事项。".to_string();
+        }
+    }
     Ok(TodayWorkspace {
         generated_at: now_string(),
         continue_work_focus,
@@ -13562,7 +15370,143 @@ pub fn get_today_workspace<R: Runtime>(
         pending_actions,
         executions,
         status,
+        continue_projects,
     })
+}
+
+fn build_continue_project_recommendations(
+    manifests: &[ProjectManifest],
+    focus_projects: &[TodayProjectFocus],
+    pending_actions: &[PendingActionProjection],
+    activities: &[ActivityProjection],
+    freshness_checks: &[TodayFreshnessCheck],
+    preferences: &[ContinueProjectPreference],
+) -> Vec<ContinueProjectRecommendation> {
+    let mut items = manifests
+        .iter()
+        .filter_map(|manifest| {
+            let project_id = &manifest.project.id;
+            let preference = preferences
+                .iter()
+                .find(|item| item.project_id == *project_id);
+            let snoozed = preference
+                .and_then(|item| item.snoozed_until.parse::<u128>().ok())
+                .map(|until| until > now_string().parse::<u128>().unwrap_or_default())
+                .unwrap_or(false);
+            let pinned = preference.map(|item| item.pinned).unwrap_or(false);
+            if snoozed && !pinned {
+                return None;
+            }
+            let actions = pending_actions
+                .iter()
+                .filter(|action| action.project_id == *project_id)
+                .collect::<Vec<_>>();
+            let focus = build_continue_work_focus(
+                std::slice::from_ref(manifest),
+                &focus_projects
+                    .iter()
+                    .filter(|item| item.project_id == *project_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                &activities
+                    .iter()
+                    .filter(|item| item.project_id == *project_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                &actions
+                    .iter()
+                    .map(|action| (*action).clone())
+                    .collect::<Vec<_>>(),
+                &CodexTaskTodaySummary::default(),
+                &WorkspaceActivitySummary::default(),
+                &freshness_checks
+                    .iter()
+                    .filter(|item| item.project_id == *project_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            let focus = focus.filter(|item| !item.title.contains("没有足够事实"));
+            let recent_change = activities
+                .iter()
+                .find(|item| item.project_id == *project_id)
+                .map(|item| item.summary.clone())
+                .or_else(|| {
+                    manifest
+                        .project_state_summary
+                        .recent_changes
+                        .first()
+                        .cloned()
+                })
+                .unwrap_or_default();
+            let blocker = manifest
+                .project_state_summary
+                .blockers
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            let mut score = if focus.is_some() { 40 } else { 0 };
+            let mut basis = Vec::new();
+            if pinned {
+                score += 100;
+                basis.push("用户固定".to_string());
+            }
+            if !actions.is_empty() {
+                score += 50;
+                basis.push("存在有效待处理事项".to_string());
+            }
+            if actions.iter().any(|action| {
+                matches!(
+                    action.action_type.as_str(),
+                    "codexAcceptance" | "codexReview"
+                )
+            }) {
+                score += 25;
+                basis.push("Codex结果等待处理".to_string());
+            }
+            if !blocker.is_empty() {
+                score += 20;
+                basis.push("存在项目阻塞".to_string());
+            }
+            if !recent_change.is_empty() {
+                score += 10;
+                basis.push("最近有真实变化".to_string());
+            }
+            if focus.is_none() && !pinned {
+                return None;
+            }
+            let reason = if pinned {
+                "这是你固定优先处理的项目。".to_string()
+            } else if !actions.is_empty() {
+                "当前有需要你处理的有效事项。".to_string()
+            } else if !recent_change.is_empty() {
+                "项目最近有真实变化。".to_string()
+            } else {
+                "当前项目仍有可恢复的工作焦点。".to_string()
+            };
+            Some((
+                score,
+                ContinueProjectRecommendation {
+                    project_id: project_id.clone(),
+                    project_name: manifest.project.name.clone(),
+                    project_root: manifest.project.root_dir.clone(),
+                    focus,
+                    reason,
+                    recent_change,
+                    blocker,
+                    priority: if score >= 80 {
+                        "P0".to_string()
+                    } else {
+                        "P1".to_string()
+                    },
+                    score_basis: basis,
+                    pinned,
+                    snoozed,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| right.0.cmp(&left.0));
+    items.into_iter().take(3).map(|(_, item)| item).collect()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -13666,6 +15610,87 @@ fn refresh_project_git_facts_for_today(
                 kind: "git".to_string(),
                 id: repo_path,
                 label: "Git 事实刷新失败".to_string(),
+                ..EvidenceRef::default()
+            }],
+        },
+    }
+}
+
+fn read_project_git_facts_for_today(
+    root: &Path,
+    manifest: &ProjectManifest,
+) -> TodayFreshnessCheck {
+    let previous = read_git_snapshot(root).ok().flatten();
+    let repo_path = configured_repository_path(&manifest.project)
+        .map(|path| path_to_string(&path))
+        .or_else(|| {
+            previous
+                .as_ref()
+                .map(|snapshot| snapshot.repository_path.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| root.join(".git").is_dir().then(|| path_to_string(root)));
+    let Some(repo_path) = repo_path else {
+        return TodayFreshnessCheck {
+            project_id: manifest.project.id.clone(),
+            project_root: manifest.project.root_dir.clone(),
+            status: "notApplicable".to_string(),
+            reason: "当前项目没有关联代码仓库，Git 事实不适用。".to_string(),
+            evidence_refs: vec![EvidenceRef {
+                kind: "project".to_string(),
+                id: manifest.project.id.clone(),
+                label: "项目未关联代码仓库".to_string(),
+                ..EvidenceRef::default()
+            }],
+        };
+    };
+    let repository_available = PathBuf::from(&repo_path).is_dir();
+    match previous {
+        Some(snapshot) if repository_available => TodayFreshnessCheck {
+            project_id: manifest.project.id.clone(),
+            project_root: manifest.project.root_dir.clone(),
+            status: "fresh".to_string(),
+            reason: format!("已读取上次核验的 Git HEAD {}。", snapshot.head_short),
+            evidence_refs: vec![EvidenceRef {
+                kind: "git".to_string(),
+                id: snapshot.head,
+                label: format!("Git HEAD {}", snapshot.head_short),
+                ..EvidenceRef::default()
+            }],
+        },
+        Some(snapshot) => TodayFreshnessCheck {
+            project_id: manifest.project.id.clone(),
+            project_root: manifest.project.root_dir.clone(),
+            status: "stale".to_string(),
+            reason: "上次核验的代码仓库当前不可用，请刷新项目事实。".to_string(),
+            evidence_refs: vec![EvidenceRef {
+                kind: "git".to_string(),
+                id: snapshot.head,
+                label: "Git 仓库当前不可用".to_string(),
+                ..EvidenceRef::default()
+            }],
+        },
+        None if repository_available => TodayFreshnessCheck {
+            project_id: manifest.project.id.clone(),
+            project_root: manifest.project.root_dir.clone(),
+            status: "unknown".to_string(),
+            reason: "尚未读取关联代码仓库的 Git 事实，请刷新项目事实。".to_string(),
+            evidence_refs: vec![EvidenceRef {
+                kind: "git".to_string(),
+                id: repo_path,
+                label: "尚未核验 Git 事实".to_string(),
+                ..EvidenceRef::default()
+            }],
+        },
+        None => TodayFreshnessCheck {
+            project_id: manifest.project.id.clone(),
+            project_root: manifest.project.root_dir.clone(),
+            status: "unknown".to_string(),
+            reason: "关联代码仓库当前不可用。".to_string(),
+            evidence_refs: vec![EvidenceRef {
+                kind: "git".to_string(),
+                id: repo_path,
+                label: "Git 仓库当前不可用".to_string(),
                 ..EvidenceRef::default()
             }],
         },
@@ -16318,20 +18343,6 @@ fn workspace_message_with_status(
 
 fn record_message_derivatives(manifest: &mut ProjectManifest, message: &WorkspaceMessage) {
     record_message_in_session(manifest, &message.id);
-    if message.author == "user" && message.kind == "requirement" && !message.text.trim().is_empty()
-    {
-        let title = first_line(&message.text, 80);
-        let task = TaskRecord {
-            id: new_id(),
-            title,
-            status: "active".to_string(),
-            source_message_id: message.id.clone(),
-            created_at: message.created_at.clone(),
-            updated_at: now_string(),
-        };
-        record_task_in_session(manifest, &task.id);
-        manifest.tasks.push(task);
-    }
     if message.kind == "restore" {
         for task in &mut manifest.tasks {
             if task.status == "active" {
@@ -16339,16 +18350,6 @@ fn record_message_derivatives(manifest: &mut ProjectManifest, message: &Workspac
                 task.updated_at = now_string();
             }
         }
-    }
-    if message.author != "user" && looks_like_decision(&message.text) {
-        let decision = crate::models::DecisionRecord {
-            id: new_id(),
-            summary: first_line(&message.text, 120),
-            source_message_id: message.id.clone(),
-            created_at: now_string(),
-        };
-        record_decision_in_session(manifest, &decision.id);
-        manifest.decisions.push(decision);
     }
     if message.author != "user" && looks_like_artifact(&message.text) {
         let artifact = crate::models::ArtifactRecord {
@@ -16366,6 +18367,9 @@ fn record_message_derivatives(manifest: &mut ProjectManifest, message: &Workspac
         manifest.artifacts.push(artifact);
     }
     for attachment in &message.attachments {
+        if attachment.attachment_type == "image" {
+            continue;
+        }
         let artifact = crate::models::ArtifactRecord {
             id: new_id(),
             title: attachment.file_name.clone(),
@@ -16382,10 +18386,108 @@ fn record_message_derivatives(manifest: &mut ProjectManifest, message: &Workspac
     }
 }
 
-fn looks_like_decision(text: &str) -> bool {
-    ["决定", "确认", "采用", "建议", "下一步"]
+// Requirement messages are context, not confirmed work items. Older versions
+// derived active tasks from every user message; retain those records for
+// history, but do not let them drive today's work without confirmation.
+fn task_is_confirmed_project_task(manifest: &ProjectManifest, task: &TaskRecord) -> bool {
+    !manifest.messages.iter().any(|message| {
+        message.id == task.source_message_id
+            && message.author == "user"
+            && message.kind == "requirement"
+    })
+}
+
+fn extract_explicit_recorded_decision(text: &str) -> Option<String> {
+    const DECISION_MARKERS: [&str; 3] = ["我决定", "我确认", "决定采用"];
+    const RECORD_MARKERS: [&str; 7] = [
+        "请把这个决定记下来",
+        "请记下来",
+        "记录下来",
+        "保存这个决定",
+        "帮我记住这个决定",
+        "请记录这个决定",
+        "请记录下来",
+    ];
+
+    let (decision_start, decision_marker) = DECISION_MARKERS
         .iter()
-        .any(|word| text.contains(word))
+        .filter_map(|marker| text.find(marker).map(|start| (start, *marker)))
+        .min_by_key(|(start, _)| *start)?;
+    let marker_end = decision_start + decision_marker.len();
+    let record_start = RECORD_MARKERS
+        .iter()
+        .filter_map(|marker| {
+            text[marker_end..]
+                .find(marker)
+                .map(|offset| marker_end + offset)
+        })
+        .min()?;
+    if record_start <= marker_end {
+        return None;
+    }
+
+    let decision = text[marker_end..record_start]
+        .trim()
+        .trim_matches(|character: char| "：:，,；;。".contains(character))
+        .trim();
+    (!decision.is_empty()).then(|| decision.to_string())
+}
+
+fn extract_explicit_recorded_next_step(text: &str) -> Option<String> {
+    const NEXT_STEP_MARKERS: [&str; 2] = ["下一步", "接下来"];
+    const RECORD_MARKERS: [&str; 8] = [
+        "请把这个下一步记下来",
+        "保存这个下一步",
+        "请保存这个下一步",
+        "帮我记住这个下一步",
+        "记住这个下一步",
+        "请记下来",
+        "记录下来",
+        "帮我记住",
+    ];
+
+    let (next_step_start, marker) = NEXT_STEP_MARKERS
+        .iter()
+        .filter_map(|marker| text.find(marker).map(|start| (start, *marker)))
+        .min_by_key(|(start, _)| *start)?;
+    let leading_context = text[..next_step_start]
+        .trim_end()
+        .trim_end_matches(|character: char| "：:，,；;。 ".contains(character));
+    if ["建议", "推荐", "应该", "可以", "AI", "助手"]
+        .iter()
+        .any(|marker| leading_context.ends_with(marker))
+    {
+        return None;
+    }
+    let marker_end = next_step_start + marker.len();
+    let record_start = RECORD_MARKERS
+        .iter()
+        .filter_map(|marker| {
+            text[marker_end..]
+                .find(marker)
+                .map(|offset| marker_end + offset)
+        })
+        .min()?;
+    if record_start <= marker_end {
+        return None;
+    }
+
+    let mut next_step = text[marker_end..record_start]
+        .trim()
+        .trim_matches(|character: char| "：:，,；;。".contains(character))
+        .trim()
+        .to_string();
+    for prefix in ["我准备", "我会", "我将", "准备", "打算"] {
+        if let Some(rest) = next_step.strip_prefix(prefix) {
+            next_step = rest
+                .trim()
+                .trim_matches(|character: char| "：:，,；;。".contains(character))
+                .trim()
+                .to_string();
+            break;
+        }
+    }
+    (!next_step.is_empty()).then_some(next_step)
 }
 
 fn looks_like_artifact(text: &str) -> bool {
@@ -16410,16 +18512,6 @@ fn first_line(text: &str, max_chars: usize) -> String {
 fn record_message_in_session(manifest: &mut ProjectManifest, id: &str) {
     let session = active_daily_session(manifest);
     push_unique(&mut session.message_ids, id);
-}
-
-fn record_task_in_session(manifest: &mut ProjectManifest, id: &str) {
-    let session = active_daily_session(manifest);
-    push_unique(&mut session.task_ids, id);
-}
-
-fn record_decision_in_session(manifest: &mut ProjectManifest, id: &str) {
-    let session = active_daily_session(manifest);
-    push_unique(&mut session.decision_ids, id);
 }
 
 fn record_artifact_in_session(manifest: &mut ProjectManifest, id: &str) {
@@ -16488,6 +18580,7 @@ fn ensure_deepseek_authorization(manifest: &ProjectManifest) -> Result<(), Strin
 fn build_deepseek_context(
     manifest: &ProjectManifest,
     message_id: &str,
+    model_id: &str,
 ) -> Result<serde_json::Value, String> {
     let current_question = current_question_for_message(manifest, message_id);
     let evidence_items = manifest
@@ -16529,8 +18622,49 @@ fn build_deepseek_context(
                 "file" | "task" | "decision" | "outcome" | "projectState" | "projectAnalysis"
             )
     });
+    let reference_material = reference_files_for_question(manifest, &current_question)
+        .into_iter()
+        .filter(|file| reference_body_is_allowed(file, &current_question))
+        .map(|file| build_reference_material(manifest, file, &current_question))
+        .collect::<Vec<_>>();
+    let recorded_next_step = (!manifest.project.next_step.trim().is_empty()
+        && !is_system_generated_next_step(manifest, &manifest.project.next_step))
+    .then(|| context_text(&manifest.project.next_step, 180));
+    let image_attachments = image_attachments_for_message(manifest, message_id);
+    let mut image_parts = Vec::new();
+    let image_context_note = if image_attachments.is_empty() {
+        String::new()
+    } else if !deepseek::model_supports_vision(model_id) {
+        " 当前消息包含图片附件，但当前 DeepSeek 模型不支持视觉输入；不得声称已经看到了图片，回答只能依据文字和项目资料。".to_string()
+    } else {
+        let mut unreadable = 0_usize;
+        for attachment in &image_attachments {
+            if attachment.relative_path.trim().is_empty() {
+                unreadable += 1;
+                continue;
+            }
+            match read_chat_attachment_data(
+                Path::new(&manifest.project.root_dir),
+                &attachment.relative_path,
+            ) {
+                Ok(data) => image_parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": data.data_url, "detail": "auto" }
+                })),
+                Err(_) => unreadable += 1,
+            }
+        }
+        if image_parts.is_empty() {
+            " 当前消息包含图片附件，但图片暂时不可读取；不得根据文件名猜测图片内容。".to_string()
+        } else if unreadable > 0 {
+            format!(" 当前消息已发送可读取的图片附件；另有 {unreadable} 张图片不可读取，不得猜测其内容。")
+        } else {
+            " 当前消息已包含图片视觉输入；请只依据实际图片和文字回答，不要把推断写成图片事实。"
+                .to_string()
+        }
+    };
     let system_prompt = format!(
-        "你是感冒院的项目专属工作助手。上下文优先级固定为：当前项目真实资料、Decision Trace、任务/决定/成果、项目分析，最后才可使用明确标注的通用常识。不得补充资料中不存在的组织背景、技术栈、历史或目标，不要假装看到了原始文件。回答固定区分“已知事实”“AI总结”“建议”；待确认内容不能写成事实。{} 项目名称：{}。资料事实：{}。待确认内容：{}。",
+        "你是感冒院的项目专属工作助手。上下文优先级固定为：当前项目真实资料、Decision Trace、任务/决定/成果、项目分析，最后才可使用明确标注的通用常识。不得补充资料中不存在的组织背景、技术栈、历史或目标，不要假装看到了未列出的原始文件。回答固定区分“已知事实”“AI总结”“建议”；待确认内容不能写成事实。{} 项目名称：{}。资料事实：{}。待确认内容：{}。{}{}{}",
         if has_grounded_project_material {
             "所有事实必须引用下方依据。"
         } else {
@@ -16539,11 +18673,238 @@ fn build_deepseek_context(
         manifest.project.name,
         if facts.is_empty() { "无项目资料依据" } else { &facts },
         if pending.is_empty() { "暂无待确认内容" } else { &pending },
+        recorded_next_step
+            .as_deref()
+            .map(|value| format!(" 当前已记录的用户下一步：{}。它是已保存事实，不要称为草稿、待确认事项或要求用户再次确认。", value))
+            .unwrap_or_default(),
+        if reference_material.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " 本次问题明确命中了当前项目的参考资料。以下只提供有限的文件摘要和正文片段；正文不可用时只能依据摘要回答，并明确说明依据摘要：\n{}",
+                reference_material.join("\n\n")
+            )
+        },
+        image_context_note,
     );
+    let user_content = if image_parts.is_empty() {
+        json!(current_question)
+    } else {
+        let mut parts = vec![json!({ "type": "text", "text": current_question })];
+        parts.extend(image_parts);
+        serde_json::Value::Array(parts)
+    };
     Ok(json!([
         { "role": "system", "content": system_prompt },
-        { "role": "user", "content": current_question }
+        { "role": "user", "content": user_content }
     ]))
+}
+
+fn image_attachments_for_message<'a>(
+    manifest: &'a ProjectManifest,
+    message_id: &str,
+) -> Vec<&'a MessageAttachment> {
+    let Some(index) = manifest
+        .messages
+        .iter()
+        .position(|message| message.id == message_id)
+    else {
+        return Vec::new();
+    };
+
+    let message = &manifest.messages[index];
+    if message.author == "user" {
+        return message
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.attachment_type == "image")
+            .collect();
+    }
+
+    manifest.messages[..index]
+        .iter()
+        .rev()
+        .find(|candidate| candidate.author == "user")
+        .map(|candidate| {
+            candidate
+                .attachments
+                .iter()
+                .filter(|attachment| attachment.attachment_type == "image")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn reference_files_for_question<'a>(
+    manifest: &'a ProjectManifest,
+    question: &str,
+) -> Vec<&'a FileRecord> {
+    let normalized_query = normalize_search_text(question);
+    let mut matched = manifest
+        .files
+        .iter()
+        .filter(|file| !unhealthy_source(manifest, "file", &file.id))
+        .filter(|file| {
+            matches_query(
+                &join_search_fields(&[
+                    &file.file_name,
+                    &file.content_summary,
+                    &file.recommended_category,
+                    &file.category,
+                    &file.main_fields_or_sections.join("；"),
+                ]),
+                &normalized_query,
+            )
+        })
+        .take(AI_REFERENCE_FILE_LIMIT)
+        .collect::<Vec<_>>();
+
+    if matched.is_empty() && asks_for_reference_material(question) {
+        matched = manifest
+            .files
+            .iter()
+            .rev()
+            .filter(|file| !unhealthy_source(manifest, "file", &file.id))
+            .take(AI_REFERENCE_FILE_LIMIT)
+            .collect();
+    }
+    matched
+}
+
+fn asks_for_reference_material(question: &str) -> bool {
+    [
+        "这个文件",
+        "这份文件",
+        "这份资料",
+        "这份文档",
+        "刚才加入",
+        "刚加入",
+        "刚才导入",
+        "刚导入",
+        "当前参考资料",
+        "文件内容",
+        "文档内容",
+        "资料内容",
+        "正文",
+        "摘要",
+        "清单",
+        "manifest",
+    ]
+    .iter()
+    .any(|marker| {
+        question
+            .to_ascii_lowercase()
+            .contains(&marker.to_ascii_lowercase())
+    })
+}
+
+fn reference_body_is_allowed(file: &FileRecord, question: &str) -> bool {
+    if asks_for_reference_material(question) {
+        return true;
+    }
+    let normalized_query = normalize_search_text(question);
+    let normalized_name = normalize_search_text(&file.file_name);
+    if normalized_name.len() >= 5 && normalized_query.contains(&normalized_name) {
+        return true;
+    }
+    let stem = file
+        .file_name
+        .rsplit_once('.')
+        .map(|(value, _)| value)
+        .unwrap_or(&file.file_name);
+    stem.chars().count() >= 6 && normalized_query.contains(&normalize_search_text(stem))
+}
+
+fn build_reference_material(
+    manifest: &ProjectManifest,
+    file: &FileRecord,
+    question: &str,
+) -> String {
+    let name = context_text(&file.file_name, 160);
+    let category = context_text(
+        if file.recommended_category.trim().is_empty() {
+            &file.category
+        } else {
+            &file.recommended_category
+        },
+        80,
+    );
+    let summary = context_excerpt(&file.content_summary, 420);
+    let excerpt = read_project_reference_text(manifest, file)
+        .map(|text| reference_text_excerpt(&text, question))
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "正文片段不可用，只能依据已登记解析摘要。".to_string());
+    format!(
+        "- 文件：{}\n  分类：{}\n  解析摘要：{}\n  有限正文片段：{}",
+        if name.is_empty() {
+            "未命名资料"
+        } else {
+            &name
+        },
+        if category.is_empty() {
+            "未分类"
+        } else {
+            &category
+        },
+        if summary.is_empty() {
+            "暂无摘要"
+        } else {
+            &summary
+        },
+        excerpt,
+    )
+}
+
+fn read_project_reference_text(manifest: &ProjectManifest, file: &FileRecord) -> Option<String> {
+    let root = fs::canonicalize(&manifest.project.root_dir).ok()?;
+    let candidates = [&file.extracted_text_path, &file.managed_path];
+    candidates.iter().find_map(|value| {
+        if value.trim().is_empty() {
+            return None;
+        }
+        let path = fs::canonicalize(value).ok()?;
+        if !path.starts_with(&root) || !path.is_file() {
+            return None;
+        }
+        read_optional_text(&path)
+    })
+}
+
+fn reference_text_excerpt(text: &str, question: &str) -> String {
+    let normalized_text = normalize_search_text(text);
+    let normalized_query = normalize_search_text(question);
+    let related = normalized_query
+        .split_whitespace()
+        .filter(|token| token.chars().count() >= 2)
+        .find_map(|token| {
+            normalized_text
+                .find(token)
+                .map(|start| excerpt_by_byte_range(text, start, start + token.len(), 360))
+        });
+    let preview = text.lines().take(18).collect::<Vec<_>>().join("\n");
+    let combined = match related {
+        Some(related) if !preview.contains(&related) => format!("{preview}\n相关片段：{related}"),
+        _ => preview,
+    };
+    context_excerpt(&combined, AI_REFERENCE_EXCERPT_CHARS)
+}
+
+fn context_excerpt(value: &str, max_chars: usize) -> String {
+    let mut lines = Vec::new();
+    let mut length = 0;
+    for line in value.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let safe = context_text(line, 360);
+        if safe.is_empty() {
+            continue;
+        }
+        let next_length = length + safe.chars().count() + usize::from(!lines.is_empty());
+        if next_length > max_chars {
+            break;
+        }
+        length = next_length;
+        lines.push(safe);
+    }
+    lines.join("\n")
 }
 
 fn current_question_for_message(manifest: &ProjectManifest, message_id: &str) -> String {
@@ -16594,22 +18955,8 @@ fn collect_answer_evidence(
         });
     }
 
-    for file in manifest
-        .files
-        .iter()
-        .filter(|file| !unhealthy_source(manifest, "file", &file.id))
-        .filter(|file| {
-            matches_query(
-                &join_search_fields(&[
-                    &file.file_name,
-                    &file.content_summary,
-                    &file.recommended_category,
-                    &file.category,
-                    &file.main_fields_or_sections.join("；"),
-                ]),
-                &normalized_query,
-            )
-        })
+    for file in reference_files_for_question(manifest, current_question)
+        .into_iter()
         .take(4)
     {
         evidence_items.push(MessageEvidenceItem {
@@ -18334,7 +20681,7 @@ mod tests {
         fs::write(root.join("target/debug/build-output.bin"), "ignored").unwrap();
         fs::write(root.join(".git/objects/object"), "ignored").unwrap();
 
-        let first = collect_observed_project_files(&root).unwrap();
+        let first = collect_observed_project_files(&root, None).unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].file_name, "project-note.txt");
         let first_hash = first[0].hash.clone();
@@ -18344,9 +20691,23 @@ mod tests {
             "changed content with another size",
         )
         .unwrap();
-        let second = collect_observed_project_files(&root).unwrap();
+        let second = collect_observed_project_files(&root, None).unwrap();
         assert_eq!(second.len(), 1);
         assert_ne!(second[0].hash, first_hash);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_monitor_skips_an_associated_repository_tree() {
+        let root = test_root("project-monitor-repository-skip");
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "target\n").unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let observed = collect_observed_project_files(&root, Some(&root)).unwrap();
+
+        assert!(observed.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -18816,6 +21177,146 @@ mod tests {
         root
     }
 
+    fn setup_test_git_repository(label: &str) -> PathBuf {
+        let repo = test_root(label);
+        fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.local"],
+            vec!["config", "user.name", "Ganmaoyuan Test"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        fs::write(repo.join("README.md"), "initial\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-m", "initial"])
+            .status()
+            .unwrap()
+            .success());
+        repo
+    }
+
+    #[test]
+    fn continue_project_queue_prioritizes_action_and_excludes_resolved_focus() {
+        let manifests = [
+            ProjectManifest {
+                project: ProjectSummary {
+                    id: "project-a".to_string(),
+                    name: "项目 A".to_string(),
+                    root_dir: "D:\\Projects\\A".to_string(),
+                    ..ProjectSummary::default()
+                },
+                ..ProjectManifest::default()
+            },
+            ProjectManifest {
+                project: ProjectSummary {
+                    id: "project-b".to_string(),
+                    name: "项目 B".to_string(),
+                    root_dir: "D:\\Projects\\B".to_string(),
+                    ..ProjectSummary::default()
+                },
+                ..ProjectManifest::default()
+            },
+            ProjectManifest {
+                project: ProjectSummary {
+                    id: "project-c".to_string(),
+                    name: "项目 C".to_string(),
+                    root_dir: "D:\\Projects\\C".to_string(),
+                    ..ProjectSummary::default()
+                },
+                ..ProjectManifest::default()
+            },
+        ];
+        let focuses = manifests
+            .iter()
+            .map(|manifest| TodayProjectFocus {
+                project_id: manifest.project.id.clone(),
+                project_name: manifest.project.name.clone(),
+                project_root: manifest.project.root_dir.clone(),
+                ..TodayProjectFocus::default()
+            })
+            .collect::<Vec<_>>();
+        let pending = vec![PendingActionProjection {
+            id: "codex-review-a".to_string(),
+            action_type: "codexAcceptance".to_string(),
+            project_id: "project-a".to_string(),
+            title: "验收 Codex 结果".to_string(),
+            reason: "等待人工验收".to_string(),
+            priority: "high".to_string(),
+            status: "open".to_string(),
+            ..PendingActionProjection::default()
+        }];
+        let activities = vec![ActivityProjection {
+            id: "git-b".to_string(),
+            project_id: "project-b".to_string(),
+            summary: "Git 最近有变化".to_string(),
+            ..ActivityProjection::default()
+        }];
+        let recommendations = build_continue_project_recommendations(
+            &manifests,
+            &focuses,
+            &pending,
+            &activities,
+            &[],
+            &[],
+        );
+        assert_eq!(recommendations.len(), 2);
+        assert_eq!(recommendations[0].project_id, "project-a");
+        assert_eq!(recommendations[1].project_id, "project-b");
+        assert!(recommendations
+            .iter()
+            .all(|item| item.project_id != "project-c"));
+        assert!(recommendations[0]
+            .score_basis
+            .iter()
+            .any(|item| item.contains("有效待处理")));
+
+        let snoozed = build_continue_project_recommendations(
+            &manifests,
+            &focuses,
+            &pending,
+            &activities,
+            &[],
+            &[ContinueProjectPreference {
+                project_id: "project-a".to_string(),
+                snoozed_until: (now_string().parse::<u128>().unwrap() + 86_400_000).to_string(),
+                ..ContinueProjectPreference::default()
+            }],
+        );
+        assert!(snoozed.iter().all(|item| item.project_id != "project-a"));
+
+        let pinned = build_continue_project_recommendations(
+            &manifests,
+            &focuses,
+            &[],
+            &[],
+            &[],
+            &[ContinueProjectPreference {
+                project_id: "project-c".to_string(),
+                pinned: true,
+                ..ContinueProjectPreference::default()
+            }],
+        );
+        assert!(pinned
+            .iter()
+            .any(|item| item.project_id == "project-c" && item.pinned));
+    }
+
     #[test]
     fn stable_manifest_reads_do_not_rewrite_derived_project_files() {
         let root = setup_project("stable-manifest-read");
@@ -19088,6 +21589,11 @@ mod tests {
         assert_eq!(manifest.project_impact_analyses.len(), 1);
         assert!(!manifest.project_action_candidates.is_empty());
         assert_eq!(manifest.project_state_proposals.len(), 1);
+        assert!(manifest
+            .pending_reviews
+            .iter()
+            .all(|item| item.kind != "projectState.proposal"));
+        assert!(manifest.project.next_step.is_empty());
         assert!(!manifest.project_state_proposals[0]
             .decision_trace
             .id
@@ -19237,6 +21743,113 @@ mod tests {
         assert!(snapshot.last_progress.is_empty());
         assert!(snapshot.recommended_actions.is_empty());
         assert!(manifest.project_state_summary.facts.is_empty());
+    }
+
+    #[test]
+    fn cleared_scan_reviews_do_not_survive_as_continue_focus() {
+        let mut manifest = ProjectManifest::default();
+        manifest.project = ProjectSummary {
+            id: "cleared-scan-project".to_string(),
+            name: "已清理扫描项目".to_string(),
+            next_step: "请先处理待确认事项：发现新文件：.gitignore".to_string(),
+            ..ProjectSummary::default()
+        };
+
+        update_daily_continue_snapshot(&mut manifest);
+
+        let snapshot = manifest.daily_continue_snapshots.last().unwrap();
+        assert!(snapshot.pending_confirmations.is_empty());
+        assert!(snapshot
+            .recommended_actions
+            .iter()
+            .all(|item| !item.action.contains(".gitignore")));
+        assert!(!manifest.project.next_step.contains("发现新文件"));
+    }
+
+    #[test]
+    fn project_analysis_suggestions_do_not_become_current_next_step() {
+        let mut manifest = ProjectManifest::default();
+        manifest.project = ProjectSummary {
+            id: "analysis-only-project".to_string(),
+            next_step: "接入只读 Atlas Adapter 并评估 Atlas。".to_string(),
+            ..ProjectSummary::default()
+        };
+        manifest.project_analysis.next_steps = vec![
+            "接入只读 Atlas Adapter 并评估 Atlas。".to_string(),
+            "补充正式验收标准。".to_string(),
+        ];
+
+        update_daily_continue_snapshot(&mut manifest);
+
+        assert!(manifest.project.next_step.is_empty());
+        assert_eq!(manifest.project_analysis.next_steps.len(), 2);
+
+        manifest.project.next_step = FACTS_ONLY_NEXT_STEP_PLACEHOLDER.to_string();
+        update_daily_continue_snapshot(&mut manifest);
+        assert!(manifest.project.next_step.is_empty());
+    }
+
+    #[test]
+    fn requirement_messages_do_not_create_active_project_tasks() {
+        let mut manifest = ProjectManifest {
+            project: ProjectSummary {
+                id: "context-only".to_string(),
+                ..ProjectSummary::default()
+            },
+            ..ProjectManifest::default()
+        };
+        let message = WorkspaceMessage {
+            id: "message-1".to_string(),
+            author: "user".to_string(),
+            kind: "requirement".to_string(),
+            text: "请根据项目资料生成下一步建议。".to_string(),
+            created_at: "100".to_string(),
+            ..WorkspaceMessage::default()
+        };
+
+        record_message_derivatives(&mut manifest, &message);
+
+        assert!(manifest.tasks.is_empty());
+    }
+
+    #[test]
+    fn legacy_message_derived_task_does_not_become_today_focus() {
+        let mut manifest = ProjectManifest {
+            project: ProjectSummary {
+                id: "legacy-context".to_string(),
+                ..ProjectSummary::default()
+            },
+            messages: vec![WorkspaceMessage {
+                id: "message-1".to_string(),
+                author: "user".to_string(),
+                kind: "requirement".to_string(),
+                text: "请根据项目资料生成下一步建议。".to_string(),
+                created_at: "1".to_string(),
+                ..WorkspaceMessage::default()
+            }],
+            tasks: vec![TaskRecord {
+                id: "legacy-task".to_string(),
+                title: "请根据项目资料生成下一步建议。".to_string(),
+                status: "active".to_string(),
+                source_message_id: "message-1".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            }],
+            ..ProjectManifest::default()
+        };
+
+        update_daily_continue_snapshot(&mut manifest);
+
+        assert!(manifest
+            .daily_continue_snapshots
+            .last()
+            .expect("snapshot")
+            .recommended_actions
+            .is_empty());
+        assert!(!manifest
+            .project_attentions
+            .iter()
+            .any(|attention| attention.attention_type == "staleTask"));
     }
 
     #[test]
@@ -19535,6 +22148,35 @@ mod tests {
         assert_eq!(read_work_ledger(&root).unwrap().events.len(), 1);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn today_read_uses_persisted_git_fact_without_refreshing_repository() {
+        let root = setup_project("today-read-persisted-git");
+        let repository = test_root("today-read-persisted-git-repository");
+        fs::create_dir_all(&repository).unwrap();
+        let mut manifest = read_and_repair_manifest(&root).unwrap();
+        manifest.project.repository_path = path_to_string(&repository);
+        persist_project(&root, &manifest, None).unwrap();
+        write_git_snapshot(
+            &root,
+            &GitSnapshot {
+                project_id: manifest.project.id.clone(),
+                repository_path: path_to_string(&repository),
+                head: "abc123def456".to_string(),
+                head_short: "abc123d".to_string(),
+                ..GitSnapshot::default()
+            },
+        )
+        .unwrap();
+
+        let check = read_project_git_facts_for_today(&root, &manifest);
+
+        assert_eq!(check.status, "fresh");
+        assert_eq!(check.evidence_refs[0].id, "abc123def456");
+        assert_eq!(read_work_ledger(&root).unwrap().events.len(), 0);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(repository).unwrap();
     }
 
     #[test]
@@ -20876,11 +23518,141 @@ mod tests {
             }],
             ..WorkspaceMessage::default()
         });
-        let context = build_deepseek_context(&manifest, "assistant-pending")
+        let context = build_deepseek_context(&manifest, "assistant-pending", "deepseek-chat")
             .unwrap()
             .to_string();
         assert!(context.contains("当前项目资料不足，无法确认"));
         assert!(context.contains("不得猜测或补全背景"));
+    }
+
+    #[test]
+    fn ai_context_includes_explicit_reference_file_excerpt() {
+        let root = setup_project("ai-reference-context");
+        let file_path = root
+            .join(".ganmaoyuan")
+            .join("managed")
+            .join("02_requirements")
+            .join("WTS_Production_Migration_Manifest.md");
+        fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        fs::write(
+            &file_path,
+            "# WTS Production Migration Manifest\n\n用于指导 IT/DBA 按顺序执行数据库结构初始化和迁移。\n排除业务数据导入和生产数据改写。\n",
+        )
+        .unwrap();
+
+        let mut manifest = ProjectManifest::default();
+        manifest.project.id = "reference-project".to_string();
+        manifest.project.name = "WTS".to_string();
+        manifest.project.root_dir = path_to_string(&root);
+        manifest.files.push(FileRecord {
+            id: "reference-file".to_string(),
+            file_name: "WTS_Production_Migration_Manifest.md".to_string(),
+            managed_path: path_to_string(&file_path),
+            file_type: "md".to_string(),
+            parse_status: "success".to_string(),
+            content_summary: "WTS Production Migration Manifest，数据库迁移执行清单。".to_string(),
+            still_exists: true,
+            ..FileRecord::default()
+        });
+        manifest.messages.push(WorkspaceMessage {
+            id: "question".to_string(),
+            author: "user".to_string(),
+            text: "刚才加入的 WTS_Production_Migration_Manifest.md 主要是做什么的？".to_string(),
+            ..WorkspaceMessage::default()
+        });
+        manifest.messages.push(WorkspaceMessage {
+            id: "assistant".to_string(),
+            author: "ganmaoyuan".to_string(),
+            ..WorkspaceMessage::default()
+        });
+
+        let context = build_deepseek_context(&manifest, "assistant", "deepseek-chat")
+            .unwrap()
+            .to_string();
+
+        assert!(context.contains("WTS_Production_Migration_Manifest.md"));
+        assert!(context.contains("数据库结构初始化和迁移"));
+        assert!(context.contains("排除业务数据导入"));
+        assert!(!context.contains(&path_to_string(&root)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_image_attachment_persists_without_becoming_project_material() {
+        let root = setup_project("chat-image-persist");
+        let input = ChatImageAttachmentInput {
+            file_name: "screen.png".to_string(),
+            content_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
+        };
+        let attachments =
+            persist_chat_image_attachments(&root, "message-image", vec![input.clone()]).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].attachment_type, "image");
+        assert_eq!(attachments[0].content_type, "image/png");
+        assert!(attachments[0].managed_path.is_empty());
+        assert!(root.join(&attachments[0].relative_path).is_file());
+
+        let loaded = read_chat_attachment_data(&root, &attachments[0].relative_path).unwrap();
+        assert_eq!(loaded.content_type, "image/png");
+        assert_eq!(loaded.data_url, input.data_url);
+
+        let mut manifest = ProjectManifest::default();
+        record_message_derivatives(
+            &mut manifest,
+            &WorkspaceMessage {
+                id: "message-image".to_string(),
+                author: "user".to_string(),
+                kind: "requirement".to_string(),
+                attachments,
+                ..WorkspaceMessage::default()
+            },
+        );
+        assert!(manifest.artifacts.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_image_context_uses_current_user_attachment_only_for_vision_models() {
+        let root = setup_project("chat-image-context");
+        let attachments = persist_chat_image_attachments(
+            &root,
+            "question",
+            vec![ChatImageAttachmentInput {
+                file_name: "screen.png".to_string(),
+                content_type: "image/png".to_string(),
+                data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
+            }],
+        )
+        .unwrap();
+        let mut manifest = ProjectManifest::default();
+        manifest.project.root_dir = path_to_string(&root);
+        manifest.project.name = "图片上下文测试".to_string();
+        manifest.messages.push(WorkspaceMessage {
+            id: "question".to_string(),
+            author: "user".to_string(),
+            text: "请看这张截图".to_string(),
+            attachments,
+            ..WorkspaceMessage::default()
+        });
+        manifest.messages.push(WorkspaceMessage {
+            id: "assistant".to_string(),
+            author: "ganmaoyuan".to_string(),
+            ..WorkspaceMessage::default()
+        });
+
+        let vision_context = build_deepseek_context(&manifest, "assistant", "deepseek-flash")
+            .unwrap()
+            .to_string();
+        assert!(vision_context.contains("image_url"));
+        assert!(vision_context.contains("data:image/png;base64"));
+
+        let text_context = build_deepseek_context(&manifest, "assistant", "deepseek-chat")
+            .unwrap()
+            .to_string();
+        assert!(!text_context.contains("image_url"));
+        assert!(text_context.contains("不支持视觉输入"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -21279,6 +24051,68 @@ mod tests {
     }
 
     #[test]
+    fn explicit_codex_task_keeps_prompt_scope_isolated() {
+        let root = setup_project("explicit-codex-task");
+        let task = create_codex_task(
+            path_to_string(&root),
+            CodexTaskCreateRequest {
+                title: "验证结果桥接".to_string(),
+                task_type: "fileOperation".to_string(),
+                instructions: "仅创建 docs/proof.md，内容为 OK。不要修改其它文件。".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(task.status, "ready");
+        assert_eq!(task.task_type, "fileOperation");
+        assert!(task.prompt.contains("docs/proof.md"));
+        assert!(task.prompt.contains(&task.task_id));
+        assert!(task.prompt.contains(&task.expected_result_path));
+        assert!(!task.prompt.contains("D:\\Atlas"));
+        assert_eq!(read_codex_task(&root, &task.task_id).unwrap(), task);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_coding_task_persists_type_for_reload_and_runner() {
+        let root = setup_project("explicit-coding-task-type");
+        let task = create_codex_task(
+            path_to_string(&root),
+            CodexTaskCreateRequest {
+                title: "优化设置后台右侧内容区留白".to_string(),
+                task_type: "coding".to_string(),
+                instructions: "只调整右侧内容区的 padding 和 section spacing，不修改其它功能。"
+                    .to_string(),
+            },
+        )
+        .unwrap();
+        let reloaded = read_codex_task(&root, &task.task_id).unwrap();
+        let run_prompt = codex_prompt_for_run(
+            &reloaded,
+            &CodexRun {
+                id: "run-coding-type".to_string(),
+                git_head_before: "abc123".to_string(),
+                git_dirty_files_before: vec![GitChangedFile {
+                    status: "M".to_string(),
+                    path: "unrelated.md".to_string(),
+                }],
+                ..CodexRun::default()
+            },
+        );
+
+        assert_eq!(task.task_type, "coding");
+        assert_eq!(reloaded.task_type, "coding");
+        assert!(reloaded.prompt.contains("taskType：coding"));
+        assert!(run_prompt.contains("taskType：coding"));
+        assert!(codex_task_git_required(&reloaded));
+        assert!(run_prompt.contains("git add -- <本任务文件路径>"));
+        assert!(run_prompt.contains("禁止 `git add .`"));
+        assert!(run_prompt.contains("unrelated.md"));
+        assert!(run_prompt.contains("gitHead"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn consecutive_codex_tasks_keep_prompt_and_result_paths_isolated() {
         let root = setup_project("codex-task-prompt-isolation");
 
@@ -21449,7 +24283,7 @@ mod tests {
     }
 
     #[test]
-    fn exited_codex_run_without_result_creates_runner_fallback() {
+    fn exited_codex_run_without_result_does_not_create_fallback_during_scan() {
         let root = setup_project("codex-run-fallback");
         ensure_project_dirs(&root).unwrap();
         let task = CodexTask {
@@ -21485,25 +24319,21 @@ mod tests {
         let external = read_codex_external_results(&root).unwrap();
         let task = read_codex_task(&root, "task-fallback").unwrap();
 
-        assert!(fallback_path.exists());
-        assert_eq!(first.imported_count, 1);
+        assert!(!fallback_path.exists());
+        assert_eq!(first.imported_count, 0);
         assert_eq!(second.imported_count, 0);
-        assert_eq!(external.results.len(), 1);
-        assert_eq!(external.results[0].task_id, "task-fallback");
-        assert_eq!(external.results[0].result_source, "runnerFallback");
-        assert!(external.results[0].commits.is_empty());
-        assert!(external.results[0].tests.is_empty());
-        assert_eq!(task.status, "needsReview");
+        assert!(external.results.is_empty());
+        assert_eq!(task.status, "awaitingResult");
         refresh_codex_task_git_verifications(&root, "").unwrap();
         assert_eq!(
             read_codex_task(&root, "task-fallback").unwrap().status,
-            "needsReview"
+            "awaitingResult"
         );
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn runner_fallback_handles_missing_last_message_without_fake_tests() {
+    fn missing_last_message_does_not_create_fake_result_during_scan() {
         let root = setup_project("codex-run-fallback-missing-message");
         ensure_project_dirs(&root).unwrap();
         let task = CodexTask {
@@ -21536,12 +24366,11 @@ mod tests {
 
         let result = scan_codex_result_bridge(path_to_string(&root)).unwrap();
         let external = read_codex_external_results(&root).unwrap();
+        let task = read_codex_task(&root, "task-no-message").unwrap();
 
-        assert_eq!(result.imported_count, 1);
-        assert_eq!(external.results[0].task_id, "task-no-message");
-        assert_eq!(external.results[0].result_source, "runnerFallback");
-        assert!(external.results[0].commits.is_empty());
-        assert!(external.results[0].tests.is_empty());
+        assert_eq!(result.imported_count, 0);
+        assert!(external.results.is_empty());
+        assert_eq!(task.status, "awaitingResult");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -21604,7 +24433,7 @@ mod tests {
     }
 
     #[test]
-    fn lost_codex_process_without_result_fails_instead_of_waiting_forever() {
+    fn restarted_codex_process_waits_for_result_without_fallback() {
         let root = setup_project("codex-process-lost");
         let task_id = "lost-task";
         write_codex_task(
@@ -21642,18 +24471,68 @@ mod tests {
 
         let task = read_codex_task(&root, task_id).unwrap();
         let run = read_codex_run(&root, "run-lost").unwrap();
-        assert_eq!(task.status, "failed");
+        assert_eq!(task.status, "awaitingResult");
         assert_eq!(run.status, "unknownAfterRestart");
         assert!(run.error.contains("未检测到"));
+        assert!(!codex_result_bridge_dir(&root)
+            .join(format!("{task_id}-result.json"))
+            .exists());
+
+        write_analysis_bridge_result(&root, task_id, &[]);
+        list_codex_tasks(path_to_string(&root)).unwrap();
+        let recovered = read_codex_task(&root, task_id).unwrap();
+        assert_eq!(recovered.status, "completed");
+        assert_eq!(recovered.result_source, "codex");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restarted_codex_process_needs_review_only_after_recovery_window() {
+        let root = setup_project("codex-process-recovery-expired");
+        let task_id = "expired-task";
+        write_codex_task(
+            &root,
+            &CodexTask {
+                task_id: task_id.to_string(),
+                project_id: "p1".to_string(),
+                title: "过期恢复任务".to_string(),
+                task_type: "analysis".to_string(),
+                status: "awaitingResult".to_string(),
+                prompt: format!("taskId：{task_id}"),
+                expected_result_path: path_to_string(
+                    &codex_result_bridge_dir(&root).join(format!("{task_id}-result.json")),
+                ),
+                updated_at: now_string(),
+                ..CodexTask::default()
+            },
+        )
+        .unwrap();
+        upsert_codex_run(
+            &root,
+            CodexRun {
+                id: "run-expired".to_string(),
+                task_id: task_id.to_string(),
+                project_id: "p1".to_string(),
+                status: "unknownAfterRestart".to_string(),
+                started_at: "1".to_string(),
+                ended_at: "1".to_string(),
+                pid: 0,
+                ..CodexRun::default()
+            },
+        )
+        .unwrap();
+
+        sync_failed_codex_runs_to_tasks(&root).unwrap();
+
+        let task = read_codex_task(&root, task_id).unwrap();
+        assert_eq!(task.status, "needsReview");
         assert!(task
             .remaining_issues
             .iter()
-            .any(|item| item.contains("未检测到")));
-        list_codex_tasks(path_to_string(&root)).unwrap();
-        assert_eq!(
-            read_codex_task(&root, task_id).unwrap().updated_at,
-            task.updated_at
-        );
+            .any(|item| item.contains("恢复窗口已结束")));
+        assert!(!codex_result_bridge_dir(&root)
+            .join(format!("{task_id}-result.json"))
+            .exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -21675,6 +24554,40 @@ mod tests {
         .unwrap();
     }
 
+    fn wait_for_live_codex_result(root: &Path, task_id: &str) -> (CodexTask, CodexRun) {
+        let run = start_codex_task_run(path_to_string(root), task_id.to_string()).unwrap();
+        assert_eq!(run.status, "starting");
+        let deadline = std::time::Instant::now() + Duration::from_secs(240);
+        loop {
+            let current = read_codex_run(root, &run.id).unwrap();
+            if !matches!(current.status.as_str(), "starting" | "running") {
+                assert!(
+                    current.exit_code == Some(0)
+                        || current.error.contains("已收到本次真实 Codex 结果"),
+                    "CLI failed; inspect the isolated CodexRun record"
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                cancel_codex_task_run(path_to_string(root), task_id.to_string()).unwrap();
+                panic!("Live test exceeded four minutes; only its child process was cancelled");
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        let task = (0..30)
+            .find_map(|_| {
+                let current = read_codex_task(root, task_id).unwrap();
+                if !current.result_received_at.is_empty() && current.result_run_id == run.id {
+                    Some(current)
+                } else {
+                    std::thread::sleep(Duration::from_millis(500));
+                    None
+                }
+            })
+            .expect("Runner did not automatically import the Codex-written result");
+        (task, read_codex_run(root, &run.id).unwrap())
+    }
+
     #[test]
     #[ignore = "Opt-in: runs the installed Codex CLI using local authentication"]
     fn live_codex_cli_writes_result_and_bridge_receives_it() {
@@ -21694,11 +24607,12 @@ mod tests {
             .prompt
             .id;
         let mut task = read_codex_task(&root, &id).unwrap();
-        task.task_type = "analysis".to_string();
+        task.task_type = "fileOperation".to_string();
         task.repository_path = path_to_string(&repo);
+        let proof_path = repo.join("codex-live-runner-proof.md");
         task.prompt = format!(
-            "taskId: {id}\nThis is an isolated result-handoff smoke test. Do not read any other project, memory, network, or user files. Do not change Git or code. Your only task is to write UTF-8 JSON to this absolute path: {}\nJSON must contain taskId={id}, taskType=analysis, status=completed, summary='Isolated handoff verified', resultText='The isolated test requested a result file and this file was written.', findings=['The result file was written by Codex'], changedFiles=[], commits=[], tests=[], remainingIssues=[], manualAcceptance=['Confirm the isolated handoff'], resultSource=codex, completedAt=actual current time. Use a file-writing tool, then finish immediately. Do not merely print the JSON. Do not use a fallback. Final reply: Handoff file written.",
-            task.expected_result_path
+            "taskId: {id}\nThis is an isolated file-operation and result-handoff smoke test. Do not read any other project, memory, network, or user files. Do not change Git. Create this UTF-8 text file with exactly `CODEX_LIVE_RUNNER_OK`: {}. Then write UTF-8 JSON to this absolute path: {}\nJSON must contain taskId={id}, taskType=fileOperation, status=completed, summary='Isolated runner handoff verified', resultText='The isolated test file and result file were written by Codex.', changedFiles=['codex-live-runner-proof.md'], artifacts=['codex-live-runner-proof.md'], targetFiles=['codex-live-runner-proof.md'], commits=[], tests=[], remainingIssues=[], manualAcceptance=['Confirm the isolated runner file'], resultSource=codex, completedAt=actual current time. Use a dedicated file-writing tool, then finish immediately. Do not merely print the JSON. Do not use a fallback. Final reply: Handoff file written.",
+            path_to_string(&proof_path), task.expected_result_path
         );
         write_codex_task(&root, &task).unwrap();
         assert_eq!(task.status, "ready");
@@ -21714,7 +24628,7 @@ mod tests {
                 .unwrap();
             }
             let run = start_codex_task_run(path_to_string(&root), id.clone()).unwrap();
-            assert_eq!(run.status, "running");
+            assert_eq!(run.status, "starting");
             eprintln!(
                 "Live handoff started; isolated artifacts: {}",
                 root.display()
@@ -21722,10 +24636,10 @@ mod tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(900);
             loop {
                 let current = read_codex_run(&root, &run.id).unwrap();
-                if current.status != "running" {
-                    assert_eq!(
-                        current.exit_code,
-                        Some(0),
+                if !matches!(current.status.as_str(), "starting" | "running") {
+                    assert!(
+                        current.exit_code == Some(0)
+                            || current.error.contains("已收到本次真实 Codex 结果"),
                         "CLI failed; inspect isolated run record"
                     );
                     break;
@@ -21752,6 +24666,10 @@ mod tests {
             assert_eq!(result["taskId"], id);
             assert_eq!(result["resultSource"], "codex");
             assert_eq!(result["resultRunId"], run.id);
+            assert_eq!(
+                fs::read_to_string(&proof_path).unwrap(),
+                "CODEX_LIVE_RUNNER_OK\n"
+            );
             assert_eq!(received.result_source, "codex");
             assert_eq!(received.result_run_id, run.id);
             assert_eq!(received.status, "awaitingAcceptance");
@@ -21806,6 +24724,140 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Opt-in: runs a real, isolated Codex analysis task using local authentication"]
+    fn live_codex_cli_analysis_uses_cmd_and_returns_a_structured_result() {
+        let root = setup_project("codex-live-analysis");
+        let repo = root.join("repository");
+        fs::create_dir_all(&repo).unwrap();
+        assert!(hidden_command("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("init")
+            .output()
+            .unwrap()
+            .status
+            .success());
+        fs::write(
+            repo.join("package.json"),
+            r#"{"name":"isolated-analysis","version":"1.2.3"}"#,
+        )
+        .unwrap();
+        let id = generate_codex_prompt(path_to_string(&root))
+            .unwrap()
+            .prompt
+            .id;
+        let mut task = read_codex_task(&root, &id).unwrap();
+        task.task_type = "analysis".to_string();
+        task.repository_path = path_to_string(&repo);
+        task.prompt = format!(
+            "taskId: {id}\nThis is an isolated read-only analysis and result-handoff test. Read only {} and report its JSON name and version. Do not create, modify, delete, stage, or commit any repository file. Do not access any other project, memory, network, or user files. Then write UTF-8 JSON to {} with taskId={id}, taskType=analysis, status=completed, summary='Isolated analysis completed', resultText='The package metadata was read in the isolated repository.', findings=['package name isolated-analysis', 'version 1.2.3'], recommendations=['No repository changes are needed'], questions=[], changedFiles=[], commits=[], tests=[], remainingIssues=[], manualAcceptance=[], resultSource=codex, completedAt=actual current time. Use cmd.exe for the read command as required by the execution constraints. Do not merely print the JSON. Final reply: Analysis result file written.",
+            path_to_string(&repo.join("package.json")),
+            task.expected_result_path
+        );
+        write_codex_task(&root, &task).unwrap();
+
+        let (received, run) = wait_for_live_codex_result(&root, &id);
+        let result: serde_json::Value = read_json(Path::new(&task.expected_result_path)).unwrap();
+        assert_eq!(run.status, "exited");
+        assert_eq!(result["taskId"], id);
+        assert_eq!(result["taskType"], "analysis");
+        assert_eq!(result["resultSource"], "codex");
+        assert_eq!(result["resultRunId"], run.id);
+        assert!(result["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item
+                .as_str()
+                .unwrap_or_default()
+                .contains("isolated-analysis")));
+        assert_eq!(received.result_source, "codex");
+        assert_eq!(received.status, "completed");
+        assert_eq!(received.git_verification.status, "notApplicable");
+    }
+
+    #[test]
+    #[ignore = "Opt-in: runs a real, isolated Codex coding task using local authentication"]
+    fn live_codex_cli_coding_task_commits_and_is_git_verified() {
+        let root = setup_project("codex-live-coding");
+        let repo = root.join("repository");
+        fs::create_dir_all(&repo).unwrap();
+        assert!(hidden_command("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-b", "main"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(hidden_command("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "user.email", "codex-live@example.invalid"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(hidden_command("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "user.name", "Codex Live Test"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        fs::write(repo.join("README.md"), "# Isolated Codex coding test\n").unwrap();
+        assert!(hidden_command("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "README.md"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(hidden_command("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-m", "test: initialize isolated coding task"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let id = generate_codex_prompt(path_to_string(&root))
+            .unwrap()
+            .prompt
+            .id;
+        let mut task = read_codex_task(&root, &id).unwrap();
+        task.task_type = "coding".to_string();
+        task.repository_path = path_to_string(&repo);
+        let proof_path = repo.join("codex-live-coding-proof.md");
+        task.prompt = format!(
+            "taskId: {id}\nThis is an isolated coding and Git-verification test. In this isolated repository only, create {} with exactly `CODEX_LIVE_CODING_OK` followed by one newline. Use cmd.exe for every Git or test command as required by the execution constraints. Run `git add codex-live-coding-proof.md`, commit with message `test: verify Codex coding bridge`, then obtain the full commit SHA with `git rev-parse HEAD`. Do not access any other project, memory, network, or user files. Then write UTF-8 JSON to {} with taskId={id}, taskType=coding, status=completed, summary='Isolated coding task completed', resultText='The proof file was created and committed in the isolated repository.', changedFiles=['codex-live-coding-proof.md'], commits=[the full SHA from git rev-parse HEAD], tests=['git status --porcelain returned clean'], remainingIssues=[], manualAcceptance=['Confirm the isolated coding proof file'], resultSource=codex, completedAt=actual current time. Do not merely print the JSON. Final reply: Coding result file written.",
+            path_to_string(&proof_path),
+            task.expected_result_path
+        );
+        write_codex_task(&root, &task).unwrap();
+
+        let (received, run) = wait_for_live_codex_result(&root, &id);
+        let result: serde_json::Value = read_json(Path::new(&task.expected_result_path)).unwrap();
+        assert_eq!(run.status, "exited");
+        assert_eq!(result["taskId"], id);
+        assert_eq!(result["taskType"], "coding");
+        assert_eq!(result["resultSource"], "codex");
+        assert_eq!(result["resultRunId"], run.id);
+        assert_eq!(
+            fs::read_to_string(&proof_path).unwrap(),
+            "CODEX_LIVE_CODING_OK\n"
+        );
+        assert_eq!(received.result_source, "codex");
+        assert_eq!(received.status, "awaitingAcceptance");
+        assert_eq!(received.git_verification.status, "verified");
+        assert_eq!(received.reported_commits.len(), 1);
+        let accepted = accept_codex_task(path_to_string(&root), id, received.result_id).unwrap();
+        assert_eq!(accepted.status, "completed");
+    }
+
+    #[test]
     fn codex_result_rescan_preserves_acceptance_and_task_timestamp() {
         let root = setup_project("codex-rescan-acceptance");
         let prompt = generate_codex_prompt(path_to_string(&root)).unwrap();
@@ -21843,6 +24895,31 @@ mod tests {
         write_codex_task(&root, &legacy).unwrap();
         scan_codex_result_bridge(path_to_string(&root)).unwrap();
         assert_eq!(read_codex_task(&root, &id).unwrap().status, "completed");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_needs_review_can_use_the_canonical_acceptance_path() {
+        let root = setup_project("codex-needs-review-acceptance");
+        let prompt = generate_codex_prompt(path_to_string(&root)).unwrap();
+        let id = prompt.prompt.id;
+        write_analysis_bridge_result(&root, &id, &["确认分析结论"]);
+        scan_codex_result_bridge(path_to_string(&root)).unwrap();
+
+        let mut review_task = read_codex_task(&root, &id).unwrap();
+        assert_eq!(review_task.status, "awaitingAcceptance");
+        review_task.status = "needsReview".to_string();
+        write_codex_task(&root, &review_task).unwrap();
+
+        let accepted =
+            accept_codex_task(path_to_string(&root), id.clone(), review_task.result_id).unwrap();
+        assert_eq!(accepted.status, "completed");
+        assert_eq!(accepted.acceptance.status, "approved");
+        assert!(read_work_ledger(&root)
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.event_type == "codex.taskAccepted"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -21935,7 +25012,6 @@ mod tests {
             "ready",
             "running",
             "awaitingResult",
-            "needsReview",
             "failed",
             "cancelled",
             "completed",
@@ -22181,6 +25257,46 @@ mod tests {
     }
 
     #[test]
+    fn codex_review_accepts_result_after_handoff_cleanup_exit() {
+        let root = setup_project("codex-review-handoff-cleanup");
+        let id = generate_codex_prompt(path_to_string(&root))
+            .unwrap()
+            .prompt
+            .id;
+        write_analysis_bridge_result(&root, &id, &["人工检查"]);
+        let path = codex_result_bridge_dir(&root).join(format!("{id}-result.json"));
+        let mut value: serde_json::Value = read_json(&path).unwrap();
+        value["resultRunId"] = json!("handoff");
+        write_json_atomic(&path, &value).unwrap();
+        scan_codex_result_bridge(path_to_string(&root)).unwrap();
+        let task = read_codex_task(&root, &id).unwrap();
+        upsert_codex_run(
+            &root,
+            CodexRun {
+                id: "handoff".to_string(),
+                task_id: id.clone(),
+                status: "exited".to_string(),
+                exit_code: Some(1),
+                error:
+                    "已收到本次真实 Codex 结果；Codex CLI 未在宽限期内自行退出，已停止残留进程。"
+                        .to_string(),
+                ..CodexRun::default()
+            },
+        )
+        .unwrap();
+
+        let accepted =
+            accept_codex_task(path_to_string(&root), id.clone(), task.result_id).unwrap();
+        assert_eq!(accepted.status, "completed");
+        assert!(get_work_ledger(path_to_string(&root))
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.event_type == "codex.taskAccepted"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn codex_review_failed_ledger_write_restores_pending_task() {
         let root = setup_project("codex-review-ledger-failure");
         let id = generate_codex_prompt(path_to_string(&root))
@@ -22255,7 +25371,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_handoff_write_error_is_visible_and_not_infinite_waiting() {
+    fn codex_handoff_write_error_is_visible_and_needs_review() {
         let root = setup_project("codex-handoff-write-error");
         let id = generate_codex_prompt(path_to_string(&root))
             .unwrap()
@@ -22278,7 +25394,7 @@ mod tests {
         upsert_codex_run(&root, run.clone()).unwrap();
         let error = finish_codex_result_handoff(&root, &run).unwrap_err();
         let task = read_codex_task(&root, &id).unwrap();
-        assert_eq!(task.status, "failed");
+        assert_eq!(task.status, "needsReview");
         assert!(task.remaining_issues.contains(&error));
         assert!(error.contains("结果回流失败"));
         assert_eq!(fs::read_to_string(blocked_parent).unwrap(), "preserve");
@@ -22439,12 +25555,21 @@ mod tests {
             upsert_codex_run(&root, run.clone()).unwrap();
             assert!(!codex_expected_result_exists(&root, &id));
             if status == "exited" {
-                finish_codex_result_handoff(&root, &run).unwrap();
+                assert!(finish_codex_result_handoff(&root, &run).is_err());
             }
             let listed = list_codex_tasks(path_to_string(&root)).unwrap();
             let current = listed.tasks.iter().find(|task| task.task_id == id).unwrap();
-            assert_eq!(current.status, "failed");
-            assert!(!current.remaining_issues.is_empty());
+            assert_eq!(
+                current.status,
+                if status == "exited" {
+                    "needsReview"
+                } else {
+                    "awaitingResult"
+                }
+            );
+            if status == "exited" {
+                assert!(!current.remaining_issues.is_empty());
+            }
             assert_eq!(fs::read(&path).unwrap(), before);
             assert_eq!(
                 read_and_repair_manifest(&root).unwrap().codex_reports.len(),
@@ -22583,7 +25708,13 @@ mod tests {
             task.status = "running".to_string();
             task.result_received_at = "1".to_string();
             write_codex_task(&root, &task).unwrap();
-            let prompt = codex_prompt_for_run(&task, run_id);
+            let prompt = codex_prompt_for_run(
+                &task,
+                &CodexRun {
+                    id: run_id.to_string(),
+                    ..CodexRun::default()
+                },
+            );
             assert!(prompt.contains(&format!("resultRunId=\"{run_id}\"")));
             assert!(prompt.contains(&task.expected_result_path));
             upsert_codex_run(
@@ -22676,40 +25807,27 @@ mod tests {
     }
 
     #[test]
-    fn codex_previous_success_cannot_generate_fallback_for_new_run() {
-        let root = setup_project("codex-old-fallback-retry");
+    fn codex_exit_without_result_never_generates_runner_fallback() {
+        let root = setup_project("codex-exit-without-result");
         let id = generate_codex_prompt(path_to_string(&root))
             .unwrap()
             .prompt
             .id;
-        let old = CodexRun {
-            id: "old".to_string(),
+        let run = CodexRun {
+            id: "run-without-result".to_string(),
             task_id: id.clone(),
             status: "exited".to_string(),
-            started_at: "1".to_string(),
+            started_at: now_string(),
             exit_code: Some(0),
             ..CodexRun::default()
         };
-        upsert_codex_run(&root, old.clone()).unwrap();
-        upsert_codex_run(
-            &root,
-            CodexRun {
-                id: "new".to_string(),
-                task_id: id.clone(),
-                status: "running".to_string(),
-                started_at: "2".to_string(),
-                pid: std::process::id(),
-                ..CodexRun::default()
-            },
-        )
-        .unwrap();
-        ensure_successful_codex_runs_have_results(&root).unwrap();
-        assert!(
-            ensure_codex_runner_fallback_result(&root, &id, Some(&old), false)
-                .unwrap()
-                .is_none()
-        );
+        upsert_codex_run(&root, run.clone()).unwrap();
+
+        assert!(wait_for_matching_codex_result(&root, &id, &run, false).is_err());
+        mark_codex_task_missing_result(&root, &id, "Codex 已退出，但结果缺失。").unwrap();
+
         assert!(!codex_expected_result_exists(&root, &id));
+        assert_eq!(read_codex_task(&root, &id).unwrap().status, "needsReview");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -22806,6 +25924,246 @@ mod tests {
             .events
             .iter()
             .any(|event| event.event_type == "codex.taskAccepted"));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn nested_coding_result_records_commit_and_can_be_accepted() {
+        let root = setup_project("nested-coding-result");
+        let repo = setup_test_git_repository("nested-coding-result-repo");
+        refresh_git_snapshot(path_to_string(&root), Some(path_to_string(&repo))).unwrap();
+        let task = create_codex_task(
+            path_to_string(&root),
+            CodexTaskCreateRequest {
+                title: "只修改本次代码".to_string(),
+                task_type: "coding".to_string(),
+                instructions: "创建 src/task-owned.txt 并提交。".to_string(),
+            },
+        )
+        .unwrap();
+        let (head_before, worktree_status_before, dirty_files_before) =
+            capture_codex_run_git_baseline(&repo, &task).unwrap();
+        assert_eq!(worktree_status_before, "clean");
+        assert!(dirty_files_before.is_empty());
+        let run = CodexRun {
+            id: "run-nested-coding".to_string(),
+            task_id: task.task_id.clone(),
+            project_id: task.project_id.clone(),
+            repository_path: path_to_string(&repo),
+            status: "exited".to_string(),
+            started_at: "2026-09-24T08:00:00Z".to_string(),
+            ended_at: "2026-09-24T08:01:00Z".to_string(),
+            exit_code: Some(0),
+            git_head_before: head_before,
+            git_worktree_status_before: worktree_status_before,
+            git_dirty_files_before: dirty_files_before,
+            ..CodexRun::default()
+        };
+        upsert_codex_run(&root, run.clone()).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/task-owned.txt"), "owned by this task\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "--", "src/task-owned.txt"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-m", "test: commit coding task"])
+            .status()
+            .unwrap()
+            .success());
+        let commit = run_git(&repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_json_atomic(
+            &PathBuf::from(&task.expected_result_path),
+            &json!({
+                "taskId": task.task_id,
+                "taskType": "coding",
+                "resultRunId": run.id,
+                "status": "completed",
+                "summary": "已提交本次代码修改",
+                "resultSource": "codex",
+                "manualAcceptance": ["请人工核对"],
+                "coding": {
+                    "changedFiles": ["src/task-owned.txt"],
+                    "commits": [commit],
+                    "tests": [{"name": "git diff --check", "status": "passed", "details": "无空白错误"}],
+                    "gitHead": commit,
+                    "gitStatus": "clean",
+                    "gitModifiedFiles": []
+                }
+            }),
+        )
+        .unwrap();
+
+        scan_codex_result_bridge(path_to_string(&root)).unwrap();
+        let received = read_codex_task(&root, &task.task_id).unwrap();
+        assert_eq!(received.status, "awaitingAcceptance");
+        assert_eq!(received.reported_commits, vec![commit.clone()]);
+        assert_eq!(
+            received.changed_files,
+            vec!["src/task-owned.txt".to_string()]
+        );
+        assert_eq!(received.git_verification.status, "verified");
+        assert!(received
+            .tests
+            .iter()
+            .any(|test| test.contains("git diff --check")));
+
+        let accepted = accept_codex_task(
+            path_to_string(&root),
+            task.task_id.clone(),
+            received.result_id.clone(),
+        )
+        .unwrap();
+        assert_eq!(accepted.status, "completed");
+        assert_eq!(accepted.acceptance.status, "approved");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn coding_result_rejects_commit_that_includes_startup_dirty_file() {
+        let root = setup_project("coding-dirty-baseline");
+        let repo = setup_test_git_repository("coding-dirty-baseline-repo");
+        refresh_git_snapshot(path_to_string(&root), Some(path_to_string(&repo))).unwrap();
+        let task = create_codex_task(
+            path_to_string(&root),
+            CodexTaskCreateRequest {
+                title: "仅提交任务文件".to_string(),
+                task_type: "coding".to_string(),
+                instructions: "创建 src/task-only.txt。".to_string(),
+            },
+        )
+        .unwrap();
+        fs::write(repo.join("unrelated.md"), "pre-existing user change\n").unwrap();
+        let (head_before, worktree_status_before, dirty_files_before) =
+            capture_codex_run_git_baseline(&repo, &task).unwrap();
+        assert_eq!(worktree_status_before, "dirty");
+        assert_eq!(dirty_files_before[0].path, "unrelated.md");
+        let run = CodexRun {
+            id: "run-dirty-baseline".to_string(),
+            task_id: task.task_id.clone(),
+            project_id: task.project_id.clone(),
+            repository_path: path_to_string(&repo),
+            status: "exited".to_string(),
+            started_at: "2026-09-24T08:00:00Z".to_string(),
+            exit_code: Some(0),
+            git_head_before: head_before,
+            git_worktree_status_before: worktree_status_before,
+            git_dirty_files_before: dirty_files_before,
+            ..CodexRun::default()
+        };
+        upsert_codex_run(&root, run.clone()).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/task-only.txt"), "task change\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "--", "unrelated.md", "src/task-only.txt"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-m", "test: unsafe mixed commit"])
+            .status()
+            .unwrap()
+            .success());
+        let commit = run_git(&repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        write_json_atomic(
+            &PathBuf::from(&task.expected_result_path),
+            &json!({
+                "taskId": task.task_id,
+                "taskType": "coding",
+                "resultRunId": run.id,
+                "status": "completed",
+                "summary": "不应接受混合提交",
+                "resultSource": "codex",
+                "manualAcceptance": ["请人工核对"],
+                "coding": {
+                    "changedFiles": ["src/task-only.txt"],
+                    "commits": [commit],
+                    "tests": ["passed"]
+                }
+            }),
+        )
+        .unwrap();
+
+        scan_codex_result_bridge(path_to_string(&root)).unwrap();
+        let received = read_codex_task(&root, &task.task_id).unwrap();
+        assert_eq!(received.status, "needsReview");
+        assert_eq!(received.git_verification.status, "mismatch");
+        assert!(received.git_verification.reason.contains("unrelated.md"));
+        assert!(
+            accept_codex_task(path_to_string(&root), task.task_id, received.result_id).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn coding_result_without_commit_remains_unacceptable() {
+        let root = setup_project("coding-no-commit");
+        let repo = setup_test_git_repository("coding-no-commit-repo");
+        refresh_git_snapshot(path_to_string(&root), Some(path_to_string(&repo))).unwrap();
+        let task = create_codex_task(
+            path_to_string(&root),
+            CodexTaskCreateRequest {
+                title: "没有提交的代码任务".to_string(),
+                task_type: "coding".to_string(),
+                instructions: "仅用于验证无 commit 不能验收。".to_string(),
+            },
+        )
+        .unwrap();
+        let run = CodexRun {
+            id: "run-no-commit".to_string(),
+            task_id: task.task_id.clone(),
+            project_id: task.project_id.clone(),
+            repository_path: path_to_string(&repo),
+            status: "exited".to_string(),
+            started_at: "2026-09-24T08:00:00Z".to_string(),
+            exit_code: Some(0),
+            git_head_before: run_git(&repo, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_string(),
+            git_worktree_status_before: "clean".to_string(),
+            ..CodexRun::default()
+        };
+        upsert_codex_run(&root, run.clone()).unwrap();
+        write_json_atomic(
+            &PathBuf::from(&task.expected_result_path),
+            &json!({
+                "taskId": task.task_id,
+                "taskType": "coding",
+                "resultRunId": run.id,
+                "status": "completed",
+                "summary": "没有 commit",
+                "resultSource": "codex",
+                "coding": {"changedFiles": ["src/no-commit.txt"], "commits": [], "tests": ["passed"]}
+            }),
+        )
+        .unwrap();
+
+        scan_codex_result_bridge(path_to_string(&root)).unwrap();
+        let received = read_codex_task(&root, &task.task_id).unwrap();
+        assert_eq!(received.status, "needsReview");
+        assert_eq!(received.git_verification.status, "unavailable");
+        assert!(
+            accept_codex_task(path_to_string(&root), task.task_id, received.result_id).is_err()
+        );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(repo).unwrap();
     }
@@ -22994,7 +26352,7 @@ mod tests {
     }
 
     #[test]
-    fn runner_fallback_uses_current_run_output_and_ignores_old_stderr() {
+    fn exited_run_output_never_becomes_a_synthetic_result_during_scan() {
         let root = setup_project("codex-fallback-current-run");
         ensure_project_dirs(&root).unwrap();
         let task_id = "task-current-output";
@@ -23043,11 +26401,14 @@ mod tests {
 
         scan_codex_result_bridge(path_to_string(&root)).unwrap();
         let external = read_codex_external_results(&root).unwrap();
+        let task = read_codex_task(&root, task_id).unwrap();
 
-        assert_eq!(external.results.len(), 1);
-        assert_eq!(external.results[0].result_run_id, "run-new");
-        assert!(external.results[0].result_text.contains("当前 run"));
-        assert!(!external.results[0].result_text.contains("旧 run"));
+        assert!(external.results.is_empty());
+        assert_eq!(task.status, "awaitingResult");
+        assert!(!task
+            .remaining_issues
+            .iter()
+            .any(|item| item.contains("旧 run")));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -23105,8 +26466,9 @@ mod tests {
 
     #[test]
     fn codex_exec_args_are_repo_scoped_and_not_full_access() {
-        let repo = PathBuf::from(r"D:\GanMaoYuan\Website-Clone");
-        let project = PathBuf::from(r"D:\GanMaoYuan\SelfProject");
+        let repo = std::env::temp_dir().join("ganmaoyuan-test-repository");
+        let project = std::env::temp_dir().join("ganmaoyuan-test-project");
+        let result_directory = project.join(".ganmaoyuan/codex/results");
         let output = project.join(".ganmaoyuan/codex/runs/run-last-message.txt");
         let probe = CodexCliCapabilityProbe {
             available: true,
@@ -23119,20 +26481,145 @@ mod tests {
             ..CodexCliCapabilityProbe::default()
         };
 
-        let args = codex_exec_args(&repo, &project, &output, &probe).unwrap();
+        let args = codex_exec_args(&repo, &result_directory, &output, &probe, false).unwrap();
         let repo_arg = path_to_string(&repo);
-        let project_arg = path_to_string(&project);
+        let result_arg = path_to_string(&result_directory);
 
         assert!(args.windows(2).any(|pair| pair == ["-C", &repo_arg]));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--add-dir", &project_arg]));
+            .any(|pair| pair == ["--add-dir", &result_arg]));
+        assert!(!args.iter().any(|arg| arg == &path_to_string(&project)));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--sandbox", "workspace-write"]));
         assert!(!args.iter().any(|arg| arg == "--ask-for-approval"));
         assert!(!args.iter().any(|arg| arg.contains("danger")));
         assert!(!args.iter().any(|arg| arg.contains("full-access")));
+    }
+
+    #[test]
+    fn native_codex_exec_args_use_safe_auto_approval_without_conflicting_sandbox_flag() {
+        let repo = std::env::temp_dir().join("ganmaoyuan-test-repository");
+        let project = std::env::temp_dir().join("ganmaoyuan-test-project");
+        let result_directory = project.join(".ganmaoyuan/codex/results");
+        let output = project.join(".ganmaoyuan/codex/runs/run-last-message.txt");
+        let probe = CodexCliCapabilityProbe {
+            available: true,
+            supports_cd: true,
+            supports_add_dir: true,
+            supports_json: true,
+            supports_output_last_message: true,
+            supports_stdin: true,
+            ..CodexCliCapabilityProbe::default()
+        };
+
+        let args = codex_exec_args(&repo, &result_directory, &output, &probe, true).unwrap();
+
+        assert!(args.iter().any(|arg| arg == "--approve-for-me"));
+        assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(!args.iter().any(|arg| arg == "--sandbox"));
+        assert!(!args.iter().any(|arg| arg.contains("danger")));
+        assert!(!args.iter().any(|arg| arg.contains("full-access")));
+    }
+
+    #[test]
+    fn file_operation_run_prompt_avoids_the_unreliable_shell_path() {
+        let prompt = codex_prompt_for_run(
+            &CodexTask {
+                task_id: "file-task".to_string(),
+                task_type: "fileOperation".to_string(),
+                expected_result_path: "D:/project/.ganmaoyuan/codex/results/file-task-result.json"
+                    .to_string(),
+                prompt: "taskId：file-task\n执行文件操作".to_string(),
+                ..CodexTask::default()
+            },
+            &CodexRun {
+                id: "run-file".to_string(),
+                ..CodexRun::default()
+            },
+        );
+
+        assert!(prompt.contains("优先使用 Codex 专用 apply_patch 文件工具"));
+        assert!(prompt.contains("不要使用 terminal、shell、PowerShell 或 cmd"));
+        assert!(prompt.contains("resultRunId=\"run-file\""));
+    }
+
+    #[test]
+    fn non_file_codex_runs_require_cmd_on_windows() {
+        let prompt = codex_prompt_for_run(
+            &CodexTask {
+                task_id: "analysis-task".to_string(),
+                task_type: "analysis".to_string(),
+                expected_result_path:
+                    "D:/project/.ganmaoyuan/codex/results/analysis-task-result.json".to_string(),
+                prompt: "taskId：analysis-task\n读取项目状态".to_string(),
+                ..CodexTask::default()
+            },
+            &CodexRun {
+                id: "run-analysis".to_string(),
+                ..CodexRun::default()
+            },
+        );
+
+        if cfg!(target_os = "windows") {
+            assert!(prompt.contains("C:\\Windows\\System32\\cmd.exe"));
+            assert!(prompt.contains("不要使用 PowerShell、pwsh"));
+        }
+        assert!(prompt.contains("resultRunId=\"run-analysis\""));
+    }
+
+    #[test]
+    fn file_operation_without_reported_commit_does_not_require_git_verification() {
+        let task = CodexTask {
+            task_type: "fileOperation".to_string(),
+            changed_files: vec!["docs/codex-golden-path-test.md".to_string()],
+            target_files: vec!["docs/codex-golden-path-test.md".to_string()],
+            ..CodexTask::default()
+        };
+
+        assert!(!codex_task_git_required(&task));
+    }
+
+    #[test]
+    fn codex_task_result_directory_is_limited_to_the_bridge_directory() {
+        let root = setup_project("codex-result-directory-scope");
+        let task = CodexTask {
+            task_id: "isolated-task".to_string(),
+            expected_result_path: path_to_string(
+                &codex_result_bridge_dir(&root).join("isolated-task-result.json"),
+            ),
+            ..CodexTask::default()
+        };
+
+        assert_eq!(
+            codex_task_result_directory(&root, &task).unwrap(),
+            codex_result_bridge_dir(&root)
+        );
+
+        let mut outside = task;
+        outside.expected_result_path =
+            path_to_string(&root.join("other/isolated-task-result.json"));
+        assert!(codex_task_result_directory(&root, &outside).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_task_result_directory_accepts_equivalent_windows_separator_forms() {
+        let root = setup_project("codex-result-directory-separators");
+        let task_id = "separator-task";
+        let expected = path_to_string(&canonical_codex_result_path(&root, task_id));
+        let task = CodexTask {
+            task_id: task_id.to_string(),
+            expected_result_path: expected.replace('\\', "/"),
+            ..CodexTask::default()
+        };
+
+        assert_eq!(
+            codex_task_result_directory(&root, &task).unwrap(),
+            codex_result_bridge_dir(&root)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -23213,6 +26700,177 @@ mod tests {
     }
 
     #[test]
+    fn matching_result_closes_stale_run_without_restart_warning() {
+        let root = setup_project("codex-run-result-recovery");
+        let task = create_codex_task(
+            path_to_string(&root),
+            CodexTaskCreateRequest {
+                title: "恢复真实结果".to_string(),
+                task_type: "fileOperation".to_string(),
+                instructions: "仅创建证明文件。".to_string(),
+            },
+        )
+        .unwrap();
+        let run = CodexRun {
+            id: "run-with-result".to_string(),
+            task_id: task.task_id.clone(),
+            project_id: task.project_id.clone(),
+            status: "running".to_string(),
+            started_at: now_string(),
+            pid: u32::MAX,
+            ..CodexRun::default()
+        };
+        upsert_codex_run(&root, run.clone()).unwrap();
+        fs::write(
+            &task.expected_result_path,
+            format!(
+                "{{\"taskId\":\"{}\",\"resultRunId\":\"{}\",\"status\":\"completed\"}}",
+                task.task_id, run.id
+            ),
+        )
+        .unwrap();
+
+        recover_stale_codex_runs(&root).unwrap();
+        let recovered = read_codex_run(&root, &run.id).unwrap();
+
+        assert_eq!(recovered.status, "exited");
+        assert!(recovered.error.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn starting_codex_run_is_active_without_being_recovered_immediately() {
+        let root = setup_project("codex-run-starting");
+        let run = CodexRun {
+            id: "run-starting".to_string(),
+            task_id: "task-1".to_string(),
+            status: "starting".to_string(),
+            started_at: now_string(),
+            ..CodexRun::default()
+        };
+        upsert_codex_run(&root, run).unwrap();
+
+        recover_stale_codex_runs(&root).unwrap();
+
+        assert_eq!(
+            read_codex_run(&root, "run-starting").unwrap().status,
+            "starting"
+        );
+        assert!(active_codex_run_for_task(&root, "task-1")
+            .unwrap()
+            .is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn coding_task_running_past_three_minutes_stays_within_its_long_task_window() {
+        let now = now_string().parse::<u128>().unwrap();
+        let run = CodexRun {
+            status: "running".to_string(),
+            started_at: (now - CODEX_STANDARD_RUN_TIMEOUT.as_millis() - 1).to_string(),
+            ..CodexRun::default()
+        };
+
+        assert!(!codex_run_execution_timed_out(&run, "coding"));
+        assert!(codex_run_execution_timed_out(&run, "analysis"));
+        let coding_expired = CodexRun {
+            started_at: (now - CODEX_CODING_RUN_TIMEOUT.as_millis() - 1).to_string(),
+            ..run
+        };
+        assert!(codex_run_execution_timed_out(&coding_expired, "coding"));
+        assert!(codex_timeout_error("coding").contains("30 分钟"));
+        assert!(codex_timeout_error("analysis").contains("3 分钟"));
+    }
+
+    #[test]
+    fn live_coding_task_past_standard_timeout_is_not_recovered_as_failed() {
+        let root = setup_project("codex-coding-long-run-recovery");
+        let task = create_codex_task(
+            path_to_string(&root),
+            CodexTaskCreateRequest {
+                title: "长时间代码修改".to_string(),
+                task_type: "coding".to_string(),
+                instructions: "执行一项需要较长时间的代码修改。".to_string(),
+            },
+        )
+        .unwrap();
+        let mut running_task = task.clone();
+        running_task.status = "running".to_string();
+        write_codex_task(&root, &running_task).unwrap();
+        upsert_codex_run(
+            &root,
+            CodexRun {
+                id: "run-long-coding".to_string(),
+                task_id: task.task_id.clone(),
+                project_id: task.project_id.clone(),
+                status: "running".to_string(),
+                started_at: (now_string().parse::<u128>().unwrap()
+                    - CODEX_STANDARD_RUN_TIMEOUT.as_millis()
+                    - 1)
+                .to_string(),
+                pid: std::process::id(),
+                ..CodexRun::default()
+            },
+        )
+        .unwrap();
+
+        recover_stale_codex_runs(&root).unwrap();
+
+        assert_eq!(
+            read_codex_run(&root, "run-long-coding").unwrap().status,
+            "running"
+        );
+        assert_eq!(
+            read_codex_task(&root, &task.task_id).unwrap().status,
+            "running"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn user_cancel_terminates_codex_process_and_marks_task_cancelled() {
+        let root = setup_project("codex-user-cancel");
+        let task = create_codex_task(
+            path_to_string(&root),
+            CodexTaskCreateRequest {
+                title: "可停止的代码任务".to_string(),
+                task_type: "coding".to_string(),
+                instructions: "等待用户主动停止。".to_string(),
+            },
+        )
+        .unwrap();
+        let mut child = hidden_command("cmd.exe")
+            .args(["/d", "/s", "/c", "ping 127.0.0.1 -n 60 >NUL"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        upsert_codex_run(
+            &root,
+            CodexRun {
+                id: "run-user-cancel".to_string(),
+                task_id: task.task_id.clone(),
+                project_id: task.project_id.clone(),
+                status: "running".to_string(),
+                started_at: now_string(),
+                pid,
+                ..CodexRun::default()
+            },
+        )
+        .unwrap();
+
+        let cancelled = cancel_codex_task_run(path_to_string(&root), task.task_id.clone()).unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(!process_exists(pid));
+        assert_eq!(
+            read_codex_task(&root, &task.task_id).unwrap().status,
+            "cancelled"
+        );
+        let _ = child.wait();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn failed_codex_run_keeps_task_current_and_retryable() {
         let root = setup_project("codex-run-failed-task");
         let task = CodexTask {
@@ -23234,6 +26892,52 @@ mod tests {
             .remaining_issues
             .iter()
             .any(|item| item.contains("Codex CLI 参数无效")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn abnormal_codex_exit_is_recorded_as_failure_not_timeout() {
+        let root = setup_project("codex-run-abnormal-exit");
+        let task = create_codex_task(
+            path_to_string(&root),
+            CodexTaskCreateRequest {
+                title: "异常退出任务".to_string(),
+                task_type: "coding".to_string(),
+                instructions: "执行代码修改。".to_string(),
+            },
+        )
+        .unwrap();
+        let mut running_task = task.clone();
+        running_task.status = "running".to_string();
+        write_codex_task(&root, &running_task).unwrap();
+        upsert_codex_run(
+            &root,
+            CodexRun {
+                id: "run-abnormal-exit".to_string(),
+                task_id: task.task_id.clone(),
+                project_id: task.project_id.clone(),
+                status: "failed".to_string(),
+                exit_code: Some(1),
+                error: "Codex CLI 未登录或认证失败：需要登录".to_string(),
+                started_at: now_string(),
+                ended_at: now_string(),
+                ..CodexRun::default()
+            },
+        )
+        .unwrap();
+
+        sync_failed_codex_runs_to_tasks(&root).unwrap();
+
+        let failed = read_codex_task(&root, &task.task_id).unwrap();
+        assert_eq!(failed.status, "failed");
+        assert!(failed
+            .remaining_issues
+            .iter()
+            .any(|issue| issue.contains("未登录或认证失败")));
+        assert!(!failed
+            .remaining_issues
+            .iter()
+            .any(|issue| issue.contains("执行超过")));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -23340,6 +27044,361 @@ mod tests {
                 .count(),
             1
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_decision_capture_requires_explicit_recording_intent() {
+        assert_eq!(
+            extract_explicit_recorded_decision("我决定采用新的迁移门禁，但先不记录。"),
+            None
+        );
+        assert_eq!(
+            extract_explicit_recorded_decision("请记下来：以后先做备份。"),
+            None
+        );
+        assert_eq!(
+            extract_explicit_recorded_decision(
+                "根据资料，我决定：以后正式库迁移前必须完成备份。请把这个决定记下来。"
+            ),
+            Some("以后正式库迁移前必须完成备份".to_string())
+        );
+        assert_eq!(
+            extract_explicit_recorded_decision("我确认以后使用影子库，帮我记住这个决定。"),
+            Some("以后使用影子库".to_string())
+        );
+    }
+
+    #[test]
+    fn chat_next_step_capture_requires_explicit_recording_intent() {
+        let text = "下一步我准备先核对 WTS 当前工作区里的未提交改动分别是什么，再决定是否提交。请把这个下一步记下来。";
+        assert_eq!(
+            extract_explicit_recorded_next_step(text),
+            Some("先核对 WTS 当前工作区里的未提交改动分别是什么，再决定是否提交".to_string())
+        );
+        assert_eq!(
+            extract_explicit_recorded_next_step("下一步先核对工作区，但暂时不记录。"),
+            None
+        );
+        assert_eq!(
+            extract_explicit_recorded_next_step("建议下一步核对工作区，请记下来。"),
+            None
+        );
+        assert_eq!(
+            extract_explicit_recorded_next_step("AI建议：下一步核对工作区，请记下来。"),
+            None
+        );
+        assert_eq!(
+            extract_explicit_recorded_decision(text),
+            None,
+            "下一步中的‘再决定是否提交’不能触发用户决定记录"
+        );
+    }
+
+    #[test]
+    fn chat_next_step_capture_persists_current_fact_without_decision_or_review() {
+        let root = setup_project("chat-next-step-capture");
+        let mut manifest = read_and_repair_manifest(&root).unwrap();
+        let user_message = workspace_message(
+            "user",
+            "requirement",
+            "下一步我准备先核对 WTS 当前工作区里的未提交改动分别是什么，再决定是否提交。请把这个下一步记下来。",
+            "user",
+        );
+        let next_step = extract_explicit_recorded_next_step(&user_message.text).unwrap();
+        manifest.messages.push(user_message.clone());
+        let write = record_user_next_step_event_in_manifest(
+            &root,
+            &mut manifest,
+            &next_step,
+            None,
+            Some(&user_message.id),
+        )
+        .unwrap();
+        assert!(write.is_new);
+        persist_project(&root, &manifest, None).unwrap();
+        append_work_event_if_new(&root, write.event.clone())
+            .unwrap()
+            .expect("canonical next-step event should be written");
+
+        let duplicate = record_user_next_step_event_in_manifest(
+            &root,
+            &mut manifest,
+            &next_step,
+            None,
+            Some(&user_message.id),
+        )
+        .unwrap();
+        assert!(!duplicate.is_new);
+        persist_project(&root, &manifest, None).unwrap();
+
+        let reloaded = read_and_repair_manifest(&root).unwrap();
+        assert_eq!(reloaded.project.next_step, next_step);
+        assert!(reloaded.decisions.is_empty());
+        assert!(reloaded.pending_reviews.is_empty());
+        let ledger = read_work_ledger(&root).unwrap();
+        assert_eq!(
+            ledger
+                .events
+                .iter()
+                .filter(|event| event.event_type == "user.nextActionRecorded")
+                .count(),
+            1
+        );
+
+        let packet = get_project_context_packet(path_to_string(&root)).unwrap();
+        assert_eq!(packet.next_step, next_step);
+        assert!(packet
+            .decisions
+            .iter()
+            .all(|decision| !decision.summary.contains("决定是否提交")));
+        assert_eq!(
+            packet
+                .pending_actions
+                .iter()
+                .filter(|action| action.title.contains("先核对 WTS"))
+                .count(),
+            1
+        );
+
+        capture_project_fact(
+            path_to_string(&root),
+            ProjectFactCaptureRequest {
+                capture_type: "resolveAction".to_string(),
+                action_source_ref: write.event.source_ref.clone(),
+                ..ProjectFactCaptureRequest::default()
+            },
+        )
+        .unwrap();
+        let cleared = read_and_repair_manifest(&root).unwrap();
+        assert!(cleared.project.next_step.is_empty());
+        let cleared_packet = get_project_context_packet(path_to_string(&root)).unwrap();
+        assert!(cleared_packet.pending_actions.is_empty());
+        assert!(cleared_packet.next_step.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finishing_work_replaces_or_clears_current_next_step_without_deleting_history() {
+        let root = setup_project("finish-work-next-step");
+        let mut manifest = read_and_repair_manifest(&root).unwrap();
+        manifest.project.next_step = "旧的下一步".to_string();
+        write_json_atomic(&manifest_path(&root), &manifest).unwrap();
+
+        let replaced = finish_project_work(
+            path_to_string(&root),
+            "完成旧事项".to_string(),
+            "新的下一步".to_string(),
+        )
+        .unwrap();
+        assert_eq!(replaced.recovery_point.next_step, "新的下一步");
+        assert_eq!(
+            read_and_repair_manifest(&root).unwrap().project.next_step,
+            "新的下一步"
+        );
+
+        let cleared = finish_project_work(
+            path_to_string(&root),
+            "完成新的下一步".to_string(),
+            String::new(),
+        )
+        .unwrap();
+        let reloaded = read_and_repair_manifest(&root).unwrap();
+        assert!(reloaded.project.next_step.is_empty());
+        assert!(cleared.recovery_point.next_step.is_empty());
+        assert_eq!(reloaded.recovery_points.len(), 2);
+        assert_eq!(reloaded.recovery_points[0].next_step, "新的下一步");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_decision_capture_persists_canonical_facts_without_current_actions() {
+        let root = setup_project("chat-decision-capture");
+        let mut manifest = read_and_repair_manifest(&root).unwrap();
+        let user_message = workspace_message(
+            "user",
+            "requirement",
+            "根据这份资料，我决定：正式库迁移前必须确认目标库不在禁止列表里，并且已经完成备份或快照。请把这个决定记下来。",
+            "user",
+        );
+        manifest.messages.push(user_message.clone());
+        let decision = extract_explicit_recorded_decision(&user_message.text).unwrap();
+        let write = record_user_decision_event_in_manifest(
+            &root,
+            &mut manifest,
+            &decision,
+            None,
+            Some(&user_message.id),
+        )
+        .unwrap();
+        assert!(write.is_new);
+        persist_project(&root, &manifest, None).unwrap();
+        append_work_event_if_new(&root, write.event.clone())
+            .unwrap()
+            .expect("canonical decision event should be written");
+
+        let reloaded = read_and_repair_manifest(&root).unwrap();
+        let decision_record = reloaded
+            .decisions
+            .iter()
+            .find(|item| item.summary == decision)
+            .expect("decision record should survive reload");
+        assert_eq!(decision_record.source_message_id, user_message.id);
+        assert!(reloaded.project.next_step.is_empty());
+        assert!(reloaded.pending_reviews.is_empty());
+
+        let ledger = read_work_ledger(&root).unwrap();
+        let event = ledger
+            .events
+            .iter()
+            .find(|item| item.event_type == "user.decisionRecorded")
+            .expect("decision ledger event should survive reload");
+        assert_eq!(event.project_id, reloaded.project.id);
+        assert_eq!(event.decision_trace.recommendation, decision);
+
+        let packet = get_project_context_packet(path_to_string(&root)).unwrap();
+        assert!(packet.decisions.iter().any(|item| item.summary == decision));
+        assert_eq!(packet.next_step, "");
+        assert!(packet.pending_actions.is_empty());
+
+        let mut assistant_manifest = reloaded.clone();
+        record_message_derivatives(
+            &mut assistant_manifest,
+            &workspace_message(
+                "ganmaoyuan",
+                "assistant",
+                "建议确认后再决定是否继续，并记录这次结果。",
+                "deepseek",
+            ),
+        );
+        assert_eq!(
+            assistant_manifest
+                .decisions
+                .iter()
+                .filter(|item| item.summary.contains("建议确认后再决定"))
+                .count(),
+            0
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_bridge_excludes_legacy_system_scan_decisions() {
+        let root = setup_project("context-legacy-system-decision");
+        let mut manifest = read_and_repair_manifest(&root).unwrap();
+        manifest.decisions.push(DecisionRecord {
+            id: "legacy-scan".to_string(),
+            summary: "项目目录扫描发现 16091 个待确认事项。".to_string(),
+            source_message_id: "system-monitor".to_string(),
+            created_at: now_string(),
+        });
+        manifest.decisions.push(DecisionRecord {
+            id: "user-decision".to_string(),
+            summary: "保留项目资料目录与代码仓库分离。".to_string(),
+            source_message_id: String::new(),
+            created_at: now_string(),
+        });
+        manifest.decisions.push(DecisionRecord {
+            id: "legacy-unlinked-decision".to_string(),
+            summary: "历史记录中没有用户来源的文本".to_string(),
+            source_message_id: String::new(),
+            created_at: now_string(),
+        });
+        manifest.messages.push(workspace_message(
+            "ganmaoyuan",
+            "assistant",
+            "## 已知事实\n\n**AI总结**\n- 这是分析结果。",
+            "deepseek",
+        ));
+        let assistant_message_id = manifest.messages.last().unwrap().id.clone();
+        manifest.decisions.push(DecisionRecord {
+            id: "legacy-ai-summary".to_string(),
+            summary: "## 已知事实".to_string(),
+            source_message_id: assistant_message_id,
+            created_at: now_string(),
+        });
+        for (index, summary) in [
+            "## 已知事实（依据：WTS_Production_Migration_Manifest.md）",
+            "**已知事实**",
+            "- **已知事实**",
+            "AI总结",
+            "建议：把迁移门禁写入 checklist。",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            manifest.decisions.push(DecisionRecord {
+                id: format!("legacy-analysis-{index}"),
+                summary: summary.to_string(),
+                source_message_id: String::new(),
+                created_at: now_string(),
+            });
+        }
+        let user_message = workspace_message(
+            "user",
+            "requirement",
+            "我决定保留当前目录结构，请把这个决定记下来。",
+            "user",
+        );
+        let user_message_id = user_message.id.clone();
+        manifest.messages.push(user_message);
+        manifest.decisions.push(DecisionRecord {
+            id: "user-message-decision".to_string(),
+            summary: "保留当前目录结构".to_string(),
+            source_message_id: user_message_id,
+            created_at: now_string(),
+        });
+        write_json_atomic(&manifest_path(&root), &manifest).unwrap();
+        append_work_event_if_new(
+            &root,
+            fact_event(
+                &manifest.project.id,
+                "user",
+                "legacy-user-decision",
+                "user.decisionRecorded",
+                "用户确认决定：保留项目资料目录与代码仓库分离。".to_string(),
+                vec!["decision:user-decision".to_string()],
+                100,
+            ),
+        )
+        .unwrap();
+        append_work_event_if_new(
+            &root,
+            fact_event(
+                &manifest.project.id,
+                "user",
+                "legacy-analysis-decision",
+                "user.decisionRecorded",
+                "用户确认决定：已知事实".to_string(),
+                vec!["decision:legacy-analysis-0".to_string()],
+                100,
+            ),
+        )
+        .unwrap();
+
+        let packet = get_project_context_packet(path_to_string(&root)).unwrap();
+
+        assert!(packet
+            .decisions
+            .iter()
+            .all(|item| !item.summary.contains("16091")));
+        assert!(packet
+            .decisions
+            .iter()
+            .any(|item| item.summary.contains("资料目录")));
+        assert!(packet
+            .decisions
+            .iter()
+            .all(|item| !item.summary.contains("没有用户来源")));
+        assert!(packet
+            .decisions
+            .iter()
+            .any(|item| item.summary == "保留当前目录结构"));
+        assert!(packet
+            .decisions
+            .iter()
+            .all(|item| !item.summary.contains("已知事实")));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -23500,6 +27559,10 @@ mod tests {
 
         let first_snapshot = get_work_ledger(path_to_string(&first_root)).unwrap();
         let second_snapshot = get_work_ledger(path_to_string(&second_root)).unwrap();
+        let first_manifest = read_and_repair_manifest(&first_root).unwrap();
+        let second_manifest = read_and_repair_manifest(&second_root).unwrap();
+        assert_eq!(first_manifest.project.next_step, "完成第一项目验收");
+        assert_eq!(second_manifest.project.next_step, "完成第二项目验收");
         assert!(first_snapshot
             .pending_actions
             .iter()

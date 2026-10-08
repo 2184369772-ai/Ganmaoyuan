@@ -560,6 +560,27 @@ pub struct MessageAttachment {
     pub file_id: String,
     pub file_name: String,
     pub managed_path: String,
+    #[serde(default)]
+    pub attachment_type: String,
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default)]
+    pub relative_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatImageAttachmentInput {
+    pub file_name: String,
+    pub content_type: String,
+    pub data_url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatAttachmentData {
+    pub data_url: String,
+    pub content_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -1146,6 +1167,17 @@ pub struct AppRegistry {
     pub schema_version: u32,
     #[serde(default)]
     pub projects: Vec<ProjectSummary>,
+    #[serde(default)]
+    pub continue_preferences: Vec<ContinueProjectPreference>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueProjectPreference {
+    pub project_id: String,
+    pub pinned: bool,
+    pub snoozed_until: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -2054,6 +2086,24 @@ pub struct TodayWorkspace {
     pub executions: Vec<ExecutionRecord>,
     #[serde(default)]
     pub status: String,
+    #[serde(default)]
+    pub continue_projects: Vec<ContinueProjectRecommendation>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueProjectRecommendation {
+    pub project_id: String,
+    pub project_name: String,
+    pub project_root: String,
+    pub focus: Option<ContinueWorkFocus>,
+    pub reason: String,
+    pub recent_change: String,
+    pub blocker: String,
+    pub priority: String,
+    pub score_basis: Vec<String>,
+    pub pinned: bool,
+    pub snoozed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -2343,6 +2393,17 @@ pub struct CodexTask {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct CodexTaskCreateRequest {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub task_type: String,
+    #[serde(default)]
+    pub instructions: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct CodexTaskList {
     #[serde(default)]
     pub tasks: Vec<CodexTask>,
@@ -2370,6 +2431,12 @@ pub struct CodexRun {
     #[serde(default)]
     pub working_directory: String,
     #[serde(default)]
+    pub git_head_before: String,
+    #[serde(default)]
+    pub git_worktree_status_before: String,
+    #[serde(default)]
+    pub git_dirty_files_before: Vec<GitChangedFile>,
+    #[serde(default)]
     pub stdin_prompt_summary: String,
     #[serde(default)]
     pub status: String,
@@ -2380,6 +2447,8 @@ pub struct CodexRun {
     #[serde(default)]
     pub pid: u32,
     #[serde(default)]
+    pub process_alive: bool,
+    #[serde(default)]
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub output_last_message_path: String,
@@ -2387,6 +2456,10 @@ pub struct CodexRun {
     pub stdout_summary: String,
     #[serde(default)]
     pub stderr_summary: String,
+    #[serde(default)]
+    pub last_activity_at: String,
+    #[serde(default)]
+    pub recent_activity: Vec<String>,
     #[serde(default)]
     pub error: String,
 }
@@ -2557,6 +2630,18 @@ pub struct WorkLedgerSnapshot {
     pub executions: Vec<ExecutionRecord>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFactSyncResult {
+    pub manifest: ProjectManifest,
+    pub work_ledger: WorkLedgerSnapshot,
+    pub today_workspace: TodayWorkspace,
+    #[serde(default)]
+    pub file_facts_changed: bool,
+    #[serde(default)]
+    pub imported_codex_results: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectContextFocus {
@@ -2624,11 +2709,51 @@ pub struct ProjectContextCodexResult {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ProjectContextDecision {
+    pub summary: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectContextGitFacts {
+    pub branch: String,
+    pub head_short: String,
+    pub subject: String,
+    #[serde(default)]
+    pub recent_commits: Vec<ProjectContextGitCommit>,
+    pub is_dirty: bool,
+    pub changed_files: Vec<String>,
+    pub captured_at: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectContextGitCommit {
+    pub short_hash: String,
+    pub subject: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectContextFreshness {
+    pub generated_at: String,
+    pub facts_synced_at: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectContextPacket {
     #[serde(default)]
     pub project_id: String,
     #[serde(default)]
     pub project_name: String,
+    #[serde(default)]
+    pub project_description: String,
+    #[serde(default)]
+    pub current_phase: String,
     #[serde(default)]
     pub generated_at: String,
     #[serde(default)]
@@ -2643,6 +2768,16 @@ pub struct ProjectContextPacket {
     pub files: Vec<ProjectContextFile>,
     #[serde(default)]
     pub codex_result: Option<ProjectContextCodexResult>,
+    #[serde(default)]
+    pub decisions: Vec<ProjectContextDecision>,
+    #[serde(default)]
+    pub git_facts: Option<ProjectContextGitFacts>,
+    #[serde(default)]
+    pub risks: Vec<String>,
+    #[serde(default)]
+    pub next_step: String,
+    #[serde(default)]
+    pub freshness: ProjectContextFreshness,
     #[serde(default)]
     pub sparse: bool,
     #[serde(default)]

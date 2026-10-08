@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState, type ReactNode } from "react";
+﻿import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { type SettingsSection, useAppState } from "../app/AppState";
 import { AppLayout } from "../components/AppLayout";
@@ -174,6 +174,7 @@ export function SettingsPage() {
   const [workspaceConfig, setWorkspaceConfig] = useState<WorkspaceConfig | null>(null);
   const [workspaceScanBatches, setWorkspaceScanBatches] = useState<WorkspaceScanBatch[]>([]);
   const [isScanningWorkspace, setIsScanningWorkspace] = useState(false);
+  const loadedWeeklyDashboardScopeRef = useRef<string | null>(null);
 
   useEffect(() => {
     setSelectedModelId(deepSeekSettings.selectedModelId);
@@ -188,6 +189,17 @@ export function SettingsPage() {
       .then(setWorkspaceScanBatches)
       .catch((err) => reportActionError("读取扫描批次", err));
   }, [isDesktopReady]);
+
+  useEffect(() => {
+    if (!isDesktopReady || selectedSettingsSection !== "weekly-review") return;
+    const scope = activeProject?.rootDir ?? "__global__";
+    if (loadedWeeklyDashboardScopeRef.current === scope) return;
+    loadedWeeklyDashboardScopeRef.current = scope;
+    void refreshWeeklyReviewDashboard().catch((err) => {
+      loadedWeeklyDashboardScopeRef.current = null;
+      reportActionError("读取每周复盘", err);
+    });
+  }, [isDesktopReady, selectedSettingsSection, activeProject?.rootDir]);
 
   const currentProjectName = activeProject?.name ?? "未打开项目";
   const currentProjectRoot = activeProject?.rootDir ?? "";

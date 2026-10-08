@@ -296,40 +296,14 @@ impl PendingActionAdapter {
                 }],
             ))
         }));
-        actions.extend(
-            manifest
-                .project_state_proposals
-                .iter()
-                .filter_map(|proposal| {
-                    if proposal.status != "pending" {
-                        return None;
-                    }
-                    Some(pending_action(
-                        &format!("project-state:{}", proposal.id),
-                        "projectStateConfirmation",
-                        project_id,
-                        "项目状态变化待确认",
-                        "AI 只提出状态变化建议，需用户确认后才能生效。",
-                        &proposal.id,
-                        confidence_priority((proposal.confidence * 100.0) as u8),
-                        "pending",
-                        &proposal.created_at,
-                        proposal
-                            .source_file_ids
-                            .iter()
-                            .map(|id| EvidenceRef {
-                                kind: "file".to_string(),
-                                id: id.clone(),
-                                path_snapshot: String::new(),
-                                hash_snapshot: String::new(),
-                                label: "项目状态依据".to_string(),
-                            })
-                            .collect(),
-                    ))
-                }),
-        );
+        // Project-state proposals are analysis suggestions, not user-confirmed
+        // work. Keep them available to the impact-analysis panel, but do not
+        // promote them into the current PendingAction projection.
         actions.extend(manifest.project_attentions.iter().filter_map(|attention| {
             if !matches!(attention.status.as_str(), "pending" | "later") {
+                return None;
+            }
+            if attention_is_legacy_message_task(attention, manifest) {
                 return None;
             }
             Some(pending_action(
@@ -356,6 +330,9 @@ impl PendingActionAdapter {
             ))
         }));
         actions.extend(codex_tasks.iter().filter_map(|task| {
+            if codex_task_is_superseded_by_accepted_target(task, codex_tasks) {
+                return None;
+            }
             match task.status.as_str() {
                 "awaitingAcceptance" => Some(pending_action(
                     &format!("codex-acceptance:{}", task.task_id),
@@ -400,12 +377,17 @@ impl PendingActionAdapter {
                 _ => None,
             }
         }));
-        actions.extend(Self::from_user_work_events(project_id, work_events));
+        actions.extend(Self::from_user_work_events(
+            project_id,
+            &manifest.project.next_step,
+            work_events,
+        ));
         unique_pending_actions(actions)
     }
 
     fn from_user_work_events(
         project_id: &str,
+        current_next_step: &str,
         work_events: &[WorkEvent],
     ) -> Vec<PendingActionProjection> {
         let resolved_sources = work_events
@@ -427,6 +409,8 @@ impl PendingActionAdapter {
                         event.event_type.as_str(),
                         "user.blockerRecorded" | "user.nextActionRecorded"
                     )
+                    && (event.event_type == "user.blockerRecorded"
+                        || user_next_action_is_current(event, current_next_step))
                     && !resolved_sources.contains(&event.source_ref)
             })
             .map(|event| {
@@ -527,6 +511,83 @@ impl PendingActionAdapter {
                 .collect(),
         )
     }
+}
+
+fn user_next_action_is_current(event: &WorkEvent, current_next_step: &str) -> bool {
+    let current_next_step = current_next_step.trim();
+    if current_next_step.is_empty() {
+        return false;
+    }
+    event
+        .summary
+        .strip_prefix("用户记录下一步：")
+        .map(str::trim)
+        .is_some_and(|summary| {
+            normalize_user_text(summary) == normalize_user_text(current_next_step)
+        })
+}
+
+fn normalize_user_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn codex_task_is_superseded_by_accepted_target(task: &CodexTask, tasks: &[CodexTask]) -> bool {
+    if !matches!(task.status.as_str(), "needsReview" | "failed")
+        || !task.remaining_issues.is_empty()
+        || task.target_files.is_empty()
+    {
+        return false;
+    }
+    tasks.iter().any(|candidate| {
+        candidate.task_id != task.task_id
+            && candidate.status == "completed"
+            && candidate.acceptance.status == "approved"
+            && candidate.created_at > task.created_at
+            && target_files_overlap(&task.target_files, &candidate.target_files)
+    })
+}
+
+fn attention_is_legacy_message_task(
+    attention: &crate::models::ProjectAttention,
+    manifest: &ProjectManifest,
+) -> bool {
+    attention.attention_type == "staleTask"
+        && attention.evidence.iter().any(|evidence| {
+            evidence.kind == "task"
+                && manifest.tasks.iter().any(|task| {
+                    task.id == evidence.source_id
+                        && manifest.messages.iter().any(|message| {
+                            message.id == task.source_message_id
+                                && message.author == "user"
+                                && message.kind == "requirement"
+                        })
+                })
+        })
+}
+
+fn target_files_overlap(left: &[String], right: &[String]) -> bool {
+    left.iter().any(|left_path| {
+        let left_key = normalize_target_path(left_path);
+        !left_key.is_empty()
+            && right.iter().any(|right_path| {
+                let right_key = normalize_target_path(right_path);
+                !right_key.is_empty()
+                    && (left_key == right_key
+                        || left_key.ends_with(&format!("/{right_key}"))
+                        || right_key.ends_with(&format!("/{left_key}")))
+            })
+    })
+}
+
+fn normalize_target_path(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_ascii_lowercase()
 }
 
 pub struct ExecutionProjectionAdapter;
@@ -1020,6 +1081,7 @@ mod tests {
         let manifest = ProjectManifest {
             project: crate::models::ProjectSummary {
                 id: "project-1".to_string(),
+                next_step: "整理验收结论".to_string(),
                 ..crate::models::ProjectSummary::default()
             },
             ..ProjectManifest::default()
@@ -1052,10 +1114,122 @@ mod tests {
     }
 
     #[test]
+    fn accepted_newer_task_suppresses_only_the_same_stale_codex_target() {
+        let manifest = ProjectManifest {
+            project: crate::models::ProjectSummary {
+                id: "project-1".to_string(),
+                ..crate::models::ProjectSummary::default()
+            },
+            ..ProjectManifest::default()
+        };
+        let stale = CodexTask {
+            task_id: "stale".to_string(),
+            title: "旧的黄金文件检查".to_string(),
+            status: "needsReview".to_string(),
+            created_at: "100".to_string(),
+            target_files: vec!["docs/codex-golden-path-test.md".to_string()],
+            ..CodexTask::default()
+        };
+        let accepted = CodexTask {
+            task_id: "accepted".to_string(),
+            title: "新的黄金文件检查".to_string(),
+            status: "completed".to_string(),
+            created_at: "200".to_string(),
+            target_files: vec![
+                "D:/GanMaoYuan/Website-Clone/docs/codex-golden-path-test.md".to_string()
+            ],
+            acceptance: crate::models::CodexTaskAcceptance {
+                status: "approved".to_string(),
+                ..crate::models::CodexTaskAcceptance::default()
+            },
+            ..CodexTask::default()
+        };
+        let unrelated = CodexTask {
+            task_id: "unrelated".to_string(),
+            title: "仍需检查的不同文件".to_string(),
+            status: "needsReview".to_string(),
+            created_at: "100".to_string(),
+            target_files: vec!["docs/another-file.md".to_string()],
+            ..CodexTask::default()
+        };
+
+        let actions =
+            PendingActionAdapter::from_project(&manifest, &[stale, accepted, unrelated], &[]);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].source_ref, "unrelated");
+    }
+
+    #[test]
+    fn legacy_message_derived_attention_is_not_a_current_pending_action() {
+        let legacy_task = crate::models::TaskRecord {
+            id: "legacy-task".to_string(),
+            title: "历史需求消息".to_string(),
+            status: "active".to_string(),
+            source_message_id: "message-1".to_string(),
+            created_at: "100".to_string(),
+            updated_at: "100".to_string(),
+        };
+        let manifest = ProjectManifest {
+            project: crate::models::ProjectSummary {
+                id: "project-1".to_string(),
+                ..crate::models::ProjectSummary::default()
+            },
+            messages: vec![crate::models::WorkspaceMessage {
+                id: "message-1".to_string(),
+                author: "user".to_string(),
+                kind: "requirement".to_string(),
+                ..crate::models::WorkspaceMessage::default()
+            }],
+            tasks: vec![legacy_task],
+            project_attentions: vec![crate::models::ProjectAttention {
+                id: "attention-1".to_string(),
+                attention_type: "staleTask".to_string(),
+                title: "任务长期未关闭".to_string(),
+                status: "pending".to_string(),
+                evidence: vec![crate::models::DecisionTraceEvidence {
+                    kind: "task".to_string(),
+                    source_id: "legacy-task".to_string(),
+                    ..crate::models::DecisionTraceEvidence::default()
+                }],
+                ..crate::models::ProjectAttention::default()
+            }],
+            ..ProjectManifest::default()
+        };
+
+        let actions = PendingActionAdapter::from_project(&manifest, &[], &[]);
+
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn analysis_state_proposals_are_not_current_pending_actions() {
+        let manifest = ProjectManifest {
+            project: crate::models::ProjectSummary {
+                id: "project-1".to_string(),
+                ..crate::models::ProjectSummary::default()
+            },
+            project_state_proposals: vec![crate::models::ProjectStateProposal {
+                id: "proposal-1".to_string(),
+                status: "pending".to_string(),
+                ..crate::models::ProjectStateProposal::default()
+            }],
+            ..ProjectManifest::default()
+        };
+
+        let actions = PendingActionAdapter::from_project(&manifest, &[], &[]);
+
+        assert!(actions
+            .iter()
+            .all(|action| action.action_type != "projectStateConfirmation"));
+    }
+
+    #[test]
     fn user_blockers_and_next_actions_are_pending_until_resolved() {
         let manifest = ProjectManifest {
             project: crate::models::ProjectSummary {
                 id: "project-1".to_string(),
+                next_step: "整理验收结论".to_string(),
                 ..crate::models::ProjectSummary::default()
             },
             ..ProjectManifest::default()
@@ -1100,6 +1274,45 @@ mod tests {
         let refreshed = PendingActionAdapter::from_project(&manifest, &[], &resolved);
         assert_eq!(refreshed.len(), 1);
         assert_eq!(refreshed[0].action_type, "userNextAction");
+    }
+
+    #[test]
+    fn stale_user_next_actions_remain_history_but_only_current_one_is_pending() {
+        let manifest = ProjectManifest {
+            project: crate::models::ProjectSummary {
+                id: "project-1".to_string(),
+                next_step: "第二个下一步".to_string(),
+                ..crate::models::ProjectSummary::default()
+            },
+            ..ProjectManifest::default()
+        };
+        let events = vec![
+            WorkEvent {
+                id: "old-next".to_string(),
+                project_id: "project-1".to_string(),
+                source_type: "user".to_string(),
+                source_ref: "old-source".to_string(),
+                event_type: "user.nextActionRecorded".to_string(),
+                summary: "用户记录下一步：第一个下一步".to_string(),
+                occurred_at: "100".to_string(),
+                ..WorkEvent::default()
+            },
+            WorkEvent {
+                id: "current-next".to_string(),
+                project_id: "project-1".to_string(),
+                source_type: "user".to_string(),
+                source_ref: "current-source".to_string(),
+                event_type: "user.nextActionRecorded".to_string(),
+                summary: "用户记录下一步：第二个下一步".to_string(),
+                occurred_at: "200".to_string(),
+                ..WorkEvent::default()
+            },
+        ];
+
+        let actions = PendingActionAdapter::from_project(&manifest, &[], &events);
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].source_ref, "current-source");
     }
 
     #[test]
