@@ -307,7 +307,14 @@ export type WorkspaceMessage = {
   text: string;
   createdAt: string;
   status: string;
-  attachments: Array<{ fileId: string; fileName: string; managedPath: string }>;
+  attachments: Array<{
+    fileId: string;
+    fileName: string;
+    managedPath: string;
+    attachmentType?: string;
+    contentType?: string;
+    relativePath?: string;
+  }>;
   relatedTask: string;
   source: string;
   modelId: string;
@@ -474,6 +481,12 @@ export type CodexTask = {
   updatedAt: string;
 };
 
+export type CodexTaskCreateRequest = {
+  title: string;
+  taskType: "analysis" | "coding" | "verification" | "fileOperation";
+  instructions: string;
+};
+
 export type CodexCliCapabilityProbe = {
   available: boolean;
   version: string;
@@ -501,10 +514,13 @@ export type CodexRun = {
   startedAt: string;
   endedAt: string;
   pid: number;
+  processAlive: boolean;
   exitCode: number | null;
   outputLastMessagePath: string;
   stdoutSummary: string;
   stderrSummary: string;
+  lastActivityAt: string;
+  recentActivity: string[];
   error: string;
 };
 
@@ -795,6 +811,30 @@ export type CodexReportImportResult = {
   report: CodexReportRecord;
   manifest: ProjectManifest;
   duplicate: boolean;
+};
+
+export type ChatImageAttachmentInput = {
+  fileName: string;
+  contentType: string;
+  dataUrl: string;
+};
+
+export type ChatAttachmentData = {
+  dataUrl: string;
+  contentType: string;
+};
+
+export type ProjectWorkspaceScanResult = {
+  manifest: ProjectManifest;
+  changed: boolean;
+};
+
+export type ProjectFactSyncResult = {
+  manifest: ProjectManifest;
+  workLedger: WorkLedgerSnapshot;
+  todayWorkspace: TodayWorkspace;
+  fileFactsChanged: boolean;
+  importedCodexResults: number;
 };
 
 export type CodexResultBridgeScanResult = {
@@ -1250,6 +1290,21 @@ export type TodayWorkspace = {
   pendingActions?: PendingActionProjection[];
   executions?: ExecutionRecord[];
   status: string;
+  continueProjects: ContinueProjectRecommendation[];
+};
+
+export type ContinueProjectRecommendation = {
+  projectId: string;
+  projectName: string;
+  projectRoot: string;
+  focus: ContinueWorkFocus | null;
+  reason: string;
+  recentChange: string;
+  blocker: string;
+  priority: string;
+  scoreBasis: string[];
+  pinned: boolean;
+  snoozed: boolean;
 };
 
 export type WorkEvent = {
@@ -1405,9 +1460,26 @@ export type ProjectContextCodexResult = {
   manualAcceptance: string[];
 };
 
+export type ProjectContextDecision = {
+  summary: string;
+  createdAt: string;
+};
+
+export type ProjectContextGitFacts = {
+  branch: string;
+  headShort: string;
+  subject: string;
+  isDirty: boolean;
+  changedFiles: string[];
+  capturedAt: string;
+  status: string;
+};
+
 export type ProjectContextPacket = {
   projectId: string;
   projectName: string;
+  projectDescription: string;
+  currentPhase: string;
   generatedAt: string;
   privacyNotice: string;
   focus: ProjectContextFocus | null;
@@ -1415,6 +1487,11 @@ export type ProjectContextPacket = {
   pendingActions: ProjectContextPendingAction[];
   files: ProjectContextFile[];
   codexResult: ProjectContextCodexResult | null;
+  decisions: ProjectContextDecision[];
+  gitFacts: ProjectContextGitFacts | null;
+  risks: string[];
+  nextStep: string;
+  freshness: { generatedAt: string; factsSyncedAt: string; status: string };
   sparse: boolean;
   markdown: string;
 };
@@ -1510,6 +1587,21 @@ export async function regenerateDailyContinue(projectRoot: string) {
 
 export async function getTodayWorkspace() {
   return invoke<TodayWorkspace>("get_today_workspace");
+}
+
+export async function refreshTodayWorkspace() {
+  return invoke<TodayWorkspace>("refresh_today_workspace");
+}
+
+export async function updateContinueProjectPreference(
+  projectId: string,
+  options: { pinned?: boolean; snoozedUntil?: string },
+) {
+  return invoke<TodayWorkspace>("update_continue_project_preference", {
+    projectId,
+    pinned: options.pinned ?? null,
+    snoozedUntil: options.snoozedUntil ?? null,
+  });
 }
 
 export async function updateProjectAttention(projectRoot: string, attentionId: string, status: string) {
@@ -1670,6 +1762,10 @@ export async function loadProject(projectRoot: string) {
   return invoke<ProjectManifest>("load_project", { projectRoot });
 }
 
+export async function markProjectOpened(projectRoot: string) {
+  return invoke<ProjectSummary>("mark_project_opened", { projectRoot });
+}
+
 export async function createProject(name: string, rootDir: string, filePaths: string[], description: string) {
   return invoke<ProjectCreateResult>("create_project", { name, rootDir, filePaths, description });
 }
@@ -1678,8 +1774,17 @@ export async function importFiles(projectRoot: string, filePaths: string[], rela
   return invoke<ImportResult>("import_files", { projectRoot, filePaths, relatedTask });
 }
 
-export async function sendProjectMessage(projectRoot: string, text: string) {
-  return invoke<MessageResult>("send_project_message", { projectRoot, text });
+export async function sendProjectMessage(
+  projectRoot: string,
+  text: string,
+  imageAttachments: ChatImageAttachmentInput[] = [],
+) {
+  const payload = imageAttachments.length ? { projectRoot, text, imageAttachments } : { projectRoot, text };
+  return invoke<MessageResult>("send_project_message", payload);
+}
+
+export async function readChatAttachment(projectRoot: string, relativePath: string) {
+  return invoke<ChatAttachmentData>("read_chat_attachment", { projectRoot, relativePath });
 }
 
 export async function stopProjectMessage(projectRoot: string) {
@@ -1696,6 +1801,10 @@ export async function finishProjectWork(projectRoot: string, completed: string, 
 
 export async function generateCodexPrompt(projectRoot: string) {
   return invoke<CodexPromptResult>("generate_codex_prompt", { projectRoot });
+}
+
+export async function createCodexTask(projectRoot: string, request: CodexTaskCreateRequest) {
+  return invoke<CodexTask>("create_codex_task", { projectRoot, request });
 }
 
 export async function listCodexTasks(projectRoot: string) {
@@ -1746,8 +1855,12 @@ export async function getWorkLedger(projectRoot: string) {
   return invoke<WorkLedgerSnapshot>("get_work_ledger", { projectRoot });
 }
 
+export async function synchronizeProjectFacts(projectRoot: string) {
+  return invoke<ProjectFactSyncResult>("synchronize_project_facts", { projectRoot });
+}
+
 export async function getProjectContextPacket(projectRoot: string) {
-  return invoke<ProjectContextPacket>("get_project_context_packet", { projectRoot });
+  return invoke<ProjectContextPacket>("get_current_project_context_packet", { projectRoot });
 }
 
 export async function refreshGitSnapshot(projectRoot: string, repositoryPath?: string) {
@@ -1965,7 +2078,11 @@ export async function refreshProjectUnderstanding(projectRoot: string) {
 }
 
 export async function scanProjectWorkspace(projectRoot: string) {
-  return invoke<ProjectManifest>("scan_project_workspace", { projectRoot });
+  const result = await invoke<ProjectWorkspaceScanResult | ProjectManifest>("scan_project_workspace", { projectRoot });
+  // A short-lived older desktop shell returned the manifest directly. Treat it
+  // as a changed scan so a source update cannot leave the project stale.
+  if ("manifest" in result && "changed" in result) return result;
+  return { manifest: result, changed: true };
 }
 
 export async function createLocalBackup(projectRoots: string[], destinationDir: string) {

@@ -1,6 +1,7 @@
 ﻿$ErrorActionPreference = "Stop"
 
-$root = "D:\GanMaoYuan\Acceptance\checkpoint-a\source 中文 空格 长路径\第一层目录\第二层目录"
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$root = Join-Path $repoRoot "var\acceptance\checkpoint-a\source 中文 空格 长路径\第一层目录\第二层目录"
 $null = New-Item -ItemType Directory -Path $root -Force
 
 [System.IO.File]::WriteAllText(
@@ -63,7 +64,10 @@ finally {
     $bitmap.Dispose()
 }
 
-$existingRoot = "D:\GanMaoYuan_Test\资料解析验收测试\.ganmaoyuan\managed"
+$existingRoot = $env:GANMAOYUAN_ACCEPTANCE_FIXTURE_ROOT
+if ([string]::IsNullOrWhiteSpace($existingRoot)) {
+    throw "请设置 GANMAOYUAN_ACCEPTANCE_FIXTURE_ROOT 指向已授权的受管资料目录。"
+}
 $existingFiles = @{
     "06-结构化需求.docx" = Join-Path $existingRoot "02_requirements\supOS-Free_KEBA_OPCUA_修正版.docx"
     "07-文本需求.pdf" = Join-Path $existingRoot "02_requirements\QR-M215.13-2025电子设备管理规定（发布版）- 20250325.pdf"

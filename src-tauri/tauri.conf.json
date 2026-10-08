@@ -41,7 +41,7 @@
     },
     "windows": {
       "nsis": {
-        "template": "installer/sendto-installer.nsi"
+        "installerHooks": "installer/sendto-hooks.nsh"
       }
     }
   }

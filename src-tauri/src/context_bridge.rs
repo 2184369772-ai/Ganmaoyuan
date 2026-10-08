@@ -111,6 +111,15 @@ fn handle_request(project_root: &Path, request: Value) -> Option<Value> {
 fn bridge_tools() -> Vec<Value> {
     vec![
         tool_definition(
+            "get_current_project_context",
+            "Synchronize the selected project facts and return one bounded current context packet. Use level 1 by default; request level 2 only when more detail is needed.",
+            json!({
+                "type": "object",
+                "properties": { "level": { "type": "integer", "enum": [1, 2] } },
+                "additionalProperties": false
+            }),
+        ),
+        tool_definition(
             "get_project_state",
             "Read the current project name, factual focus, freshness summary, and privacy boundary.",
             json!({ "type": "object", "properties": {}, "additionalProperties": false }),
@@ -157,10 +166,22 @@ fn call_tool(project_root: &Path, params: Value) -> Result<Value, (i64, &'static
     {
         return Err((-32602, "Unknown Context Bridge tool."));
     }
-    let packet = project_service::get_project_context_packet(project_root.to_string_lossy().into())
-        .map_err(|_| (-32001, "The project facts are temporarily unavailable."))?;
     let arguments = params.get("arguments").cloned().unwrap_or_default();
+    // Every bridge read must observe the same reconciled facts. Keeping a raw
+    // read path here allowed stale persisted packets to disagree with the
+    // current project context.
+    let packet =
+        project_service::get_current_project_context_packet(project_root.to_string_lossy().into())
+            .map_err(|_| (-32001, "The project facts are temporarily unavailable."))?;
     let value = match tool {
+        "get_current_project_context" => {
+            let level = arguments
+                .get("level")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .clamp(1, 2);
+            current_context_value(packet, level)
+        }
         "get_project_state" => json!({
             "projectName": packet.project_name,
             "generatedAt": packet.generated_at,
@@ -184,6 +205,34 @@ fn call_tool(project_root: &Path, params: Value) -> Result<Value, (i64, &'static
     let text = serde_json::to_string_pretty(&value)
         .map_err(|_| (-32001, "The project facts could not be formatted."))?;
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+}
+
+fn current_context_value(packet: crate::models::ProjectContextPacket, level: u64) -> Value {
+    let mut value = json!({
+        "level": level,
+        "project": {
+            "id": packet.project_id.clone(),
+            "name": packet.project_name.clone(),
+            "description": packet.project_description.clone(),
+            "currentPhase": packet.current_phase.clone()
+        },
+        "focus": packet.focus.clone(),
+        "nextStep": packet.next_step.clone(),
+        "recentActivity": packet.recent_activity.iter().take(3).cloned().collect::<Vec<_>>(),
+        "pendingActions": packet.pending_actions.iter().take(3).cloned().collect::<Vec<_>>(),
+        "decisions": packet.decisions.iter().take(3).cloned().collect::<Vec<_>>(),
+        "codexResult": packet.codex_result.clone(),
+        "gitFacts": packet.git_facts.clone(),
+        "risks": packet.risks.iter().take(3).cloned().collect::<Vec<_>>(),
+        "freshness": packet.freshness.clone(),
+        "sparse": packet.sparse,
+        "privacyNotice": packet.privacy_notice.clone()
+    });
+    if level >= 2 {
+        value["files"] = json!(packet.files.into_iter().take(5).collect::<Vec<_>>());
+        value["markdown"] = json!(packet.markdown);
+    }
+    value
 }
 
 fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
@@ -231,13 +280,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_list_has_exactly_the_five_read_only_factual_tools() {
+    fn tool_list_keeps_the_five_compatible_tools_and_adds_one_context_entry() {
         let tools = bridge_tools();
         let names = tools
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 6);
+        assert!(names.contains(&"get_current_project_context"));
         assert!(names.contains(&"get_project_state"));
         assert!(names.contains(&"get_continue_work_focus"));
         assert!(!names
@@ -274,6 +324,54 @@ mod tests {
         assert!(!text.contains(&root.to_string_lossy().to_string()));
         assert!(!text.contains("repositoryPath"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_context_defaults_to_bounded_level_one() {
+        let mut packet = crate::models::ProjectContextPacket {
+            project_id: "project-a".to_string(),
+            project_name: "青岚工作台".to_string(),
+            files: (0..20)
+                .map(|index| crate::models::ProjectContextFile {
+                    name: format!("资料-{index}.md"),
+                    ..Default::default()
+                })
+                .collect(),
+            markdown: "不应进入一级上下文".to_string(),
+            ..Default::default()
+        };
+        packet.recent_activity = (0..20)
+            .map(|index| crate::models::ProjectContextActivity {
+                summary: format!("事实-{index}"),
+                ..Default::default()
+            })
+            .collect();
+
+        let value = current_context_value(packet, 1);
+        assert_eq!(value["level"], 1);
+        assert_eq!(value["project"]["id"], "project-a");
+        assert_eq!(value["recentActivity"].as_array().unwrap().len(), 3);
+        assert!(value.get("files").is_none());
+        assert!(value.get("markdown").is_none());
+        assert!(serde_json::to_string(&value).unwrap().len() < 8_000);
+    }
+
+    #[test]
+    fn current_context_level_two_expands_only_bounded_files() {
+        let packet = crate::models::ProjectContextPacket {
+            files: (0..20)
+                .map(|index| crate::models::ProjectContextFile {
+                    name: format!("资料-{index}.md"),
+                    ..Default::default()
+                })
+                .collect(),
+            markdown: "可读上下文".to_string(),
+            ..Default::default()
+        };
+
+        let value = current_context_value(packet, 2);
+        assert_eq!(value["files"].as_array().unwrap().len(), 5);
+        assert_eq!(value["markdown"], "可读上下文");
     }
 
     #[test]

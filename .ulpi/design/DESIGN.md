@@ -1,186 +1,152 @@
 ---
 project: Ganmaoyuan
 register: product
-aesthetic_direction: technical / utilitarian
-color_strategy: restrained
-design_system: Radix primitives + locked tokens
-design_variance: 6
-motion_intensity: 4
-visual_density: 6
+aesthetic_direction: quiet editorial workbench
+design_system: native React primitives + locked CSS tokens
+design_variance: 8
+motion_intensity: 2
+visual_density: 5
 ---
 
 ## Design Read
 
-Calm, local, continuous. Ganmaoyuan must feel like a trustworthy working console that lets one person resume, inspect, decide, and continue without visual noise or dashboard theater.
+Ganmaoyuan is a local-first continuity layer for one person's ongoing work. It should feel like a quiet desk: a place to reopen a project, recover context, make one decision, and continue. It is not an operations dashboard, chat wrapper, file browser, or IDE.
 
 ## Signature
 
-The product is remembered by one move: a **continuous working sheet**. Instead of stacked cards, each main screen reads like one large matte surface with quiet ruled sections, soft depth, and one luminous accent used only for action or focus. The signature fits the brief because Ganmaoyuan is a long-running workbench, not a showcase or analytics wall.
+The signature is a **paper trail on a workbench**: warm neutral canvas, ink-like type, one vermilion action color, and unboxed chronological rows. Important work is marked by rhythm and a small active rule, not by glowing containers.
 
-## Inspiration
+## Product Posture
 
-- took: Codex-like calm density, softened controls, continuous conversation-first working area, restrained action emphasis.
-- rejected: repeated nested cards, hard dividers cutting sections into boxes, bright neon accents competing with content.
-
-Synthesis note: Ganmaoyuan should inherit the emotional calm of a serious developer tool, but its Chinese project-workflow context requires clearer labels, stronger next-step guidance, and more visible evidence structure.
+- The first question is always: what should I continue?
+- One view has one primary action.
+- Facts are quiet and attributable; suggestions never masquerade as facts.
+- Technical details are available, but never the default reading path.
+- A selected item may receive elevation; lists remain lists.
 
 ## Identity Lock
 
-Every screen must read as the same product if placed side by side.
+Every screen uses the same visual grammar:
 
-### Product posture
+- warm paper-like canvas
+- charcoal ink text
+- restrained terracotta action accent
+- thin rules and selected underlines instead of boxed sections
+- compact utility controls and generous reading rhythm
+- no gradients, glass blur, glow, or decorative dashboard chrome
 
-- This is a **local-first desktop work console**.
-- It is **not** a dashboard, marketing site, file manager clone, or chat toy.
-- The interface should always answer: where was I, what matters now, what is the next safe action.
+## Color Tokens
 
-### Surface model
-
-- Default container is **continuous content on one surface**.
-- Cards are exception-only. Use them only for:
-  - modal or transient confirmation
-  - one selected file preview
-  - one AI result needing temporary emphasis
-  - destructive or permission-sensitive action blocks
-- Never nest a card inside a card.
-- Never solve hierarchy by adding another border box.
-
-## Color (locked)
-
-| role | OKLCH | hex | use |
-|------|-------|-----|-----|
-| background | 0.18 0.012 248 | #141A23 | app canvas |
-| surface | 0.23 0.014 246 | #1E2630 | main matte working surface |
-| surface-elevated | 0.27 0.017 243 | #273240 | selected or temporary emphasis |
-| surface-soft | 0.31 0.020 239 | #324050 | hover / subtle action |
-| text-primary | 0.965 0.006 232 | #F2F6FB | primary copy |
-| text-muted | 0.77 0.016 230 | #B6C2D0 | secondary copy |
-| divider | 0.38 0.018 235 | #4E5A6B | hairline dividers |
-| accent | 0.84 0.055 225 | #A9D7FF | single active accent |
-| accent-strong | 0.90 0.045 223 | #CAE6FF | focused text / selected emphasis |
-| success | 0.80 0.133 167 | #63D7A9 | success |
-| warning | 0.83 0.148 84 | #F3C85C | warning |
-| danger | 0.74 0.180 29 | #EA6C58 | destructive |
+| role | value | use |
+|---|---|---|
+| canvas | `#F3F0EA` | app background |
+| canvas-deep | `#EAE5DC` | navigation / quiet bands |
+| surface | `#FBFAF7` | active work surface |
+| surface-raised | `#FFFFFF` | selected item, dialog, focused result |
+| ink | `#202522` | primary text |
+| ink-soft | `#5F665F` | secondary text |
+| ink-faint | `#8A9089` | metadata and disabled copy |
+| rule | `#D8D2C8` | dividers and field rules |
+| accent | `#B74E35` | primary actions, current step, links |
+| accent-dark | `#8F3827` | hover / pressed accent |
+| accent-wash | `#F3DED6` | selected action background |
+| success | `#2E7258` | confirmed / completed |
+| warning | `#9A6A20` | waiting / caution |
+| danger | `#A63C38` | destructive / failed |
 
 Rules:
 
-- One accent only: mist blue. No purple glow, no green-as-brand, no gradient text.
-- 60-30-10 distribution:
-  - 60 = dark neutral surfaces
-  - 30 = softened elevated neutrals
-  - 10 = accent and state colors
-- Borders are almost never full rectangles. Prefer bottom rules, section rules, or inset focus rings.
-- Contrast targets:
-  - primary text on background/surface: WCAG AA+
-  - muted text only for secondary information, never for main action labels
+- No gradient backgrounds or gradient buttons.
+- Accent is for action and focus, not decoration.
+- Status colors supplement text and icons; they never communicate meaning alone.
+- Dark mode is not part of this redesign phase; the light workbench is the product identity.
 
-## Type (locked)
+## Typography
 
-| role | family | use | notes |
-|------|--------|-----|-------|
-| display | Inter / system sans | page title, major section title | bold, tight tracking, used sparingly |
-| body | Inter / system sans | all reading content | 15–16px body, 1.65–1.8 line-height |
-| utility | ui-monospace, SFMono-Regular, Consolas, monospace | paths, identifiers, traces | only for technical content |
+| role | family | size | weight |
+|---|---|---:|---:|
+| display | `"Source Serif 4", "Noto Serif SC", Georgia, serif` | 30-36px | 600 |
+| section | `"Source Sans 3", "Noto Sans SC", sans-serif` | 18-22px | 650 |
+| body | `"Source Sans 3", "Noto Sans SC", sans-serif` | 15px | 400 |
+| label | `"Source Sans 3", "Noto Sans SC", sans-serif` | 12-13px | 650 |
+| technical | `ui-monospace, Consolas, monospace` | 12px | 400 |
 
-Rules:
+Display type is reserved for orientation and major conclusions. Chinese body copy gets 1.65 line height and a readable measure of 52-68 characters.
 
-- No decorative serif.
-- No tiny dashboard microtype for meaningful content.
-- Chinese copy should avoid cramped lines; body paragraphs target relaxed line-height over dense compression.
+## Geometry
 
-## Scales (locked)
+- spacing: 4 / 8 / 12 / 16 / 24 / 32 / 48
+- normal radius: 6px
+- control radius: 5px
+- dialog radius: 10px
+- border: 1px solid `var(--rule)`
+- shadow: only dialogs and selected raised surfaces, `0 12px 28px rgba(35, 31, 24, .08)`
+- content measure: 720-860px for prose; shell may remain wide
 
-### Spacing
+## Motion
 
-- 4 / 8 / 12 / 16 / 20 / 24 / 32 / 40
-- Section rhythm is driven by 24 / 32, not 12 / 16.
-- If a screen feels busy, increase section spacing before adding boxes.
+- 120ms for hover and focus
+- 180ms for route and panel transitions
+- no idle animation, bounce, blur transition, or parallax
+- respect `prefers-reduced-motion`
+- do not animate layout height for long lists
 
-### Radius
+## Page Grammar
 
-- 0 for normal section containers
-- 12 for controls
-- 18 for secondary soft surfaces
-- 24 for selected / focused / composer surfaces
+### Start / Today
 
-### Motion
+One orientation header, one clear `开始工作` action, then a quiet continuation list. Continue Work is the reason for the action, not a competing dashboard card.
 
-- Duration: 120 / 180 / 260ms
-- Easing: cubic-bezier(0.22, 0.84, 0.24, 1)
-- Motion use:
-  - route / panel reveal = fade + 6px rise
-  - button / row interaction = 1px lift max
-  - panel open/close = opacity + translate only
-- No bounce, no elastic easing, no decorative idle motion
-- Must respect `prefers-reduced-motion`
+### Project Work
 
-## Voice
+Project identity and mode controls sit in a compact top rail. The central work thread owns the page. Context, recent changes, files, Codex and ledger are secondary rails or sections that open on demand.
 
-- register: plain, assured, work-oriented
-- action vocabulary:
-  - 开始工作
-  - 继续工作
-  - 导入资料
-  - 查看原因
-  - 确认归位
-  - 保存恢复点
-- Never use theatrical copy, buzzwords, or “AI has done magic” phrasing.
+### Codex
 
-## Page Grammar (locked)
+A mission strip answers task, stage, user action and result. Lifecycle is a thin progress line. Results read as conclusion, key outcomes, and next action. Technical details are an appendix.
 
-### 1. Start / Today Workspace
+### Inbox and Search
 
-- One main surface
-- Three internal bands:
-  - resume + primary action
-  - focus projects
-  - today suggestions + pending
-- Suggestions are rows, not tiles.
+Use decision rows and search results, not tiles. Each row puts human meaning before metadata and offers one next action.
 
-### 2. Work page
+### Settings
 
-- One horizontal work frame:
-  - top runway bar
-  - left main thread
-  - right reference rail
-  - bottom composer dock
-- Thread is the primary artifact. All other modules are accessory.
+Use a stable navigation column and a single document-like content column. Avoid cards inside settings cards.
 
-### 3. Inbox
+## Component Rules
 
-- One receiving sheet
-- Each file is a decision row:
-  - what it is
-  - why the system thinks so
-  - what happens next
-- No boxed metadata grid unless user expands details.
+- `Button`: solid accent for one primary action; quiet text buttons for secondary actions.
+- `Card`: exception-only for dialogs, selected preview, destructive confirmation, or one highlighted result.
+- `Badge`: status and category metadata only; never an action.
+- `Feedback`: inline and sentence-led; no giant alert panels for ordinary errors.
+- `TextInput`: paper-white field with a clear bottom/outline focus state.
+- list rows: border-bottom rhythm, selected row uses accent rule and soft wash.
+- `details` / collapsible: technical evidence, raw paths, IDs, and diagnostics.
 
-### 4. Weekly Review
+## Accessibility and Responsiveness
 
-- Read like a personal review memo, not operations dashboard.
-- Lead with conclusions, then evidence, then candidates.
+- visible `:focus-visible` ring in accent-dark with 2px offset
+- keyboard order follows reading order; primary action is first actionable control
+- all status colors have text labels
+- 1280x800: collapse secondary rails; preserve work thread and primary action
+- 1440x900: show main work column plus one secondary rail
+- 1920x1080: widen shell, never stretch prose beyond its measure
+- Windows scaling must preserve minimum 40px controls and avoid horizontal scroll
 
-### 5. Settings
+## Performance Guardrails
 
-- True admin skeleton:
-  - stable sidebar
-  - stable content width
-  - content presented as sections and rows, not floating cards
+- render secondary modules only when opened or when they contain active work
+- keep activity/history lists virtualized or capped
+- pause polling while hidden; coalesce background refresh updates
+- no large blur/filter surfaces
+- preserve scroll position on passive refresh; only focus/scroll on explicit navigation
 
-## Banned patterns
+## Forbidden Patterns
 
-- three equal cards as the default answer
-- nested cards
-- hard left decorative line touching text
-- thick borders used as hierarchy
-- KPI strip styling for content that is actually narrative
-- hero-center-dark-mesh as default visual answer
-- bright neon accent as the main style device
-- fake app-window look inside the real app
-
-## Build consequences
-
-- If a container has no independent state or separate task meaning, it should not be a card.
-- If two adjacent boxes exist only because spacing felt empty, remove the boxes and use rhythm instead.
-- If a row contains title + status + explanation, the explanation always wins width; status compresses first.
-- If a settings block feels cut into fragments, unify it into one reading flow before adding controls.
+- blue/purple glow or neon outlines
+- glassmorphism, backdrop blur, gradient hero backgrounds
+- three equal dashboard cards as a default layout
+- nested cards and card-in-card hierarchy
+- oversized marketing headlines
+- technical identifiers in ordinary user-facing surfaces
+- multiple competing primary buttons

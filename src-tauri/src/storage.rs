@@ -228,7 +228,9 @@ pub fn global_data_dir<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf,
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let preferred = PathBuf::from(r"D:\GanMaoYuan\AppData");
-            if Path::new(r"D:\").exists() {
+            // Existing installs keep their historical data location. Fresh installs use
+            // Tauri's per-user directory instead of assuming every machine has a D: drive.
+            if preferred.exists() {
                 preferred
             } else {
                 legacy_dir.clone()
@@ -290,7 +292,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
 pub fn test_root(label: &str) -> PathBuf {
     let base = env::var_os("GANMAOYUAN_TEST_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"D:\GanMaoYuan\Acceptance\automated"));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-data"));
     base.join(format!("{label}-{}", new_id()))
 }
 

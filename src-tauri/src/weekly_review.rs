@@ -1053,7 +1053,7 @@ fn project_reports_path(root: &Path) -> PathBuf {
 
 fn build_report_dir(project_root: &str, week_key: &str, version: u32) -> PathBuf {
     if project_root.trim().is_empty() {
-        PathBuf::from(r"D:\GanMaoYuan\AppData\weekly-reports")
+        default_global_reports_root()
             .join(week_key)
             .join(format!("v{version}"))
     } else {
@@ -1062,6 +1062,21 @@ fn build_report_dir(project_root: &str, week_key: &str, version: u32) -> PathBuf
             .join(week_key)
             .join(format!("v{version}"))
     }
+}
+
+fn default_global_reports_root() -> PathBuf {
+    if let Some(configured) = std::env::var_os("GANMAOYUAN_DATA_DIR") {
+        return PathBuf::from(configured).join("weekly-reports");
+    }
+    let legacy = PathBuf::from(r"D:\GanMaoYuan\AppData");
+    if legacy.exists() {
+        return legacy.join("weekly-reports");
+    }
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("com.ganmaoyuan.desktop")
+        .join("weekly-reports")
 }
 
 fn current_week_window() -> (String, String, String) {

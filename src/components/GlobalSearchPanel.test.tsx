@@ -3,7 +3,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import type { GlobalSearchResult } from '../features/project/desktopApi';
-import { GlobalSearchPanel } from './GlobalSearchPanel';
+import { formatResultType, GlobalSearchPanel } from './GlobalSearchPanel';
 
 const appState = vi.hoisted(() => ({
   openProject: vi.fn(),
@@ -73,6 +73,13 @@ describe('GlobalSearchPanel', () => {
     renderPanel();
 
     expect(screen.getByRole('textbox', { name: '全局搜索' })).toBeTruthy();
+    expect(screen.getByPlaceholderText('输入中文关键词，例如：项目资料 / 下一步 / PRD')).toBeTruthy();
+    expect(screen.queryByText(/DeepSeek|Atlas/)).toBeNull();
+  });
+
+  it('uses user-facing names for implementation-backed result types', () => {
+    expect(formatResultType('atlas')).toBe('项目分析');
+    expect(formatResultType('codexReport')).toBe('执行报告');
   });
 
   it('shows a result card after entering a search term', async () => {

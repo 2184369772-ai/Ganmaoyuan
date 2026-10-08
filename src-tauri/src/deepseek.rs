@@ -165,6 +165,13 @@ pub fn selected_model_id<R: Runtime>(app: &AppHandle<R>) -> Result<String, Strin
     Ok(read_settings_file(settings_path(app)?)?.selected_model_id)
 }
 
+pub fn model_supports_vision(model_id: &str) -> bool {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    normalized == "deepseek-flash"
+        || normalized.contains("v4-flash")
+        || normalized.contains("flash-vision")
+}
+
 pub fn stop_stream(project_root: &str) {
     if let Ok(mut guard) = active_streams().lock() {
         if let Some(flag) = guard.remove(project_root) {
@@ -442,7 +449,15 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::http_status_error;
+    use super::{http_status_error, model_supports_vision};
+
+    #[test]
+    fn identifies_deepseek_vision_models_without_promoting_text_models() {
+        assert!(model_supports_vision("deepseek-flash"));
+        assert!(model_supports_vision("deepseek-v4-flash-vision-exp"));
+        assert!(!model_supports_vision("deepseek-chat"));
+        assert!(!model_supports_vision("deepseek-reasoner"));
+    }
 
     #[test]
     fn maps_rate_limit_status_to_friendly_message() {

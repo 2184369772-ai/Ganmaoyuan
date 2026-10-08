@@ -190,8 +190,9 @@ fn global_data_dir_path() -> Result<PathBuf, String> {
     let fallback = env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("Ganmaoyuan");
-    let path = if Path::new(r"D:\").exists() {
+        .join("com.ganmaoyuan.desktop");
+    // Keep existing installations together while avoiding a new hard dependency on D:.
+    let path = if preferred.exists() {
         preferred
     } else {
         fallback

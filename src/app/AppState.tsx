@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   applyCodexReport as applyDesktopCodexReport,
+  createCodexTask as createDesktopCodexTask,
   createProject as createDesktopProject,
   captureProjectFact as captureDesktopProjectFact,
   createProjectFromMaterialInbox as createDesktopProjectFromMaterialInbox,
@@ -34,8 +35,8 @@ import {
   loadWeeklyReviewSettings as loadDesktopWeeklyReviewSettings,
   listProjects,
   listDeepSeekModels as listDesktopDeepSeekModels,
-  listCodexTasks as listDesktopCodexTasks,
   loadProject,
+  markProjectOpened,
   markCodexTaskHandedOff as markDesktopCodexTaskHandedOff,
   acceptCodexTask as acceptDesktopCodexTask,
   rejectCodexTask as rejectDesktopCodexTask,
@@ -45,6 +46,7 @@ import {
   confirmMaterialInboxItem as confirmDesktopMaterialInboxItem,
   consumeLaunchInboxEntries as consumeDesktopLaunchInboxEntries,
   scanProjectWorkspace as scanDesktopProjectWorkspace,
+  synchronizeProjectFacts as synchronizeDesktopProjectFacts,
   refreshProjectUnderstanding as refreshDesktopProjectUnderstanding,
   saveDeepSeekApiKey as saveDesktopDeepSeekApiKey,
   saveProjectDraft as saveDesktopProjectDraft,
@@ -65,6 +67,8 @@ import {
   getDailyContinue as getDesktopDailyContinue,
   getWorkLedger as getDesktopWorkLedger,
   getTodayWorkspace as getDesktopTodayWorkspace,
+  refreshTodayWorkspace as refreshDesktopTodayWorkspace,
+  updateContinueProjectPreference as updateDesktopContinueProjectPreference,
   regenerateDailyContinue as regenerateDesktopDailyContinue,
   updateProjectAttention as updateDesktopProjectAttention,
   updateDataHealthStatus as updateDesktopDataHealthStatus,
@@ -81,6 +85,8 @@ import {
   type CodexReportImportResult,
   type CodexReportRecord,
   type CodexTask,
+  type CodexTaskCreateRequest,
+  type ChatImageAttachmentInput,
   type DailySession,
   type DeepSeekModelInfo,
   type DeepSeekSettings,
@@ -154,6 +160,7 @@ type AppStateValue = {
   deepSeekModels: DeepSeekModelInfo[];
   isStreaming: boolean;
   isDesktopReady: boolean;
+  isStartupHydrated: boolean;
   projects: ProjectSummary[];
   activeProject: ProjectSummary | null;
   activeManifest: ProjectManifest | null;
@@ -183,11 +190,12 @@ type AppStateValue = {
   openProject: (projectRoot: string) => Promise<void>;
   createProject: (name: string, rootDir: string, filePaths: string[], description: string) => Promise<void>;
   importFilesToActiveProject: (filePaths: string[], relatedTask: string) => Promise<void>;
-  sendProjectMessage: (text: string) => Promise<void>;
+  sendProjectMessage: (text: string, imageAttachments?: ChatImageAttachmentInput[]) => Promise<void>;
   stopProjectMessage: () => Promise<void>;
   saveProjectDraft: (text: string, pendingFilePaths?: string[]) => Promise<void>;
   finishProjectWork: (done: string, nextStep: string) => Promise<void>;
   generateCodexPrompt: () => Promise<CodexPromptResult | null>;
+  createCodexTask: (request: CodexTaskCreateRequest) => Promise<CodexTask | null>;
   markCodexTaskHandedOff: (taskId: string) => Promise<CodexTask>;
   acceptCodexTask: (taskId: string, resultId: string) => Promise<CodexTask>;
   rejectCodexTask: (taskId: string, resultId: string, reason?: string) => Promise<CodexTask>;
@@ -246,7 +254,11 @@ type AppStateValue = {
   refreshProjectImpact: () => Promise<void>;
   refreshDailyContinue: () => Promise<void>;
   regenerateDailyContinue: () => Promise<void>;
-  refreshTodayWorkspace: () => Promise<void>;
+  refreshTodayWorkspace: (options?: { refreshFacts?: boolean }) => Promise<void>;
+  updateContinueProjectPreference: (
+    projectId: string,
+    options: { pinned?: boolean; snoozedUntil?: string },
+  ) => Promise<void>;
   updateProjectAttention: (attentionId: string, status: "confirmed" | "ignored" | "later") => Promise<void>;
   updateDataHealthStatus: (recordId: string, status: "resolved" | "ignored") => Promise<void>;
   updatePendingReviewStatus: (reviewId: string, status: "open" | "pending" | "resolved" | "ignored") => Promise<void>;
@@ -338,6 +350,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const memosRef = useRef<MemoItem[]>([]);
   const memoSaveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const [error, setError] = useState("");
+  const [isStartupHydrated, setIsStartupHydrated] = useState(!isTauriRuntime());
   const isDesktopReady = isTauriRuntime();
 
   useLayoutEffect(() => {
@@ -375,6 +388,30 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  async function synchronizeProjectFacts(view: { root: string; generation: number }) {
+    if (!isCurrentProjectView(view) || !view.root) return;
+    const result = await synchronizeDesktopProjectFacts(view.root).catch(() => null);
+    if (!isCurrentProjectView(view)) return;
+    if (!result) {
+      const scan = await scanDesktopProjectWorkspace(view.root);
+      if (!isCurrentProjectView(view)) return;
+      if (scan.changed) {
+        setActiveManifest(scan.manifest);
+        setActiveProject(scan.manifest.project);
+      }
+      const ledger = await getDesktopWorkLedger(view.root);
+      if (!isCurrentProjectView(view)) return;
+      setWorkLedger(ledger);
+      setCodexTasks(ledger.codexTasks ?? []);
+      return;
+    }
+    setActiveManifest(result.manifest);
+    setActiveProject(result.manifest.project);
+    setWorkLedger(result.workLedger);
+    setCodexTasks(result.workLedger.codexTasks ?? []);
+    setTodayWorkspace(result.todayWorkspace);
+  }
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
@@ -397,8 +434,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!isDesktopReady) return;
-    void refreshProjects();
-    void getDesktopTodayWorkspace().then(setTodayWorkspace).catch((err) => setError(String(err)));
+    let disposed = false;
+    const hydrateStartup = async () => {
+      try {
+        await refreshProjects();
+        const workspace = await getDesktopTodayWorkspace();
+        if (!disposed) setTodayWorkspace(workspace);
+      } catch (err) {
+        if (!disposed) setError(String(err));
+      } finally {
+        if (!disposed) setIsStartupHydrated(true);
+      }
+    };
+    void hydrateStartup();
     // The first frame only needs project continuity. Defer settings and secondary
     // panels so their I/O cannot compete with restoring the active project.
     const secondaryLoad = window.setTimeout(() => {
@@ -409,7 +457,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       void listDesktopDeepSeekModels().then(setDeepSeekModels).catch(() => undefined);
       void loadDesktopWeeklyReviewSettings().then(setWeeklyReviewSettings).catch((err) => setError(String(err)));
     }, 250);
-    return () => window.clearTimeout(secondaryLoad);
+    return () => {
+      disposed = true;
+      window.clearTimeout(secondaryLoad);
+    };
   }, [isDesktopReady]);
 
   useEffect(() => {
@@ -417,7 +468,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     let disposed = false;
     let busy = false;
     const poll = async () => {
-      if (disposed || busy) return;
+      if (disposed || busy || document.visibilityState === "hidden") return;
       busy = true;
       try {
         const items = await consumeDesktopLaunchInboxEntries();
@@ -443,42 +494,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [isDesktopReady]);
 
   useEffect(() => {
-    if (!isDesktopReady) return;
-    let disposed = false;
-    const loadWeeklyReview = async () => {
-      try {
-        const dashboard = await loadDesktopWeeklyReviewDashboard(activeProject?.rootDir ?? readUiState().lastProjectRoot ?? null);
-        if (disposed) return;
-        setWeeklyReviewDashboard(dashboard);
-        if (
-          dashboard.generatedNow === false &&
-          dashboard.currentWeekKey &&
-          dashboard.globalReports.every((report) => report.weekKey !== dashboard.currentWeekKey) &&
-          dashboard.projectReports.every((report) => report.weekKey !== dashboard.currentWeekKey)
-        ) {
-          const generated = await generateDesktopWeeklyReviews(
-            dashboard.activeProjectRoot || null,
-            dashboard.currentWeekKey,
-            dashboard.weekStart,
-            dashboard.weekEnd,
-            false,
-          );
-          if (!disposed) {
-            setWeeklyReviewDashboard(generated);
-            setWeeklyReviewSettings(generated.settings);
-          }
-        }
-      } catch (err) {
-        if (!disposed) setError(String(err));
-      }
-    };
-    void loadWeeklyReview();
-    return () => {
-      disposed = true;
-    };
-  }, [isDesktopReady, activeProject?.rootDir]);
-
-  useEffect(() => {
     if (!isDesktopReady || !activeProject) return;
     let disposed = false;
     let busy = false;
@@ -489,10 +504,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (!isCurrentProjectView(view)) return;
       busy = true;
       try {
-        const manifest = await scanDesktopProjectWorkspace(activeProject.rootDir);
-        if (!disposed && isCurrentProjectView(view)) {
-          setActiveManifest(manifest);
-          setActiveProject(manifest.project);
+        const scan = await scanDesktopProjectWorkspace(activeProject.rootDir);
+        if (!disposed && scan.changed && isCurrentProjectView(view)) {
+          await synchronizeProjectFacts(view);
         }
       } catch {
         // Monitoring failures should not block normal work.
@@ -503,16 +517,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     timer = window.setInterval(() => {
       void runScan();
     }, PROJECT_MONITOR_INTERVAL_MS);
-    const resumeVisibleScan = () => {
-      if (document.visibilityState === "visible") void runScan();
-    };
-    document.addEventListener("visibilitychange", resumeVisibleScan);
-    window.addEventListener("focus", resumeVisibleScan);
     return () => {
       disposed = true;
       if (timer) window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", resumeVisibleScan);
-      window.removeEventListener("focus", resumeVisibleScan);
     };
   }, [isDesktopReady, activeProject?.rootDir]);
 
@@ -520,6 +527,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!isDesktopReady || !activeProject) return;
     let disposed = false;
     let busy = false;
+    const shouldPoll = codexTasks.some((task) =>
+      ["handedOff", "running", "awaitingResult", "resultReceived", "verifying"].includes(task.status),
+    );
     const runBridgeScan = async () => {
       if (disposed || busy || document.visibilityState === "hidden") return;
       const view = captureProjectView();
@@ -540,21 +550,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
     };
     void runBridgeScan();
-    const timer = window.setInterval(() => {
-      void runBridgeScan();
-    }, CODEX_RESULT_POLL_INTERVAL_MS);
-    const resumeVisibleScan = () => {
-      if (document.visibilityState === "visible") void runBridgeScan();
-    };
-    document.addEventListener("visibilitychange", resumeVisibleScan);
-    window.addEventListener("focus", resumeVisibleScan);
+    const timer = shouldPoll
+      ? window.setInterval(() => {
+          void runBridgeScan();
+        }, CODEX_RESULT_POLL_INTERVAL_MS)
+      : undefined;
     return () => {
       disposed = true;
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", resumeVisibleScan);
-      window.removeEventListener("focus", resumeVisibleScan);
+      if (timer) window.clearInterval(timer);
     };
-  }, [isDesktopReady, activeProject?.rootDir]);
+  }, [isDesktopReady, activeProject?.rootDir, codexTasks]);
 
   useEffect(() => {
     if (!isDesktopReady) return;
@@ -646,30 +651,31 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const view = { root: projectRoot, generation: projectViewRef.current.generation + 1 };
     projectViewRef.current = view;
     try {
-      let manifest = await loadProject(projectRoot);
+      const manifest = await loadProject(projectRoot);
       if (!isCurrentProjectView(view)) return;
-      try {
-        manifest = await scanDesktopProjectWorkspace(projectRoot);
-      } catch {
-        // Keep the project open even if monitoring scan fails.
+      let openedProject = manifest.project;
+      if (isTauriRuntime()) {
+        try {
+          openedProject = await markProjectOpened(projectRoot);
+        } catch (err) {
+          // Keep browser/test doubles and older desktop binaries readable; the
+          // current binary registers this command and persists the timestamp.
+          if (!String(err).includes("unexpected command")) throw err;
+        }
       }
       if (!isCurrentProjectView(view)) return;
-      let ledger: WorkLedgerSnapshot | null = null;
-      let nextTasks: CodexTask[] = [];
-      let ledgerError = "";
-      try {
-        ledger = await getDesktopWorkLedger(projectRoot);
-        nextTasks = ledger.codexTasks ?? (await listDesktopCodexTasks(projectRoot)).tasks;
-      } catch (err) {
-        ledgerError = String(err);
-      }
-      if (!isCurrentProjectView(view)) return;
-      ++ledgerRequestRef.current;
-      setActiveProject(manifest.project);
+      setActiveProject(openedProject);
+      setProjects((current) => [openedProject, ...current.filter((item) => item.id !== openedProject.id)]);
       setActiveManifest(manifest);
-      setWorkLedger(ledger);
-      setCodexTasks(nextTasks);
-      setError(ledgerError);
+      setWorkLedger(null);
+      setCodexTasks([]);
+      setError("");
+
+      // Project switches keep the existing responsive behavior; startup is
+      // gated separately until the initial registry and Today snapshot load.
+      void synchronizeProjectFacts(view).catch((err) => {
+        if (isCurrentProjectView(view)) setError(String(err));
+      });
     } catch (err) {
       if (!isCurrentProjectView(view)) return;
       projectViewRef.current = { root: displayedRootRef.current, generation: view.generation + 1 };
@@ -698,7 +704,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       // Project creation must still succeed before DeepSeek authorization exists.
     }
     try {
-      manifest = await scanDesktopProjectWorkspace(result.project.rootDir);
+      manifest = (await scanDesktopProjectWorkspace(result.project.rootDir)).manifest;
     } catch {
       // Monitoring remains best-effort.
     }
@@ -728,7 +734,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       // Import remains a file-location operation; analysis can be refreshed after authorization.
     }
     try {
-      manifest = await scanDesktopProjectWorkspace(activeProject.rootDir);
+      manifest = (await scanDesktopProjectWorkspace(activeProject.rootDir)).manifest;
     } catch {
       // Monitoring remains best-effort.
     }
@@ -840,10 +846,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return result;
   }
 
-  async function sendProjectMessage(text: string) {
+  async function sendProjectMessage(text: string, imageAttachments: ChatImageAttachmentInput[] = []) {
     const trimmed = text.trim();
     if (!trimmed || !activeProject) return;
-    const result = await sendDesktopProjectMessage(activeProject.rootDir, trimmed);
+    const result = await sendDesktopProjectMessage(activeProject.rootDir, trimmed, imageAttachments);
     setIsStreaming(Boolean(result.streamMessageId));
     setActiveProject(result.project);
     setActiveManifest((previous) =>
@@ -910,6 +916,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!isCurrentProjectView(view)) return null;
     setError("");
     return result;
+  }
+
+  async function createCodexTask(request: CodexTaskCreateRequest) {
+    if (!activeProject) throw new Error("请先打开一个项目。");
+    const view = captureProjectView();
+    const task = await createDesktopCodexTask(activeProject.rootDir, request);
+    await refreshScopedWorkLedger(view);
+    if (!isCurrentProjectView(view)) return null;
+    setError("");
+    return task;
   }
 
   async function markCodexTaskHandedOff(taskId: string) {
@@ -1118,14 +1134,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function refreshTodayWorkspace() {
+  async function refreshTodayWorkspace(options?: { refreshFacts?: boolean }) {
     if (!isDesktopReady) return;
     try {
-      setTodayWorkspace(await getDesktopTodayWorkspace());
+      setTodayWorkspace(
+        await (options?.refreshFacts ? refreshDesktopTodayWorkspace() : getDesktopTodayWorkspace()),
+      );
       setError("");
     } catch (err) {
       setError(String(err));
     }
+  }
+
+  async function updateContinueProjectPreference(
+    projectId: string,
+    options: { pinned?: boolean; snoozedUntil?: string },
+  ) {
+    setTodayWorkspace(await updateDesktopContinueProjectPreference(projectId, options));
   }
 
   async function refreshWorkLedger() {
@@ -1360,6 +1385,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       deepSeekSettings,
       deepSeekModels,
       isStreaming,
+      isStartupHydrated,
       isDesktopReady,
       projects,
       activeProject,
@@ -1399,6 +1425,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       saveProjectDraft,
       finishProjectWork,
       generateCodexPrompt,
+      createCodexTask,
       markCodexTaskHandedOff,
       acceptCodexTask,
       rejectCodexTask,
@@ -1472,6 +1499,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       refreshDailyContinue,
       regenerateDailyContinue: regenerateDailyContinueAction,
       refreshTodayWorkspace,
+      updateContinueProjectPreference,
       updateProjectAttention: updateProjectAttentionAction,
       updateDataHealthStatus: updateDataHealthStatusAction,
       updatePendingReviewStatus: updatePendingReviewStatusAction,

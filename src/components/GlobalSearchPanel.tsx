@@ -73,7 +73,7 @@ export function GlobalSearchPanel({
         autoFocus={autoFocus}
         value={query}
         onChange={(event) => setQuery(event.target.value)}
-        placeholder="输入中文关键词，例如：全局搜索 / DeepSeek / PRD"
+        placeholder="输入中文关键词，例如：项目资料 / 下一步 / PRD"
       />
 
       {query.trim() ? (
@@ -115,7 +115,7 @@ export function GlobalSearchPanel({
                   <div className="global-search-workspace-meta subdued">
                     {result.recentStatus ? <span>{result.recentStatus}</span> : null}
                     {result.confidenceDisplay ? <span>{result.confidenceDisplay}</span> : null}
-                    {result.decisionTraceId ? <span>Decision Trace：{result.decisionTraceId}</span> : null}
+                    {result.decisionTraceId ? <span>已有判断依据</span> : null}
                   </div>
                 ) : null}
                 <div className="global-search-footer">
@@ -150,13 +150,13 @@ export function GlobalSearchPanel({
           )}
         </div>
       ) : (
-        <Feedback>搜索范围包含项目名称、文件名、摘要、对话、任务、决定、成果、项目理解、Atlas 结果和 Codex 报告。</Feedback>
+        <Feedback>输入关键词，查找项目、资料和工作记录。</Feedback>
       )}
     </section>
   );
 }
 
-function formatResultType(contentType: string) {
+export function formatResultType(contentType: string) {
   switch (contentType) {
     case "project":
       return "项目";
@@ -173,9 +173,9 @@ function formatResultType(contentType: string) {
     case "projectAnalysis":
       return "项目理解";
     case "atlas":
-      return "Atlas";
+      return "项目分析";
     case "codexReport":
-      return "Codex 报告";
+      return "执行报告";
     case "global_file":
       return "Workspace 文件";
     default:

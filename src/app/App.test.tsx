@@ -52,6 +52,8 @@ let captureProjectFactFailure = false;
 const projectContextPacket: ProjectContextPacket = {
   projectId: project.id,
   projectName: project.name,
+  projectDescription: "用于验证感冒院上下文交接。",
+  currentPhase: "人工验收",
   generatedAt: "2026-09-16T10:00:00Z",
   privacyNotice: "仅包含事实摘要与相对资料位置。",
   focus: {
@@ -64,6 +66,11 @@ const projectContextPacket: ProjectContextPacket = {
   pendingActions: [{ title: "验收 Codex 结果", reason: "存在 1 项人工验收。", priority: "high" }],
   files: [{ name: "验收说明.md", documentPurpose: "reference", lifecycleStatus: "managed", location: "10_Projects/验收说明.md", summary: "验收资料" }],
   codexResult: null,
+  decisions: [],
+  gitFacts: null,
+  risks: [],
+  nextStep: "验收 Codex 结果",
+  freshness: { generatedAt: "2026-09-16T10:00:00Z", factsSyncedAt: "2026-09-16T10:00:00Z", status: "current" },
   sparse: false,
   markdown: "# 项目上下文：感冒院验收项目",
 };
@@ -232,7 +239,7 @@ describe("project workspace persistence flow", () => {
       if (command === "get_work_ledger") {
         return { events: workLedgerEvents, gitSnapshot, codexResults, codexTasks: [] };
       }
-      if (command === "get_project_context_packet") return projectContextPacket;
+      if (command === "get_current_project_context_packet") return projectContextPacket;
       if (command === "record_user_decision_event") {
         const decision = (args as { decision: string; reason?: string | null }).decision;
         const existing = workLedgerEvents.find(
@@ -418,11 +425,90 @@ describe("project workspace persistence flow", () => {
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByText("今天检查事务导入")).toBeInTheDocument();
-    expect(await screen.findByText("assistant / streaming")).toBeInTheDocument();
+    expect((await screen.findAllByText("项目记录")).length).toBeGreaterThan(0);
     expect(invoke).toHaveBeenCalledWith("send_project_message", {
       projectRoot: project.rootDir,
       text: "今天检查事务导入",
     });
+  });
+
+  it("prefills the Codex form from the latest project discussion", async () => {
+    const previousMessages = manifest.messages;
+    manifest.messages = [
+      ...previousMessages,
+      {
+        ...initialMessage,
+        id: "user-ui-discussion",
+        author: "user",
+        kind: "requirement",
+        text: "设置后台右侧内容区文字太贴边，希望增加 padding / gap / section spacing。不要修改左侧菜单、业务逻辑和整体视觉风格。",
+        createdAt: "2",
+        status: "completed",
+        source: "user",
+        attachments: [{
+          fileId: "image-1",
+          fileName: "settings.png",
+          managedPath: "",
+          attachmentType: "image",
+          contentType: "image/png",
+          relativePath: ".ganmaoyuan/chat-attachments/user-ui-discussion/image-1-settings.png",
+        }],
+      },
+      {
+        ...initialMessage,
+        id: "assistant-ui-discussion",
+        author: "ganmaoyuan",
+        kind: "assistant",
+        text: "增加外层内容区 padding，调整区块 vertical gap / section spacing，增加表格行上下 padding；不修改左侧菜单，不改变整体视觉风格，不改业务逻辑，修改后运行最新构建进行验证。",
+        createdAt: "3",
+        status: "completed",
+        source: "deepseek",
+        modelId: "deepseek-v4-flash",
+      },
+    ];
+    try {
+      const originalInvoke = vi.mocked(invoke).getMockImplementation()!;
+      vi.mocked(invoke).mockImplementation(async (command, args) => {
+        if (command === "create_codex_task") {
+          return {
+            taskId: "task-from-discussion",
+            projectId: project.id,
+            title: "优化设置后台右侧内容区留白",
+            taskType: "coding",
+            prompt: "taskId：task-from-discussion",
+            status: "ready",
+          };
+        }
+        return originalInvoke(command, args);
+      });
+      render(
+        <MemoryRouter initialEntries={["/work"]}>
+          <App />
+        </MemoryRouter>,
+      );
+
+      fireEvent.click(await screen.findByRole("button", { name: "交给 Codex" }));
+
+      expect(await screen.findByLabelText("任务标题")).toHaveValue("优化设置后台右侧内容区留白");
+      expect(screen.getByLabelText("任务类型")).toHaveValue("coding");
+      const instructions = (screen.getByLabelText("任务说明") as HTMLTextAreaElement).value;
+      expect(instructions).toContain("增加外层内容区 padding");
+      expect(instructions).toContain("settings.png");
+
+      fireEvent.click(screen.getByRole("button", { name: "创建任务" }));
+      await waitFor(() => {
+        expect(invoke).toHaveBeenCalledWith("create_codex_task", {
+          projectRoot: project.rootDir,
+          request: {
+            title: "优化设置后台右侧内容区留白",
+            taskType: "coding",
+            instructions,
+          },
+        });
+      });
+    } finally {
+      manifest.messages = previousMessages;
+    }
   });
 
   it("shows the evidence-backed Today Workspace on startup", async () => {
@@ -434,21 +520,37 @@ describe("project workspace persistence flow", () => {
 
     expect(await screen.findByText("今天应该做什么")).toBeInTheDocument();
     expect(await screen.findByText(/上次做到：已完成资料整理/)).toBeInTheDocument();
-    expect(await screen.findByText("任务推进")).toBeInTheDocument();
+    expect(await screen.findByText("最近进入的项目")).toBeInTheDocument();
   });
 
-  it("keeps Start Work as the homepage primary action and leaves focus as auxiliary", async () => {
+  it("keeps Start Work as the homepage primary action and lists recent projects", async () => {
     render(
       <MemoryRouter initialEntries={["/"]}>
         <App />
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText("继续工作")).toBeInTheDocument();
-    expect(await screen.findByText("检查 Codex 任务结果")).toBeInTheDocument();
-    expect(await screen.findByText(/依据 1 条事实/)).toBeInTheDocument();
+    expect((await screen.findAllByText("最近项目")).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("感冒院验收项目")).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "开始工作" })).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "查看问题" })).toHaveLength(1);
+    expect(screen.queryByText("优先继续")).not.toBeInTheDocument();
+    expect(screen.queryByText("Codex 待验收")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "本周复盘" })).not.toBeInTheDocument();
+  });
+
+  it("keeps secondary Today details collapsed until requested", async () => {
+    render(
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    const disclosure = (await screen.findByText("更多动态")).closest("details");
+    expect(disclosure).not.toHaveAttribute("open");
+    expect(screen.getByText("最近进入的项目")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("更多动态"));
+    expect(disclosure).toHaveAttribute("open");
   });
 
   it("opens the project picker from Start Work even when a continue focus exists", async () => {
@@ -463,6 +565,33 @@ describe("project workspace persistence flow", () => {
     expect(await screen.findByText("继续历史任务")).toBeInTheDocument();
     expect(screen.getByRole("combobox")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "继续" })).toBeDisabled();
+  });
+
+  it("keeps low-frequency work tools behind a More disclosure", async () => {
+    render(
+      <MemoryRouter initialEntries={["/work"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("工作流");
+    expect(screen.getByText("更多")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "本周复盘" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "项目影响与行动" })).toBeInTheDocument();
+  });
+
+  it("keeps implementation names out of the ordinary work surface", async () => {
+    render(
+      <MemoryRouter initialEntries={["/work"]}>
+        <App />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("工作流");
+
+    expect(screen.getAllByRole("button", { name: "启用 AI 回复" }).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/DeepSeek/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Atlas 与监视/i)).not.toBeInTheDocument();
   });
 
   it("records a user decision and refreshes the work ledger immediately", async () => {
@@ -552,7 +681,7 @@ describe("project workspace persistence flow", () => {
     expect(await screen.findByRole("heading", { name: "项目上下文" })).toBeInTheDocument();
     expect(screen.getAllByText("验收 Codex 结果")).toHaveLength(2);
     expect(screen.getByText("验收说明.md")).toBeInTheDocument();
-    expect(invoke).toHaveBeenCalledWith("get_project_context_packet", { projectRoot: project.rootDir });
+    expect(invoke).toHaveBeenCalledWith("get_current_project_context_packet", { projectRoot: project.rootDir });
   });
 
   it("uses the current project root as the Git path default before a snapshot exists", async () => {
@@ -687,6 +816,24 @@ describe("project workspace persistence flow", () => {
     expect(getState().codexTasks).toEqual([]);
   });
 
+  it("opens a project before its work ledger finishes loading", async () => {
+    const { getState, otherProject } = await projectIsolationHarness();
+    const delayed = deferred<unknown>();
+    const original = vi.mocked(invoke).getMockImplementation()!;
+    vi.mocked(invoke).mockImplementation((command, args) =>
+      command === "get_work_ledger" && (args as { projectRoot: string }).projectRoot === otherProject.rootDir
+        ? delayed.promise : original(command, args));
+
+    await act(async () => { await getState().openProject(otherProject.rootDir); });
+
+    expect(getState().activeProject?.id).toBe(otherProject.id);
+    expect(getState().workLedger).toBeNull();
+    await act(async () => {
+      delayed.resolve({ events: [], gitSnapshot: null, codexResults: [], codexTasks: [{ taskId: "task-b", projectId: otherProject.id }] });
+    });
+    await waitFor(() => expect(getState().codexTasks.map((task) => task.taskId)).toEqual(["task-b"]));
+  });
+
   it("keeps the latest opened project when an earlier load finishes late", async () => {
     const { getState, otherProject } = await projectIsolationHarness();
     const delayed = deferred<ProjectManifest>();
@@ -773,21 +920,27 @@ describe("project workspace persistence flow", () => {
     expect(getState().activeManifest?.project.id).toBe(otherProject.id);
     expect(getState().workLedger).toBeNull();
     expect(getState().codexTasks).toEqual([]);
-    expect(getState().error).toContain("Ledger read failed");
+    await waitFor(() => expect(getState().error).toContain("Ledger read failed"));
   });
 
-  it.each([false, true])("ignores an unmounted console's generation response (failure=%s)", async (failure) => {
+  it.each([false, true])("ignores an unmounted console's explicit task creation response (failure=%s)", async (failure) => {
     const { getState, otherProject } = await projectIsolationHarness(true);
     const delayed = deferred<unknown>();
     const original = vi.mocked(invoke).getMockImplementation()!;
     vi.mocked(invoke).mockImplementation((command, args) =>
-      command === "generate_codex_prompt" ? delayed.promise : original(command, args));
+      command === "create_codex_task" ? delayed.promise : original(command, args));
     fireEvent.click(screen.getByRole("button", { name: "生成新任务" }));
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("generate_codex_prompt", { projectRoot: project.rootDir }));
+    fireEvent.change(screen.getByLabelText("任务标题"), { target: { value: "任务 A" } });
+    fireEvent.change(screen.getByLabelText("任务说明"), { target: { value: "只做 A。" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建任务" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("create_codex_task", {
+      projectRoot: project.rootDir,
+      request: { title: "任务 A", taskType: "analysis", instructions: "只做 A。" },
+    }));
     await act(async () => { await getState().openProject(otherProject.rootDir); });
     await act(async () => {
       if (failure) delayed.reject(new Error("Old A generation failed"));
-      else delayed.resolve({ manifest, prompt: { id: "task-a", promptText: "project A only" } });
+      else delayed.resolve({ taskId: "task-a", projectId: project.id, title: "任务 A", prompt: "project A only" });
     });
     expect(getState().activeProject?.id).toBe(otherProject.id);
     expect(screen.getByTestId("route-query")).not.toHaveTextContent("task-a");
@@ -892,20 +1045,23 @@ describe("project workspace persistence flow", () => {
     expect(getState().codexTasks).toEqual([]);
   });
 
-  it("does not navigate to A's generated task while project B is still loading", async () => {
+  it("does not navigate to A's explicit task while project B is still loading", async () => {
     const { getState, otherProject } = await projectIsolationHarness(true);
     const generated = deferred<unknown>();
     const loading = deferred<ProjectManifest>();
     const original = vi.mocked(invoke).getMockImplementation()!;
     vi.mocked(invoke).mockImplementation((command, args) => {
-      if (command === "generate_codex_prompt") return generated.promise;
+      if (command === "create_codex_task") return generated.promise;
       if (command === "load_project" && (args as { projectRoot: string }).projectRoot === otherProject.rootDir) return loading.promise;
       return original(command, args);
     });
     fireEvent.click(screen.getByRole("button", { name: "生成新任务" }));
+    fireEvent.change(screen.getByLabelText("任务标题"), { target: { value: "任务 A" } });
+    fireEvent.change(screen.getByLabelText("任务说明"), { target: { value: "只做 A。" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建任务" }));
     let opening!: Promise<void>;
     act(() => { opening = getState().openProject(otherProject.rootDir); });
-    await act(async () => { generated.resolve({ manifest, prompt: { id: "task-a", promptText: "project A only" } }); });
+    await act(async () => { generated.resolve({ taskId: "task-a", projectId: project.id, title: "任务 A", prompt: "project A only" }); });
     const queryDuringLoad = screen.getByTestId("route-query").textContent;
     await act(async () => { loading.resolve({ ...manifest, project: otherProject }); await opening; });
     expect(queryDuringLoad).not.toContain("task-a");

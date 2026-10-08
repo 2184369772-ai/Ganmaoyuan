@@ -1,19 +1,19 @@
 use crate::{
     deepseek, launch_inbox,
     models::{
-        BackupRestoreResult, CleanupExecutionBatch, CleanupPlan, CleanupPlanReviewFilter,
-        CodexPromptResult, CodexReportApplyResult, CodexReportImportResult,
-        CodexResultBridgeScanResult, CodexRun, CodexTask, CodexTaskList, DailyContinueSnapshot,
-        DeepSeekConnectionResult, DeepSeekModelInfo, DeepSeekSettings, ExecutionRecord,
-        FileProjection, FinishWorkResult, GeneratedFileResult, GitSnapshot, GlobalManagedFile,
-        GlobalSearchResult, ImportResult, InboxRoutingSettings, LocalBackupResult,
-        MaterialInboxItem, MaterialInboxRouteResult, MemoItem, MessageResult,
-        PrivacyArtifactsResult, ProjectActionCandidate, ProjectAttention, ProjectContextPacket,
-        ProjectCreateResult, ProjectFactCaptureRequest, ProjectImpactAnalysis, ProjectManifest,
-        ProjectMigrationResult, ProjectStateProposal, ProjectSummary, SafeExportResult,
-        TodayWorkspace, WeeklyReportExportResult, WeeklyReportRecord, WeeklyReviewDashboard,
-        WeeklyReviewSettings, WorkEvent, WorkLedgerSnapshot, WorkspaceConfig, WorkspaceDraft,
-        WorkspaceScanBatch,
+        BackupRestoreResult, ChatAttachmentData, ChatImageAttachmentInput, CleanupExecutionBatch,
+        CleanupPlan, CleanupPlanReviewFilter, CodexPromptResult, CodexReportApplyResult,
+        CodexReportImportResult, CodexResultBridgeScanResult, CodexRun, CodexTask,
+        CodexTaskCreateRequest, CodexTaskList, DailyContinueSnapshot, DeepSeekConnectionResult,
+        DeepSeekModelInfo, DeepSeekSettings, ExecutionRecord, FileProjection, FinishWorkResult,
+        GeneratedFileResult, GitSnapshot, GlobalManagedFile, GlobalSearchResult, ImportResult,
+        InboxRoutingSettings, LocalBackupResult, MaterialInboxItem, MaterialInboxRouteResult,
+        MemoItem, MessageResult, PrivacyArtifactsResult, ProjectActionCandidate, ProjectAttention,
+        ProjectContextPacket, ProjectCreateResult, ProjectFactCaptureRequest,
+        ProjectFactSyncResult, ProjectImpactAnalysis, ProjectManifest, ProjectMigrationResult,
+        ProjectStateProposal, ProjectSummary, SafeExportResult, TodayWorkspace,
+        WeeklyReportExportResult, WeeklyReportRecord, WeeklyReviewDashboard, WeeklyReviewSettings,
+        WorkEvent, WorkLedgerSnapshot, WorkspaceConfig, WorkspaceDraft, WorkspaceScanBatch,
     },
     project_service, release_service,
     storage::{append_json_line, path_to_string},
@@ -28,6 +28,12 @@ use std::{
     process::Command,
 };
 use tauri::Runtime;
+
+#[derive(serde::Serialize)]
+pub struct ProjectWorkspaceScanResult {
+    pub manifest: ProjectManifest,
+    pub changed: bool,
+}
 #[cfg(target_os = "windows")]
 use windows::{
     core::{HRESULT, PCWSTR},
@@ -40,6 +46,14 @@ use windows::{
 #[tauri::command]
 pub fn list_projects<R: Runtime>(app: tauri::AppHandle<R>) -> Result<Vec<ProjectSummary>, String> {
     project_service::list_projects(&app)
+}
+
+#[tauri::command]
+pub fn mark_project_opened<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    project_root: String,
+) -> Result<ProjectSummary, String> {
+    project_service::mark_project_opened(&app, project_root)
 }
 
 #[tauri::command]
@@ -250,8 +264,14 @@ pub async fn send_project_message<R: Runtime>(
     app: tauri::AppHandle<R>,
     project_root: String,
     text: String,
+    image_attachments: Option<Vec<ChatImageAttachmentInput>>,
 ) -> Result<MessageResult, String> {
-    let initial = project_service::prepare_project_message(&app, project_root.clone(), text)?;
+    let initial = project_service::prepare_project_message(
+        &app,
+        project_root.clone(),
+        text,
+        image_attachments.unwrap_or_default(),
+    )?;
     let message_id = initial.stream_message_id.clone();
     let model_id = initial
         .messages
@@ -293,6 +313,14 @@ pub async fn send_project_message<R: Runtime>(
 }
 
 #[tauri::command]
+pub fn read_chat_attachment(
+    project_root: String,
+    relative_path: String,
+) -> Result<ChatAttachmentData, String> {
+    project_service::read_chat_attachment(project_root, relative_path)
+}
+
+#[tauri::command]
 pub fn stop_project_message(project_root: String) -> Result<(), String> {
     deepseek::stop_stream(&project_root);
     Ok(())
@@ -319,6 +347,14 @@ pub fn finish_project_work(
 #[tauri::command]
 pub fn generate_codex_prompt(project_root: String) -> Result<CodexPromptResult, String> {
     project_service::generate_codex_prompt(project_root)
+}
+
+#[tauri::command]
+pub fn create_codex_task(
+    project_root: String,
+    request: CodexTaskCreateRequest,
+) -> Result<CodexTask, String> {
+    project_service::create_codex_task(project_root, request)
 }
 
 #[tauri::command]
@@ -408,8 +444,23 @@ pub fn get_work_ledger(project_root: String) -> Result<WorkLedgerSnapshot, Strin
 }
 
 #[tauri::command]
+pub fn synchronize_project_facts<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    project_root: String,
+) -> Result<ProjectFactSyncResult, String> {
+    project_service::synchronize_project_facts(&app, project_root)
+}
+
+#[tauri::command]
 pub fn get_project_context_packet(project_root: String) -> Result<ProjectContextPacket, String> {
     project_service::get_project_context_packet(project_root)
+}
+
+#[tauri::command]
+pub fn get_current_project_context_packet(
+    project_root: String,
+) -> Result<ProjectContextPacket, String> {
+    project_service::get_current_project_context_packet(project_root)
 }
 
 #[tauri::command]
@@ -517,9 +568,9 @@ pub async fn refresh_project_understanding<R: Runtime>(
 }
 
 #[tauri::command]
-pub fn scan_project_workspace(project_root: String) -> Result<ProjectManifest, String> {
-    let (manifest, _, _) = project_service::scan_project_workspace(&project_root)?;
-    Ok(manifest)
+pub fn scan_project_workspace(project_root: String) -> Result<ProjectWorkspaceScanResult, String> {
+    let (manifest, changed, _) = project_service::scan_project_workspace(&project_root)?;
+    Ok(ProjectWorkspaceScanResult { manifest, changed })
 }
 
 #[tauri::command]
@@ -977,6 +1028,23 @@ pub fn get_today_workspace<R: Runtime>(app: tauri::AppHandle<R>) -> Result<Today
 }
 
 #[tauri::command]
+pub fn refresh_today_workspace<R: Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<TodayWorkspace, String> {
+    project_service::refresh_today_workspace(&app)
+}
+
+#[tauri::command]
+pub fn update_continue_project_preference<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    project_id: String,
+    pinned: Option<bool>,
+    snoozed_until: Option<String>,
+) -> Result<TodayWorkspace, String> {
+    project_service::update_continue_project_preference(&app, project_id, pinned, snoozed_until)
+}
+
+#[tauri::command]
 pub fn update_project_attention<R: Runtime>(
     app: tauri::AppHandle<R>,
     project_root: String,
@@ -1131,7 +1199,17 @@ fn record_open_folder_debug(
 fn open_folder_debug_log_path() -> PathBuf {
     let root = std::env::var_os("GANMAOYUAN_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"D:\GanMaoYuan\AppData"));
+        .unwrap_or_else(|| {
+            let legacy = PathBuf::from(r"D:\GanMaoYuan\AppData");
+            if legacy.exists() {
+                legacy
+            } else {
+                std::env::var_os("APPDATA")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("com.ganmaoyuan.desktop")
+            }
+        });
     let _ = fs::create_dir_all(&root);
     root.join("open-folder-debug.jsonl")
 }

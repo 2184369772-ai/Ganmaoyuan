@@ -1,7 +1,7 @@
 ﻿param(
     [string]$RepoRoot = "",
-    [string]$OutputDir = "D:\GanMaoYuan\Diagnostics",
-    [string]$ProjectRoot = "D:\GanMaoYuan\SelfProject",
+    [string]$OutputDir = "",
+    [string]$ProjectRoot = "",
     [switch]$JsonOnly
 )
 
@@ -141,6 +141,22 @@ if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = Split-Path -Parent $PSScriptRoot
 }
 $RepoRoot = Resolve-FullPath $RepoRoot
+$legacyDataDir = "D:\GanMaoYuan\AppData"
+$globalDataDir = if (-not [string]::IsNullOrWhiteSpace($env:GANMAOYUAN_DATA_DIR)) {
+    Resolve-FullPath $env:GANMAOYUAN_DATA_DIR
+} elseif (Test-Path -LiteralPath $legacyDataDir) {
+    $legacyDataDir
+} else {
+    Join-Path ([Environment]::GetFolderPath("ApplicationData")) "com.ganmaoyuan.desktop"
+}
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $diagnosticsRoot = if (Test-Path -LiteralPath $legacyDataDir) {
+        Split-Path -Parent $legacyDataDir
+    } else {
+        $globalDataDir
+    }
+    $OutputDir = Join-Path $diagnosticsRoot "Diagnostics"
+}
 $OutputDir = Resolve-FullPath $OutputDir
 $ProjectRoot = Resolve-FullPath $ProjectRoot
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -153,8 +169,12 @@ $cargoTomlPath = Join-Path $RepoRoot "src-tauri\Cargo.toml"
 $releaseExe = Join-Path $RepoRoot "src-tauri\target\release\app.exe"
 $nsisInstaller = Join-Path $RepoRoot "src-tauri\target\release\bundle\nsis\Ganmaoyuan_0.1.1_x64-setup.exe"
 $msiInstaller = Join-Path $RepoRoot "src-tauri\target\release\bundle\msi\Ganmaoyuan_0.1.1_x64_en-US.msi"
-$globalDataDir = "D:\GanMaoYuan\AppData"
-$workspaceRoot = "D:\GanMaoYuan_Workspace"
+$legacyWorkspaceRoot = "D:\GanMaoYuan_Workspace"
+$workspaceRoot = if (Test-Path -LiteralPath $legacyWorkspaceRoot) {
+    $legacyWorkspaceRoot
+} else {
+    Join-Path $globalDataDir "GanMaoYuan_Workspace"
+}
 $sendToPath = Join-Path $env:APPDATA "Microsoft\Windows\SendTo\感冒院.lnk"
 $desktopCandidates = @(
     (Join-Path ([Environment]::GetFolderPath("Desktop")) "感冒院.lnk"),
@@ -165,18 +185,23 @@ $desktopCandidates = @(
 
 $packageJson = Read-JsonFile $packageJsonPath
 $tauriConfig = Read-JsonFile $tauriConfigPath
-$projectManifestPath = Join-Path $ProjectRoot ".ganmaoyuan\project-location-manifest.json"
-$projectManifest = Read-JsonFile $projectManifestPath
+$projectManifestPath = if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    $null
+} else {
+    Join-Path $ProjectRoot ".ganmaoyuan\project-location-manifest.json"
+}
+$projectManifest = if ($projectManifestPath) { Read-JsonFile $projectManifestPath } else { $null }
+$projectManifestExists = $projectManifestPath -and (Test-Path -LiteralPath $projectManifestPath)
 $registryPath = Join-Path $globalDataDir "projects.json"
 $registry = Read-JsonFile $registryPath
 
 $desktopShortcuts = @($desktopCandidates | ForEach-Object { Get-LnkTarget $_ } | Where-Object { $_ })
 $sendToShortcut = Get-LnkTarget $sendToPath
-$secretSignals = Find-SecretSignals @(
-    $RepoRoot,
-    $globalDataDir,
-    (Join-Path $ProjectRoot ".ganmaoyuan")
-)
+$secretScanPaths = @($RepoRoot, $globalDataDir)
+if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    $secretScanPaths += (Join-Path $ProjectRoot ".ganmaoyuan")
+}
+$secretSignals = Find-SecretSignals $secretScanPaths
 
 $checks = @()
 $checks += New-Check "package.json exists" (Test-Path -LiteralPath $packageJsonPath) $packageJsonPath
@@ -187,7 +212,7 @@ $checks += New-Check "NSIS installer exists" (Test-Path -LiteralPath $nsisInstal
 $checks += New-Check "MSI installer exists" (Test-Path -LiteralPath $msiInstaller) $msiInstaller "warning"
 $checks += New-Check "global AppData exists" (Test-Path -LiteralPath $globalDataDir) $globalDataDir
 $checks += New-Check "workspace root exists" (Test-Path -LiteralPath $workspaceRoot) $workspaceRoot "warning"
-$checks += New-Check "project manifest exists" (Test-Path -LiteralPath $projectManifestPath) $projectManifestPath
+$checks += New-Check "project manifest exists" $projectManifestExists $(if ($projectManifestPath) { $projectManifestPath } else { "not requested" }) "warning"
 $checks += New-Check "registry contains projects" (($registry.projects | Measure-Object).Count -gt 0) $registryPath "warning"
 $checks += New-Check "desktop shortcut target exists" (@($desktopShortcuts | Where-Object { $_.targetExists }).Count -gt 0) (($desktopShortcuts | ConvertTo-Json -Depth 4 -Compress)) "warning"
 $checks += New-Check "SendTo shortcut target exists" ($null -ne $sendToShortcut -and $sendToShortcut.targetExists) ($sendToShortcut | ConvertTo-Json -Depth 4 -Compress) "warning"

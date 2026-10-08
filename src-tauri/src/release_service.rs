@@ -115,7 +115,7 @@ pub fn create_local_backup<R: Runtime>(
     let registry = project_service::read_registry(app)?;
     let roots = resolve_project_roots(&registry, project_roots);
     let destination_parent = if destination_dir.trim().is_empty() {
-        PathBuf::from(r"D:\GanMaoYuan\Backups")
+        default_release_directory(&global_dir, "Backups")
     } else {
         canonical_project_root(Path::new(&destination_dir))?
     };
@@ -135,7 +135,7 @@ pub fn restore_local_backup<R: Runtime>(
     let global_dir = global_data_dir(app)?;
     let backup_root = PathBuf::from(&backup_dir);
     let restore_base = if restore_projects_base_dir.trim().is_empty() {
-        canonical_project_root(Path::new(r"D:\GanMaoYuan\RestoredProjects"))?
+        canonical_project_root(&default_release_directory(&global_dir, "RestoredProjects"))?
     } else {
         canonical_project_root(Path::new(&restore_projects_base_dir))?
     };
@@ -301,7 +301,7 @@ pub fn generate_privacy_artifacts<R: Runtime>(
 ) -> Result<PrivacyArtifactsResult, String> {
     let global_dir = global_data_dir(app)?;
     let destination_parent = if destination_dir.trim().is_empty() {
-        canonical_project_root(Path::new(r"D:\GanMaoYuan\Diagnostics"))?
+        canonical_project_root(&default_release_directory(&global_dir, "Diagnostics"))?
     } else {
         canonical_project_root(Path::new(&destination_dir))?
     };
@@ -323,6 +323,7 @@ pub fn generate_privacy_artifacts<R: Runtime>(
     let registry = project_service::read_registry(app).unwrap_or(AppRegistry {
         schema_version: crate::models::MANIFEST_SCHEMA_VERSION,
         projects: Vec::new(),
+        continue_preferences: Vec::new(),
     });
     let deepseek_settings: DeepSeekSettings = if global_dir.join(DEEPSEEK_SETTINGS_FILE).exists() {
         read_json(&global_dir.join(DEEPSEEK_SETTINGS_FILE)).unwrap_or_default()
@@ -497,6 +498,7 @@ fn restore_local_backup_from_paths(
         AppRegistry {
             schema_version: crate::models::MANIFEST_SCHEMA_VERSION,
             projects: Vec::new(),
+            continue_preferences: Vec::new(),
         }
     };
     registry.schema_version = crate::models::MANIFEST_SCHEMA_VERSION;
@@ -835,6 +837,17 @@ fn same_path(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(path_to_string(right).trim_end_matches(['\\', '/']))
 }
 
+fn default_release_directory(global_dir: &Path, name: &str) -> PathBuf {
+    let legacy_data_dir = Path::new(r"D:\GanMaoYuan\AppData");
+    if same_path(global_dir, legacy_data_dir) {
+        return global_dir
+            .parent()
+            .map(|parent| parent.join(name))
+            .unwrap_or_else(|| global_dir.join(name));
+    }
+    global_dir.join(name)
+}
+
 const PRIVACY_NOTICE: &str = r#"# Ganmaoyuan Privacy Notice
 
 - 感冒院 v0.1 仅面向本机项目使用，不做云同步、在线更新或公开远程仓库写回。
@@ -917,6 +930,7 @@ mod tests {
                     description: String::new(),
                     repository_path: String::new(),
                 }],
+                continue_preferences: Vec::new(),
             },
         )
         .unwrap();
@@ -1117,6 +1131,7 @@ mod tests {
                     managed_path: path_to_string(
                         &old_root.join(".ganmaoyuan/managed/02_requirements/demo.txt"),
                     ),
+                    ..crate::models::MessageAttachment::default()
                 }],
                 ..WorkspaceMessage::default()
             }],
