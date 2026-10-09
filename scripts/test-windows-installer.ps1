@@ -116,8 +116,12 @@ try {
         Accept = 'application/vnd.github+json'
         'X-GitHub-Api-Version' = $apiVersion
     }
-    $releaseUri = "https://api.github.com/repos/$Repository/releases/tags/$ReleaseTag"
-    $release = Invoke-RestMethod -Method Get -Uri $releaseUri -Headers $headers
+    $releaseUri = "https://api.github.com/repos/$Repository/releases?per_page=100"
+    $releaseList = @(Invoke-RestMethod -Method Get -Uri $releaseUri -Headers $headers)
+    $release = $releaseList | Where-Object { $_.tag_name -eq $ReleaseTag } | Select-Object -First 1
+    if (-not $release) {
+        throw "Release tag '$ReleaseTag' was not found in the repository's release list."
+    }
     if (-not $release.draft) {
         throw "Expected a Draft Release; $ReleaseTag is not draft."
     }
