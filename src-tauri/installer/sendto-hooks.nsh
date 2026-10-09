@@ -1,12 +1,14 @@
-; Keep the SendTo integration without replacing Tauri's generated installer.
-; Tauri supplies $INSTDIR and ${MAINBINARYNAME} at bundle time.
+; Let the application manage its SendTo shortcut so it can verify ownership
+; before updating or removing an existing link.
 
 !macro NSIS_HOOK_POSTINSTALL
-  Delete "$SENDTO\Ganmaoyuan.lnk"
-  CreateShortcut "$SENDTO\感冒院.lnk" "$INSTDIR\${MAINBINARYNAME}.exe" "--shell-source windowsSendTo"
+  Push $0
+  ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --register-sendto' $0
+  Pop $0
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  Delete "$SENDTO\感冒院.lnk"
-  Delete "$SENDTO\Ganmaoyuan.lnk"
+  Push $0
+  ExecWait '"$INSTDIR\${MAINBINARYNAME}.exe" --unregister-sendto' $0
+  Pop $0
 !macroend
