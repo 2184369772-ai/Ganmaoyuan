@@ -216,7 +216,7 @@ pub fn export_weekly_report<R: Runtime>(
         .find(|item| item.id == report_id)
         .ok_or_else(|| "周报记录不存在。".to_string())?;
     let destination = if destination_dir.trim().is_empty() {
-        PathBuf::from(r"D:\GanMaoYuan\Exports")
+        crate::release_service::default_release_directory(&global_data_dir(app)?, "Exports")
     } else {
         PathBuf::from(destination_dir)
     };

@@ -239,7 +239,7 @@ describe("Workspace activity language", () => {
     expect(projectAnalysisStatusLabel("success")).toBe("已整理");
     expect(sanitizeWorkspacePublicText("codex-task-1234.md", "task")).toBe("已保存 Codex 任务记录。");
     expect(sanitizeWorkspacePublicText("Result Bridge updated taskId: 1234", "codex")).toBe("Codex 工作记录已更新。");
-    expect(sanitizeWorkspacePublicText("D:\\GanMaoYuan\\SelfProject\\internal.json", "monitor")).toBe("相关资料已更新。");
+    expect(sanitizeWorkspacePublicText("D:\\Example\\Workspace\\internal.json", "monitor")).toBe("相关资料已更新。");
   });
 });
 

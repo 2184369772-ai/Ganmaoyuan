@@ -838,11 +838,12 @@ pub fn migrate_project_root<R: Runtime>(
 }
 
 #[tauri::command]
-pub fn export_project_safe(
+pub fn export_project_safe<R: Runtime>(
+    app: tauri::AppHandle<R>,
     project_root: String,
     destination_dir: String,
 ) -> Result<SafeExportResult, String> {
-    release_service::export_project_safe(project_root, destination_dir)
+    release_service::export_project_safe(&app, project_root, destination_dir)
 }
 
 #[tauri::command]

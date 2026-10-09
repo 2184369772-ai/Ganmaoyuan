@@ -2,47 +2,29 @@
 
 ## Pick up where you left off.
 
-Ganmaoyuan is a local-first Windows workspace for people who work across project files, decisions, and code. Reopen a project, recover the latest recorded context, organize files safely, and continue with a task you can verify.
+Ganmaoyuan is a local-first Windows workspace for continuing work across project files, decisions, and code. Reopen a project, review its recorded context, and continue with a task grounded in facts you can inspect.
 
-**Files, project context, and Codex tasks — connected in one traceable workflow.**
+**Files, project context, and Codex tasks in one traceable workflow.**
 
-> **Product hero placeholder** — Replace this with an authentic screenshot from the current Windows build using sanitized demo data. No mockup is presented as a product screenshot.
+[Source](https://github.com/2184369772-ai/Ganmaoyuan) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md) · [Releases](https://github.com/2184369772-ai/Ganmaoyuan/releases)
 
-<!-- Future embed: ![Ganmaoyuan desktop workspace](docs/media/ganmaoyuan-hero.png) -->
+## Three connected workflows
 
-[Explore the source](https://github.com/2184369772-ai/Ganmaoyuan) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md) · [Releases](https://github.com/2184369772-ai/Ganmaoyuan/releases)
+### Organize project files safely
 
-## What you can do
+Import files or scan a workspace, review classification and proposed locations, then approve a cleanup plan. Ganmaoyuan creates managed copies; it does not automatically move or delete source files. Search, duplicate/version relationships, audit history, and Undo keep file operations traceable.
 
-### Organize files without losing the originals
+### Resume from recorded project context
 
-Bring files into Inbox or scan a workspace. Review their classification and proposed location, then approve a cleanup plan. Ganmaoyuan creates managed copies; it does not automatically move or delete source files. Search, duplicate/version relationships, audit history, and Undo help keep the process traceable.
+Project context brings together recorded work, currently valid actions, user decisions, and Git facts. Continue Work and the Project Context Packet distinguish known facts from suggestions, so an old summary is not presented as a confirmed current plan.
 
-> **Feature image placeholder — File organization.** Planned real capture: Inbox or scan results, a reviewed location proposal, and the safe-copy/Undo boundary. Use sanitized filenames and paths.
+### Run a project-scoped Codex task
 
-<!-- Future embed: ![Review a safe file organization plan](docs/media/file-organization.png) -->
+Create a project-bound task and, when configured, run it through the local Codex CLI. Result Bridge imports output for that task; Git verification and human acceptance provide additional evidence. A process exit alone does not mean a task is complete.
 
-### Return to a project with its recorded context
+## Product walkthrough
 
-Project state is assembled from recorded work, current actions, user decisions, and Git facts. Continue Work and the Project Context Packet help you see what is known without treating an AI suggestion or an old summary as a confirmed fact.
-
-> **Feature image placeholder — Project continuity.** Planned real capture: a project workspace showing recent recorded activity, current valid actions, and its context packet.
-
-<!-- Future embed: ![Recover project context](docs/media/project-continuity.png) -->
-
-### Hand a scoped task to local Codex CLI
-
-Create a project-bound Codex task and, when configured, run it through the local Codex CLI. Result Bridge imports task-bound output; Git verification and a human acceptance step provide additional evidence. A process exit alone is not treated as task completion.
-
-> **Feature image placeholder — Codex task.** Planned real capture: a genuine task and its actual result/acceptance state. Do not use seeded success records or imply an unverified run completed.
-
-<!-- Future embed: ![Review a Codex task result](docs/media/codex-task.png) -->
-
-## Demo
-
-> **30–45 second demo placeholder** — Record a real desktop walkthrough with a sanitized project: reopen a recent project → review its current context and recent facts → find a reference file → inspect a real Codex task/result state. Show result acceptance only after a genuine end-to-end run has been verified.
-
-<!-- Future embed: ![Ganmaoyuan product demo](docs/media/ganmaoyuan-demo.mp4) -->
+The [30–45 second demo storyboard](docs/PROMO_DEMO_STORYBOARD.md) describes a real, concise walkthrough. No fabricated screenshots or unverified completion records are presented here.
 
 ## Quickstart
 
@@ -52,12 +34,12 @@ Create a project-bound Codex task and, when configured, run it through the local
 - Node.js 20+ and Rust 1.77.2+ to build from source
 - Codex CLI installed and signed in only if you want to start local Codex tasks
 
-There is no verified Windows installer or downloadable release yet. The Releases link above is an entry point for a future verified package, not a claim that one is currently available.
+The Releases page is the source of truth for downloadable builds. A locally built or draft package is not a public release; wait for a verified, published release before installing it as a user.
 
 ### Run from source
 
 ```bash
-npm install
+npm ci
 npm run tauri:dev
 ```
 
@@ -67,12 +49,12 @@ npm run tauri:dev
 npm test
 npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
-npm run tauri build
+npm run tauri -- build
 ```
 
 ## Current status and limitations
 
-- The source is public and the Windows desktop executable has been built locally; a verified installer and GitHub Release have not been published.
+- The source is public. Windows packages are published only after installation and data-safety validation; check the Releases page for current availability.
 - Core file and project-continuity paths have automated coverage. A clean, current-build desktop Codex CLI run through result return, Git verification, and human acceptance still needs real end-to-end verification.
 - Codex execution depends on the user's local CLI installation and authentication. AI/provider access may require local configuration.
 - The app is an evolving personal project. It has no hosted service, account system, or cloud sync.

@@ -1135,9 +1135,7 @@ mod tests {
             title: "新的黄金文件检查".to_string(),
             status: "completed".to_string(),
             created_at: "200".to_string(),
-            target_files: vec![
-                "D:/GanMaoYuan/Website-Clone/docs/codex-golden-path-test.md".to_string()
-            ],
+            target_files: vec!["D:/Example/Repository/docs/codex-golden-path-test.md".to_string()],
             acceptance: crate::models::CodexTaskAcceptance {
                 status: "approved".to_string(),
                 ..crate::models::CodexTaskAcceptance::default()
