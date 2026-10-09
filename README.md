@@ -2,6 +2,10 @@
 
 ## Pick up where you left off.
 
+[Download the Windows Beta v0.1.1](https://github.com/2184369772-ai/Ganmaoyuan/releases/tag/v0.1.1)
+
+> Personal-project Beta. The installer is **unsigned** and has **not been independently tested for Windows installation or uninstallation**. Please use fictional or disposable test data only; do not use it for important work materials. See the [release notes and installer](https://github.com/2184369772-ai/Ganmaoyuan/releases/tag/v0.1.1).
+
 Ganmaoyuan is a local-first Windows workspace for continuing work across project files, decisions, and code. Reopen a project, review its recorded context, and continue with a task grounded in facts you can inspect.
 
 **Files, project context, and Codex tasks in one traceable workflow.**
@@ -28,22 +32,30 @@ The [30–45 second demo storyboard](docs/PROMO_DEMO_STORYBOARD.md) describes a 
 
 ## Quickstart
 
+### Download and try the Windows Beta
+
+1. Download the [Ganmaoyuan v0.1.1 Windows x64 installer](https://github.com/2184369772-ai/Ganmaoyuan/releases/download/v0.1.1/Ganmaoyuan_0.1.1_x64-setup.exe) from the public [Release page](https://github.com/2184369772-ai/Ganmaoyuan/releases/tag/v0.1.1).
+2. The installer is unsigned, so Windows may show an unknown-publisher warning. Continue only if you are comfortable testing an unsigned Beta.
+3. Try it with fictional or disposable project data. Do not use important work materials; independent Windows install/uninstall validation has not been completed.
+
+### Build from source (developers)
+
+Use this path if you want to inspect or develop the source rather than install the Beta.
+
 ### Requirements
 
 - Windows 10 or 11 and WebView2 Runtime
 - Node.js 20+ and Rust 1.77.2+ to build from source
 - Codex CLI installed and signed in only if you want to start local Codex tasks
 
-The Releases page is the source of truth for downloadable builds. A locally built or draft package is not a public release; wait for a verified, published release before installing it as a user.
-
-### Run from source
-
 ```bash
+git clone https://github.com/2184369772-ai/Ganmaoyuan.git
+cd Ganmaoyuan
 npm ci
 npm run tauri:dev
 ```
 
-### Validate and build
+To validate and build:
 
 ```bash
 npm test
@@ -54,7 +66,7 @@ npm run tauri -- build
 
 ## Current status and limitations
 
-- The source is public. Windows packages are published only after installation and data-safety validation; check the Releases page for current availability.
+- The v0.1.1 Windows x64 package is publicly available as a personal-project Beta. It is unsigned and has not passed independent Windows installation/uninstallation or interactive GUI validation. Use test data only, not important work materials.
 - Core file and project-continuity paths have automated coverage. A clean, current-build desktop Codex CLI run through result return, Git verification, and human acceptance still needs real end-to-end verification.
 - Codex execution depends on the user's local CLI installation and authentication. AI/provider access may require local configuration.
 - The app is an evolving personal project. It has no hosted service, account system, or cloud sync.
