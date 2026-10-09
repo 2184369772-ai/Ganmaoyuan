@@ -6,6 +6,9 @@
 
 > Personal-project Beta. The installer is **unsigned** and has **not been independently tested for Windows installation or uninstallation**. Please use fictional or disposable test data only; do not use it for important work materials. See the [release notes and installer](https://github.com/2184369772-ai/Ganmaoyuan/releases/tag/v0.1.1).
 
+<p align="center"><img src="docs/images/hero-github.png" alt="Ganmaoyuan promotional hero visual" width="100%"></p>
+<p align="center"><sub>Promotional hero visual; the application window is illustrative.</sub></p>
+
 Ganmaoyuan is a local-first Windows workspace for continuing work across project files, decisions, and code. Reopen a project, review its recorded context, and continue with a task grounded in facts you can inspect.
 
 **Files, project context, and Codex tasks in one traceable workflow.**
@@ -22,13 +25,19 @@ Import files or scan a workspace, review classification and proposed locations, 
 
 Project context brings together recorded work, currently valid actions, user decisions, and Git facts. Continue Work and the Project Context Packet distinguish known facts from suggestions, so an old summary is not presented as a confirmed current plan.
 
+<p align="center"><img src="docs/images/workflow-project-context.png" alt="AI-generated project continuity concept image" width="100%"></p>
+<p align="center"><sub>AI-generated promotional concept image; not a real running screenshot, test evidence, or real project record.</sub></p>
+
 ### Run a project-scoped Codex task
 
 Create a project-bound task and, when configured, run it through the local Codex CLI. Result Bridge imports output for that task; Git verification and human acceptance provide additional evidence. A process exit alone does not mean a task is complete.
 
+<p align="center"><img src="docs/images/workflow-codex-acceptance.png" alt="AI-generated Codex task workflow concept image" width="100%"></p>
+<p align="center"><sub>AI-generated promotional concept image; not a real running screenshot, test evidence, or real task record.</sub></p>
+
 ## Product walkthrough
 
-The [30–45 second demo storyboard](docs/PROMO_DEMO_STORYBOARD.md) describes a real, concise walkthrough. No fabricated screenshots or unverified completion records are presented here.
+The [30–45 second demo storyboard](docs/PROMO_DEMO_STORYBOARD.md) describes a real, concise walkthrough. The concept images above are labeled as illustrations, not screenshots or verification evidence.
 
 ## Quickstart
 
