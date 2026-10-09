@@ -17,7 +17,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use tauri::Runtime;
+use tauri::{AppHandle, Runtime};
 
 const BACKUP_SCHEMA_VERSION: u32 = 1;
 const BACKUP_MANIFEST_FILE: &str = "backup-bundle.json";
@@ -198,14 +198,28 @@ pub fn migrate_project_root<R: Runtime>(
     })
 }
 
-pub fn export_project_safe(
+pub fn export_project_safe<R: Runtime>(
+    app: &AppHandle<R>,
     project_root: String,
     destination_dir: String,
+) -> Result<SafeExportResult, String> {
+    let global_dir = global_data_dir(app)?;
+    export_project_safe_with_default(
+        project_root,
+        destination_dir,
+        &default_release_directory(&global_dir, "Exports"),
+    )
+}
+
+fn export_project_safe_with_default(
+    project_root: String,
+    destination_dir: String,
+    default_destination_dir: &Path,
 ) -> Result<SafeExportResult, String> {
     let root = PathBuf::from(&project_root);
     let manifest = project_service::read_and_repair_manifest(&root)?;
     let destination_parent = if destination_dir.trim().is_empty() {
-        canonical_project_root(Path::new(r"D:\GanMaoYuan\Exports"))?
+        canonical_project_root(default_destination_dir)?
     } else {
         canonical_project_root(Path::new(&destination_dir))?
     };
@@ -837,7 +851,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(path_to_string(right).trim_end_matches(['\\', '/']))
 }
 
-fn default_release_directory(global_dir: &Path, name: &str) -> PathBuf {
+pub(crate) fn default_release_directory(global_dir: &Path, name: &str) -> PathBuf {
     let legacy_data_dir = Path::new(r"D:\GanMaoYuan\AppData");
     if same_path(global_dir, legacy_data_dir) {
         return global_dir
@@ -854,7 +868,7 @@ const PRIVACY_NOTICE: &str = r#"# Ganmaoyuan Privacy Notice
 - DeepSeek API Key 保存在 Windows Credential Manager，不写入源码、项目 JSON、备份、导出或诊断日志。
 - 发送到 DeepSeek 的内容仅限项目说明、项目理解、文件摘要、关键历史和当前问题，不上传原始文件。
 - 安全备份、项目导出和诊断日志默认排除原始文件正文提取内容、调试事件日志和凭据。
-- Atlas 评估保持只读，不会自动修改 D:\Atlas。
+- 外部资料评估保持只读，不会自动修改外部目录。
 "#;
 
 const THIRD_PARTY_NOTICES: &str = r#"# Third Party Notices
@@ -1081,9 +1095,15 @@ mod tests {
         };
         project_service::persist_project(&project_root, &manifest, None).unwrap();
 
-        let export_result =
-            export_project_safe(path_to_string(&project_root), path_to_string(&root)).unwrap();
+        let default_export_root = root.join("app-data/Exports");
+        let export_result = export_project_safe_with_default(
+            path_to_string(&project_root),
+            String::new(),
+            &default_export_root,
+        )
+        .unwrap();
         let export_dir = PathBuf::from(export_result.export_dir);
+        assert!(export_dir.starts_with(&default_export_root));
         let conversations: serde_json::Value =
             read_json(&export_dir.join("conversations.json")).unwrap();
         let file_index: serde_json::Value = read_json(&export_dir.join("file-index.json")).unwrap();
@@ -1102,9 +1122,24 @@ mod tests {
     }
 
     #[test]
+    fn release_directories_follow_app_data_except_for_legacy_data_location() {
+        let app_data = PathBuf::from(r"C:\Users\test\AppData\Roaming\com.ganmaoyuan.desktop");
+        assert_eq!(
+            default_release_directory(&app_data, "Exports"),
+            app_data.join("Exports")
+        );
+
+        let legacy_app_data = PathBuf::from(r"D:\GanMaoYuan\AppData");
+        assert_eq!(
+            default_release_directory(&legacy_app_data, "Exports"),
+            PathBuf::from(r"D:\GanMaoYuan\Exports")
+        );
+    }
+
+    #[test]
     fn rewrite_manifest_root_paths_updates_nested_absolute_paths() {
-        let old_root = PathBuf::from(r"D:\GanMaoYuan\Tests\old-project");
-        let new_root = PathBuf::from(r"D:\GanMaoYuan\Tests\new-project");
+        let old_root = PathBuf::from(r"D:\Example\Tests\old-project");
+        let new_root = PathBuf::from(r"D:\Example\Tests\new-project");
         let mut manifest = ProjectManifest {
             project: ProjectSummary {
                 id: "project-3".to_string(),

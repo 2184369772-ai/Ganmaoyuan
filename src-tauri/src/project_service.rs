@@ -12202,8 +12202,16 @@ fn controlled_category(value: &str, file_type: &str) -> String {
     }
 }
 
+fn atlas_root_from_config(configured: Option<PathBuf>) -> PathBuf {
+    configured.unwrap_or_else(|| PathBuf::from(r"D:\Atlas"))
+}
+
+fn atlas_root_path() -> PathBuf {
+    atlas_root_from_config(std::env::var_os("GANMAOYUAN_ATLAS_ROOT").map(PathBuf::from))
+}
+
 fn assess_atlas_read_only(_root: &Path, manifest: &ProjectManifest) -> AtlasAssessment {
-    let atlas_root = PathBuf::from(r"D:\Atlas");
+    let atlas_root = atlas_root_path();
     let mut assessment = AtlasAssessment {
         atlas_version: String::new(),
         status: "unavailable".to_string(),
@@ -12217,7 +12225,8 @@ fn assess_atlas_read_only(_root: &Path, manifest: &ProjectManifest) -> AtlasAsse
     };
 
     if !atlas_root.exists() {
-        assessment.failure_reason = "D:\\Atlas 不存在，无法执行只读核验。".to_string();
+        assessment.failure_reason =
+            format!("Atlas 本地仓库不可用：{}", path_to_string(&atlas_root));
         assessment
             .uncovered_parts
             .push("Atlas 本地仓库不可用。".to_string());
@@ -12231,8 +12240,7 @@ fn assess_atlas_read_only(_root: &Path, manifest: &ProjectManifest) -> AtlasAsse
         fs::read_to_string(atlas_root.join("registry/candidate-modules.md")).unwrap_or_default();
     let readme = fs::read_to_string(atlas_root.join("README.md")).unwrap_or_default();
     if roadmap.is_empty() && registry.is_empty() && readme.is_empty() {
-        assessment.failure_reason =
-            "D:\\Atlas 存在，但 README、ROADMAP 或候选模块注册表不可读。".to_string();
+        assessment.failure_reason = "Atlas 入口文档不可读。".to_string();
         assessment
             .uncovered_parts
             .push("Atlas 入口文档不可用。".to_string());
@@ -12259,17 +12267,17 @@ fn assess_atlas_read_only(_root: &Path, manifest: &ProjectManifest) -> AtlasAsse
         }
     };
     assessment.evidence_references.extend([
-        "D:\\Atlas\\README.md".to_string(),
-        "D:\\Atlas\\ROADMAP.md".to_string(),
-        "D:\\Atlas\\registry\\candidate-modules.md".to_string(),
+        path_to_string(&atlas_root.join("README.md")),
+        path_to_string(&atlas_root.join("ROADMAP.md")),
+        path_to_string(&atlas_root.join("registry/candidate-modules.md")),
     ]);
     if atlas_root
         .join("docs/releases/atlas-v2-tabular-baseline.md")
         .exists()
     {
-        assessment
-            .evidence_references
-            .push("D:\\Atlas\\docs\\releases\\atlas-v2-tabular-baseline.md".to_string());
+        assessment.evidence_references.push(path_to_string(
+            &atlas_root.join("docs/releases/atlas-v2-tabular-baseline.md"),
+        ));
     }
 
     let has_tabular = registry.contains("packages/tabular-input");
@@ -14154,7 +14162,7 @@ fn update_v1_foundation(root: &Path, manifest: &mut ProjectManifest) -> Result<(
 }
 
 fn assess_skill_candidates_against_atlas(manifest: &ProjectManifest) -> Vec<AtlasSkillAssessment> {
-    let atlas_root = PathBuf::from(r"D:\Atlas");
+    let atlas_root = atlas_root_path();
     let readme = fs::read_to_string(atlas_root.join("README.md")).unwrap_or_default();
     let roadmap = fs::read_to_string(atlas_root.join("ROADMAP.md")).unwrap_or_default();
     let registry =
@@ -14228,9 +14236,9 @@ fn assess_skill_candidates_against_atlas(manifest: &ProjectManifest) -> Vec<Atla
             };
             let evidence_refs = if atlas_available {
                 vec![
-                    "D:\\Atlas\\README.md".to_string(),
-                    "D:\\Atlas\\ROADMAP.md".to_string(),
-                    "D:\\Atlas\\registry\\candidate-modules.md".to_string(),
+                    path_to_string(&atlas_root.join("README.md")),
+                    path_to_string(&atlas_root.join("ROADMAP.md")),
+                    path_to_string(&atlas_root.join("registry/candidate-modules.md")),
                 ]
             } else {
                 Vec::new()
@@ -19303,6 +19311,13 @@ mod tests {
     use crate::storage::test_root;
 
     #[test]
+    fn atlas_root_configuration_overrides_legacy_location() {
+        let configured = PathBuf::from(r"D:\DemoData\atlas-sandbox");
+        assert_eq!(atlas_root_from_config(Some(configured.clone())), configured);
+        assert_eq!(atlas_root_from_config(None), PathBuf::from(r"D:\Atlas"));
+    }
+
+    #[test]
     fn import_is_transactional_when_any_source_is_missing() {
         let root = test_root("transaction");
         fs::create_dir_all(&root).unwrap();
@@ -19539,11 +19554,11 @@ mod tests {
     #[test]
     fn cleanup_plan_generates_existing_project_item_with_trace() {
         let batch = cleanup_test_batch(vec![cleanup_scan_file(
-            "WTS测试报告.docx",
+            "示例测试报告.docx",
             "existingProjectMaterial",
             "report",
-            "WTS",
-            "D:\\GanMaoYuan_Workspace\\10_Projects\\WTS\\测试验收\\WTS测试报告.docx",
+            "示例项目",
+            "D:\\GanMaoYuan_Workspace\\10_Projects\\示例项目\\测试验收\\示例测试报告.docx",
             92,
             false,
         )]);
@@ -19555,8 +19570,8 @@ mod tests {
         assert_eq!(plan.items.len(), 1);
         let item = &plan.items[0];
         assert_eq!(item.recommended_ownership, "existingProject");
-        assert_eq!(item.recommended_project, "WTS");
-        assert!(item.recommended_target_path.contains("WTS\\测试验收"));
+        assert_eq!(item.recommended_project, "示例项目");
+        assert!(item.recommended_target_path.contains("示例项目\\测试验收"));
         assert_eq!(item.required_action, "readyForReview");
         assert!(!item.decision_trace_id.is_empty());
     }
@@ -19670,11 +19685,11 @@ mod tests {
     #[test]
     fn cleanup_plan_marks_duplicate_without_copy_action() {
         let mut file = cleanup_scan_file(
-            "WTS测试报告.docx",
+            "示例测试报告.docx",
             "existingProjectMaterial",
             "report",
-            "WTS",
-            "D:\\GanMaoYuan_Workspace\\10_Projects\\WTS\\测试验收\\WTS测试报告.docx",
+            "示例项目",
+            "D:\\GanMaoYuan_Workspace\\10_Projects\\示例项目\\测试验收\\示例测试报告.docx",
             100,
             false,
         );
@@ -19732,11 +19747,11 @@ mod tests {
         let mut plan = build_cleanup_plan_from_scan_batch(
             &cleanup_test_batch(vec![
                 cleanup_scan_file(
-                    "WTS测试报告.docx",
+                    "示例测试报告.docx",
                     "existingProjectMaterial",
                     "report",
-                    "WTS",
-                    "D:\\GanMaoYuan_Workspace\\10_Projects\\WTS\\测试验收\\WTS测试报告.docx",
+                    "示例项目",
+                    "D:\\GanMaoYuan_Workspace\\10_Projects\\示例项目\\测试验收\\示例测试报告.docx",
                     92,
                     false,
                 ),
@@ -19781,8 +19796,8 @@ mod tests {
                     "A.docx",
                     "existingProjectMaterial",
                     "report",
-                    "WTS",
-                    "D:\\GanMaoYuan_Workspace\\10_Projects\\WTS\\A.docx",
+                    "示例项目",
+                    "D:\\GanMaoYuan_Workspace\\10_Projects\\示例项目\\A.docx",
                     90,
                     false,
                 ),
@@ -19790,8 +19805,8 @@ mod tests {
                     "B.docx",
                     "existingProjectMaterial",
                     "report",
-                    "WTS",
-                    "D:\\GanMaoYuan_Workspace\\10_Projects\\WTS\\B.docx",
+                    "示例项目",
+                    "D:\\GanMaoYuan_Workspace\\10_Projects\\示例项目\\B.docx",
                     90,
                     false,
                 ),
@@ -19876,8 +19891,8 @@ mod tests {
                     "A.docx",
                     "existingProjectMaterial",
                     "report",
-                    "WTS",
-                    "D:\\GanMaoYuan_Workspace\\10_Projects\\WTS\\A.docx",
+                    "示例项目",
+                    "D:\\GanMaoYuan_Workspace\\10_Projects\\示例项目\\A.docx",
                     90,
                     false,
                 ),
@@ -19958,8 +19973,8 @@ mod tests {
                 "A.docx",
                 "existingProjectMaterial",
                 "report",
-                "WTS",
-                "D:\\GanMaoYuan_Workspace\\10_Projects\\WTS\\A.docx",
+                "示例项目",
+                "D:\\GanMaoYuan_Workspace\\10_Projects\\示例项目\\A.docx",
                 90,
                 false,
             )]),
@@ -20101,8 +20116,8 @@ mod tests {
         let root = test_root("cleanup-execute-search-record");
         let source_dir = root.join("desktop");
         fs::create_dir_all(&source_dir).unwrap();
-        let source = source_dir.join("WTS测试报告.txt");
-        fs::write(&source, "WTS 回归测试通过").unwrap();
+        let source = source_dir.join("示例测试报告.txt");
+        fs::write(&source, "示例项目回归测试通过").unwrap();
         let workspace = cleanup_test_workspace_at(&root.join("workspace"));
         fs::create_dir_all(&workspace.system_root).unwrap();
         let audit = root.join("audit.jsonl");
@@ -20110,7 +20125,7 @@ mod tests {
         item.evidence.push(DecisionTraceEvidence {
             kind: "summary".to_string(),
             label: "摘要".to_string(),
-            summary: "WTS 回归测试报告".to_string(),
+            summary: "示例项目回归测试报告".to_string(),
             source_id: item.id.clone(),
         });
         apply_cleanup_review(&mut item, "approved", None, &workspace).unwrap();
@@ -20124,7 +20139,7 @@ mod tests {
             &global.files[0].content_summary,
             &global.files[0].business_summary,
         ]);
-        assert!(match_search_score(&haystack, &normalize_search_text("WTS测试")).is_some());
+        assert!(match_search_score(&haystack, &normalize_search_text("测试报告")).is_some());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -20176,11 +20191,12 @@ mod tests {
     fn file_search_result_round_trips_projection_metadata_through_index() {
         let file = GlobalManagedFile {
             id: "global-1".to_string(),
-            file_name: "WTS测试报告-v2.txt".to_string(),
-            source_path: r"D:\桌面\WTS测试报告-v2.txt".to_string(),
-            managed_path: r"D:\GanMaoYuan_Workspace\10_Projects\WTS\测试验收\WTS测试报告-v2.txt"
-                .to_string(),
-            managed_relative_path: r"10_Projects\WTS\测试验收\WTS测试报告-v2.txt".to_string(),
+            file_name: "示例测试报告-v2.txt".to_string(),
+            source_path: r"D:\桌面\示例测试报告-v2.txt".to_string(),
+            managed_path:
+                r"D:\GanMaoYuan_Workspace\10_Projects\示例项目\测试验收\示例测试报告-v2.txt"
+                    .to_string(),
+            managed_relative_path: r"10_Projects\示例项目\测试验收\示例测试报告-v2.txt".to_string(),
             content_hash: "hash-v2".to_string(),
             file_type: "txt".to_string(),
             document_type: "测试报告".to_string(),
@@ -20188,10 +20204,10 @@ mod tests {
             business_domain: "项目验收".to_string(),
             category: "测试验收".to_string(),
             ownership_type: "existingProjectMaterial".to_string(),
-            related_project: "WTS".to_string(),
+            related_project: "示例项目".to_string(),
             lifecycle_status: "versioned".to_string(),
-            content_summary: "WTS 回归测试报告第二版".to_string(),
-            decision_trace_id: "trace-wts".to_string(),
+            content_summary: "示例项目回归测试报告第二版".to_string(),
+            decision_trace_id: "trace-example".to_string(),
             ..GlobalManagedFile::default()
         };
         let projection = FileProjectionAdapter::from_global_file(&file);
@@ -20199,13 +20215,13 @@ mod tests {
             &projection,
             String::new(),
             String::new(),
-            "WTS".to_string(),
+            "示例项目".to_string(),
             "global_file",
             &file.decision_trace_id,
             "高 92%".to_string(),
         );
         result.duplicate_of = "global-0".to_string();
-        result.version_group_id = "family-wts".to_string();
+        result.version_group_id = "family-example".to_string();
         result.version_number = 2;
 
         let entry = search_result_to_index_entry(result, "2026-08-26T00:00:00Z").unwrap();
@@ -20220,7 +20236,7 @@ mod tests {
         assert_eq!(matched.lifecycle_status, "versioned");
         assert_eq!(matched.ownership_type, "existingProjectMaterial");
         assert_eq!(matched.duplicate_of, "global-0");
-        assert_eq!(matched.version_group_id, "family-wts");
+        assert_eq!(matched.version_group_id, "family-example");
         assert_eq!(matched.version_number, 2);
         assert_eq!(matched.evidence_refs[0].hash_snapshot, "hash-v2");
     }
@@ -20263,12 +20279,13 @@ mod tests {
             files: vec![
                 GlobalManagedFile {
                     id: "g1".to_string(),
-                    file_name: "WTS测试报告-v2.txt".to_string(),
-                    managed_path: "D:/GanMaoYuan_Workspace/10_Projects/WTS/WTS测试报告-v2.txt"
-                        .to_string(),
-                    managed_relative_path: "10_Projects/WTS/WTS测试报告-v2.txt".to_string(),
+                    file_name: "示例测试报告-v2.txt".to_string(),
+                    managed_path:
+                        "D:/GanMaoYuan_Workspace/10_Projects/示例项目/示例测试报告-v2.txt"
+                            .to_string(),
+                    managed_relative_path: "10_Projects/示例项目/示例测试报告-v2.txt".to_string(),
                     ownership_type: "existingProjectMaterial".to_string(),
-                    related_project: "WTS".to_string(),
+                    related_project: "示例项目".to_string(),
                     category: "测试验收".to_string(),
                     content_hash: "same-hash".to_string(),
                     lifecycle_status: "managed".to_string(),
@@ -20278,12 +20295,14 @@ mod tests {
                 },
                 GlobalManagedFile {
                     id: "g2".to_string(),
-                    file_name: "WTS测试报告-v2-copy.txt".to_string(),
-                    managed_path: "D:/GanMaoYuan_Workspace/10_Projects/WTS/WTS测试报告-v2-copy.txt"
+                    file_name: "示例测试报告-v2-copy.txt".to_string(),
+                    managed_path:
+                        "D:/GanMaoYuan_Workspace/10_Projects/示例项目/示例测试报告-v2-copy.txt"
+                            .to_string(),
+                    managed_relative_path: "10_Projects/示例项目/示例测试报告-v2-copy.txt"
                         .to_string(),
-                    managed_relative_path: "10_Projects/WTS/WTS测试报告-v2-copy.txt".to_string(),
                     ownership_type: "existingProjectMaterial".to_string(),
-                    related_project: "WTS".to_string(),
+                    related_project: "示例项目".to_string(),
                     content_hash: "same-hash".to_string(),
                     lifecycle_status: "managed".to_string(),
                     created_at: "2026-08-20T08:01:00Z".to_string(),
@@ -20377,13 +20396,14 @@ mod tests {
     #[test]
     fn workspace_global_file_can_feed_project_impact_without_new_system() {
         let global_file = GlobalManagedFile {
-            id: "global-wts".to_string(),
-            file_name: "WTS测试报告.txt".to_string(),
-            source_path: "D:/Desktop/WTS测试报告.txt".to_string(),
-            managed_path: "D:/GanMaoYuan_Workspace/10_Projects/WTS/WTS测试报告.txt".to_string(),
-            managed_relative_path: "10_Projects/WTS/WTS测试报告.txt".to_string(),
-            related_project: "WTS".to_string(),
-            content_hash: "hash-wts".to_string(),
+            id: "global-example".to_string(),
+            file_name: "示例测试报告.txt".to_string(),
+            source_path: "D:/Desktop/示例测试报告.txt".to_string(),
+            managed_path: "D:/GanMaoYuan_Workspace/10_Projects/示例项目/示例测试报告.txt"
+                .to_string(),
+            managed_relative_path: "10_Projects/示例项目/示例测试报告.txt".to_string(),
+            related_project: "示例项目".to_string(),
+            content_hash: "hash-example".to_string(),
             business_summary: "测试报告显示回归通过，但存在多人反馈风险。".to_string(),
             document_purpose_evidence: vec!["回归测试".to_string(), "风险".to_string()],
             created_at: "2026-08-20T08:00:00Z".to_string(),
@@ -20392,8 +20412,8 @@ mod tests {
         let file = workspace_global_file_as_project_file(&global_file);
         let manifest = ProjectManifest {
             project: ProjectSummary {
-                id: "wts".to_string(),
-                name: "WTS".to_string(),
+                id: "example-project".to_string(),
+                name: "示例项目".to_string(),
                 ..ProjectSummary::default()
             },
             ..ProjectManifest::default()
@@ -20401,8 +20421,8 @@ mod tests {
 
         let impact = build_local_project_impact(&manifest, &file);
 
-        assert_eq!(impact.source_file_id, "workspace-global-wts");
-        assert_eq!(impact.source_hash, "hash-wts");
+        assert_eq!(impact.source_file_id, "workspace-global-example");
+        assert_eq!(impact.source_hash, "hash-example");
         assert!(!impact.findings.is_empty());
     }
 
@@ -20988,8 +21008,8 @@ mod tests {
             ),
             (
                 ProjectSummary {
-                    id: "wts".to_string(),
-                    name: "WTS".to_string(),
+                    id: "example-project".to_string(),
+                    name: "示例项目".to_string(),
                     ..ProjectSummary::default()
                 },
                 ProjectManifest::default(),
@@ -22844,7 +22864,7 @@ mod tests {
     fn vave_excel_routes_to_engineering_vave_with_high_confidence() {
         let analysis = FileAnalysis {
             file_id: new_id(),
-            file_name: "瑞尔-VAVE申请单.xlsx".to_string(),
+            file_name: "示例-VAVE申请单.xlsx".to_string(),
             parse_status: "success".to_string(),
             recommended_category: "数据表格".to_string(),
             document_type: "VAVE/降本申请单".to_string(),
@@ -22858,7 +22878,7 @@ mod tests {
         };
         let item = build_material_inbox_item(
             &[],
-            r"D:\资料\瑞尔-VAVE申请单.xlsx",
+            r"D:\资料\示例-VAVE申请单.xlsx",
             "hash-vave",
             1024,
             &analysis,
@@ -23094,25 +23114,25 @@ mod tests {
         let projects = vec![(
             ProjectSummary {
                 id: "project-1".to_string(),
-                name: "感冒院".to_string(),
-                root_dir: r"D:\GanMaoYuan\SelfProject".to_string(),
+                name: "示例项目".to_string(),
+                root_dir: r"D:\Example\Workspace".to_string(),
                 ..ProjectSummary::default()
             },
             ProjectManifest::default(),
         )];
         let analysis = FileAnalysis {
             file_id: new_id(),
-            file_name: "感冒院项目说明.md".to_string(),
+            file_name: "示例项目说明.md".to_string(),
             parse_status: "success".to_string(),
             recommended_category: "需求资料".to_string(),
             document_type: "项目说明".to_string(),
-            content_summary: "感冒院项目目标和范围".to_string(),
+            content_summary: "示例项目目标和范围".to_string(),
             main_fields_or_sections: vec!["项目目标".to_string()],
             ..FileAnalysis::default()
         };
         let item = build_material_inbox_item(
             &projects,
-            r"D:\资料\感冒院项目说明.md",
+            r"D:\资料\示例项目说明.md",
             "trace-project-hash",
             100,
             &analysis,
@@ -23371,12 +23391,12 @@ mod tests {
     #[test]
     fn general_material_route_records_semantic_nested_location() {
         let root = test_root("global-semantic-route");
-        let source = root.join("瑞尔-VAVE申请单.xlsx");
+        let source = root.join("示例-VAVE申请单.xlsx");
         fs::create_dir_all(&root).unwrap();
         fs::write(&source, b"vave application").unwrap();
         let mut item = MaterialInboxItem::default();
         item.id = new_id();
-        item.file_name = "瑞尔-VAVE申请单.xlsx".to_string();
+        item.file_name = "示例-VAVE申请单.xlsx".to_string();
         item.source_path = path_to_string(&source);
         item.source_hash = hash_file(&source).unwrap();
         item.ownership_type = inbox_routing::OWNERSHIP_GENERAL_WORK.to_string();
@@ -23395,7 +23415,7 @@ mod tests {
         assert_eq!(record.general_material_category, "vave");
         assert_eq!(
             record.managed_relative_path,
-            "engineering/vave/瑞尔-VAVE申请单.xlsx"
+            "engineering/vave/示例-VAVE申请单.xlsx"
         );
         assert_eq!(
             Path::new(&record.managed_path).parent(),
@@ -23532,32 +23552,32 @@ mod tests {
             .join(".ganmaoyuan")
             .join("managed")
             .join("02_requirements")
-            .join("WTS_Production_Migration_Manifest.md");
+            .join("Fictional_Migration_Guide.md");
         fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         fs::write(
             &file_path,
-            "# WTS Production Migration Manifest\n\n用于指导 IT/DBA 按顺序执行数据库结构初始化和迁移。\n排除业务数据导入和生产数据改写。\n",
+            "# Example Database Migration Guide\n\n用于指导管理员按顺序执行数据库结构初始化和迁移。\n排除业务数据导入和生产数据改写。\n",
         )
         .unwrap();
 
         let mut manifest = ProjectManifest::default();
         manifest.project.id = "reference-project".to_string();
-        manifest.project.name = "WTS".to_string();
+        manifest.project.name = "示例项目".to_string();
         manifest.project.root_dir = path_to_string(&root);
         manifest.files.push(FileRecord {
             id: "reference-file".to_string(),
-            file_name: "WTS_Production_Migration_Manifest.md".to_string(),
+            file_name: "Fictional_Migration_Guide.md".to_string(),
             managed_path: path_to_string(&file_path),
             file_type: "md".to_string(),
             parse_status: "success".to_string(),
-            content_summary: "WTS Production Migration Manifest，数据库迁移执行清单。".to_string(),
+            content_summary: "示例数据库迁移指南，提供结构初始化与迁移步骤。".to_string(),
             still_exists: true,
             ..FileRecord::default()
         });
         manifest.messages.push(WorkspaceMessage {
             id: "question".to_string(),
             author: "user".to_string(),
-            text: "刚才加入的 WTS_Production_Migration_Manifest.md 主要是做什么的？".to_string(),
+            text: "刚才加入的 Fictional_Migration_Guide.md 主要是做什么的？".to_string(),
             ..WorkspaceMessage::default()
         });
         manifest.messages.push(WorkspaceMessage {
@@ -23570,7 +23590,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        assert!(context.contains("WTS_Production_Migration_Manifest.md"));
+        assert!(context.contains("Fictional_Migration_Guide.md"));
         assert!(context.contains("数据库结构初始化和迁移"));
         assert!(context.contains("排除业务数据导入"));
         assert!(!context.contains(&path_to_string(&root)));
@@ -27071,10 +27091,10 @@ mod tests {
 
     #[test]
     fn chat_next_step_capture_requires_explicit_recording_intent() {
-        let text = "下一步我准备先核对 WTS 当前工作区里的未提交改动分别是什么，再决定是否提交。请把这个下一步记下来。";
+        let text = "下一步我准备先核对示例项目当前工作区里的未提交改动分别是什么，再决定是否提交。请把这个下一步记下来。";
         assert_eq!(
             extract_explicit_recorded_next_step(text),
-            Some("先核对 WTS 当前工作区里的未提交改动分别是什么，再决定是否提交".to_string())
+            Some("先核对示例项目当前工作区里的未提交改动分别是什么，再决定是否提交".to_string())
         );
         assert_eq!(
             extract_explicit_recorded_next_step("下一步先核对工作区，但暂时不记录。"),
@@ -27102,7 +27122,7 @@ mod tests {
         let user_message = workspace_message(
             "user",
             "requirement",
-            "下一步我准备先核对 WTS 当前工作区里的未提交改动分别是什么，再决定是否提交。请把这个下一步记下来。",
+            "下一步我准备先核对示例项目当前工作区里的未提交改动分别是什么，再决定是否提交。请把这个下一步记下来。",
             "user",
         );
         let next_step = extract_explicit_recorded_next_step(&user_message.text).unwrap();
@@ -27156,7 +27176,7 @@ mod tests {
             packet
                 .pending_actions
                 .iter()
-                .filter(|action| action.title.contains("先核对 WTS"))
+                .filter(|action| action.title.contains("先核对示例项目"))
                 .count(),
             1
         );
@@ -27319,7 +27339,7 @@ mod tests {
             created_at: now_string(),
         });
         for (index, summary) in [
-            "## 已知事实（依据：WTS_Production_Migration_Manifest.md）",
+            "## 已知事实（依据：Fictional_Migration_Guide.md）",
             "**已知事实**",
             "- **已知事实**",
             "AI总结",

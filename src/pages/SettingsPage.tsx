@@ -594,7 +594,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
             />
             <InfoRow
               label="根目录"
-              value={data.workspaceConfig?.workspaceRoot || "尚未初始化，默认将使用 D:\\GanMaoYuan_Workspace"}
+              value={data.workspaceConfig?.workspaceRoot || "尚未初始化，首次初始化时将使用应用默认工作目录"}
               mono
             />
             <InfoRow label="Inbox" value={data.workspaceConfig?.inboxRoot || "00_Inbox"} mono />
@@ -825,7 +825,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
               <input
                 value={data.backupDestination}
                 onChange={(event) => data.setBackupDestination(event.target.value)}
-                placeholder="留空则使用 D:\\GanMaoYuan\\Backups"
+                placeholder="留空则保存到应用数据目录的 Backups 子目录"
               />
               <button type="button" className="btn" onClick={() => void data.pickBackupDestination()}>
                 选择目录
@@ -887,7 +887,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
               <input
                 value={data.restoreDestination}
                 onChange={(event) => data.setRestoreDestination(event.target.value)}
-                placeholder="留空则使用 D:\\GanMaoYuan\\RestoredProjects"
+                placeholder="留空则在应用数据目录创建 RestoredProjects 子目录"
               />
               <button type="button" className="btn" onClick={() => void data.pickRestoreDestination()}>
                 选择目录
@@ -963,7 +963,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
               <input
                 value={data.exportDestination}
                 onChange={(event) => data.setExportDestination(event.target.value)}
-                placeholder="留空则使用 D:\\GanMaoYuan\\Exports"
+                placeholder="留空则保存到应用数据目录的 Exports 子目录"
               />
               <button type="button" className="btn" onClick={() => void data.pickExportDestination()}>
                 选择目录

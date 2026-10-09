@@ -753,7 +753,7 @@ describe("project workspace persistence flow", () => {
         manualAcceptance: ["需要桌面点击验收"],
         externalThreadId: "",
         resultRunId: "",
-        rawEvidencePath: "D:\\GanMaoYuan\\SelfProject\\.ganmaoyuan\\managed\\report.md",
+        rawEvidencePath: "D:\\Example\\Workspace\\.ganmaoyuan\\managed\\report.md",
         createdAt: "4",
       },
     ];
