@@ -1,0 +1,53 @@
+name: Beta Windows installer acceptance
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - .github/workflows/beta-installer-acceptance.yml
+      - scripts/test-windows-installer.ps1
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft release tag to validate
+        required: true
+        default: v0.1.1
+        type: string
+      expected_sha256:
+        description: Expected SHA-256 of the installer asset
+        required: true
+        default: 05d32a3d2e90d4f86740494561df0cf4804a2e3c15db0f45e55e731ca80622bc
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install-uninstall:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out acceptance script
+        uses: actions/checkout@v4
+
+      - name: Validate draft installer, install, launch, and uninstall
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || 'v0.1.1' }}
+          EXPECTED_SHA256: ${{ github.event.inputs.expected_sha256 || '05d32a3d2e90d4f86740494561df0cf4804a2e3c15db0f45e55e731ca80622bc' }}
+        run: |
+          ./scripts/test-windows-installer.ps1 `
+            -Repository $env:GITHUB_REPOSITORY `
+            -ReleaseTag $env:RELEASE_TAG `
+            -ExpectedSha256 $env:EXPECTED_SHA256
+
+      - name: Preserve acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ganmaoyuan-windows-installer-acceptance-${{ github.run_id }}
+          path: ${{ runner.temp }}\ganmaoyuan-beta-evidence\**
+          if-no-files-found: warn
+          retention-days: 90
