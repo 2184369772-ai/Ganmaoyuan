@@ -205,16 +205,16 @@ try {
     Invoke-Installer "collision-install" @("/D=$installRoot") | Out-Null
     $installedApp = Join-Path $installRoot "app.exe"
     Add-Check "application installed" (Test-Path -LiteralPath $installedApp -PathType Leaf)
-    $expectedAppHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $expectedApp).Hash.ToUpperInvariant()
+    $buildAppHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $expectedApp).Hash.ToUpperInvariant()
     $installedAppHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installedApp).Hash.ToUpperInvariant()
     $installedAppItem = Get-Item -LiteralPath $installedApp
     $installedAppVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($installedApp)
-    $expectedAppCopy = Join-Path $evidenceRoot "expected-build-app.exe"
-    $installedAppCopy = Join-Path $evidenceRoot "installed-app.exe"
-    Copy-Item -LiteralPath $expectedApp -Destination $expectedAppCopy -Force
-    Copy-Item -LiteralPath $installedApp -Destination $installedAppCopy -Force
-    $appHashDetail = "expected=$($ExpectedAppSha256.ToUpperInvariant()); artifact=$expectedAppHash; actual=$installedAppHash; size=$($installedAppItem.Length); fileVersion=$($installedAppVersion.FileVersion); productVersion=$($installedAppVersion.ProductVersion); expectedPath=$expectedApp; installedPath=$installedApp"
-    Add-Check "installed application matches build provenance" ($installedAppHash -eq $ExpectedAppSha256.ToUpperInvariant()) $appHashDetail
+    $appHashDetail = "expectedNsisInstalled=$($ExpectedAppSha256.ToUpperInvariant()); standaloneArtifact=$buildAppHash; actual=$installedAppHash; size=$($installedAppItem.Length); fileVersion=$($installedAppVersion.FileVersion); productVersion=$($installedAppVersion.ProductVersion); standalonePath=$expectedApp; installedPath=$installedApp"
+    if ($installedAppHash -ne $ExpectedAppSha256.ToUpperInvariant()) {
+        Copy-Item -LiteralPath $expectedApp -Destination (Join-Path $evidenceRoot "expected-build-app.exe") -Force
+        Copy-Item -LiteralPath $installedApp -Destination (Join-Path $evidenceRoot "installed-app.exe") -Force
+    }
+    Add-Check "installed application matches NSIS bundle provenance" ($installedAppHash -eq $ExpectedAppSha256.ToUpperInvariant()) $appHashDetail
     $installRegistryKey = Get-TestInstallRegistryKey
     Add-Check "isolated install registry entry found" ($null -ne $installRegistryKey) "The test must only modify the registry entry owned by this temporary installation."
     foreach ($item in @(

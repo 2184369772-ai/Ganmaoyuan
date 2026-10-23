@@ -107,6 +107,7 @@ jobs:
           VALIDATE_EXISTING_RUN_ID: ${{ inputs.validate_existing_run_id }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
         run: |
+          . ./scripts/nsis-app-provenance.ps1
           $releaseDir = "$env:RUNNER_TEMP\ganmaoyuan-release"
           $record = Get-Content -Raw -Encoding UTF8 (Join-Path $releaseDir "build-provenance.json") | ConvertFrom-Json
           if ($env:VALIDATE_EXISTING_RUN_ID) {
@@ -126,11 +127,15 @@ jobs:
           $appArtifact = Join-Path $releaseDir $record.appFile
           $actualAppArtifactSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $appArtifact).Hash.ToUpperInvariant()
           if ($actualAppArtifactSha -ne $record.appSha256.ToUpperInvariant()) { throw "The retained standalone app binary does not match build provenance." }
+          $expectedInstalledAppSha = Get-NsisInstalledAppSha256 -FilePath $appArtifact
+          if ($record.installedAppSha256 -and $record.installedAppSha256.ToUpperInvariant() -ne $expectedInstalledAppSha) { throw "NSIS installed-app hash does not match the deterministic Tauri bundle marker transformation." }
+          $record | Add-Member -NotePropertyName installedAppBundleType -NotePropertyValue "nsis" -Force
+          $record | Add-Member -NotePropertyName installedAppSha256 -NotePropertyValue $expectedInstalledAppSha -Force
           ./scripts/validate-windows-installer.ps1 `
             -InstallerPath (Join-Path $releaseDir $record.installerFile) `
             -EvidenceDirectory (Join-Path $releaseDir "validation-evidence") `
             -ExpectedSha256 $record.installerSha256 `
-            -ExpectedAppSha256 $record.appSha256 `
+            -ExpectedAppSha256 $record.installedAppSha256 `
             -ExpectedAppPath $appArtifact `
             -ExpectedVersion $record.version `
             -BaselineInstallerPath (Join-Path $env:RUNNER_TEMP "Ganmaoyuan_0.1.1_x64-setup.exe") `

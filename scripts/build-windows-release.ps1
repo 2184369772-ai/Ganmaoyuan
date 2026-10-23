@@ -5,6 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "nsis-app-provenance.ps1")
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repoRoot "src-tauri\target\release\ganmaoyuan-release"
 }
@@ -343,6 +344,7 @@ try {
     Write-NewTextFile (Join-Path $outputRoot "SHA256SUMS.txt") (($checksums -join "`n") + "`n")
 
     $signature = Get-AuthenticodeSignature -LiteralPath $outputInstaller
+    $installedAppSha256 = Get-NsisInstalledAppSha256 $outputApp
     $buildRecord = [ordered]@{
         schemaVersion = 1
         product = $tauriConfig.productName
@@ -369,6 +371,8 @@ try {
         installerSignatureStatus = [string]$signature.Status
         appFile = Split-Path -Leaf $outputApp
         appSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $outputApp).Hash.ToUpperInvariant()
+        installedAppBundleType = "nsis"
+        installedAppSha256 = $installedAppSha256
         contextBridgeFile = Split-Path -Leaf $outputBridge
         contextBridgeSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $outputBridge).Hash.ToUpperInvariant()
         installerValidation = "pending hosted Windows runner validation"
@@ -381,6 +385,7 @@ try {
 - Source revision: $gitRevision
 - Installer: $(Split-Path -Leaf $outputInstaller)
 - SHA-256: $($buildRecord.installerSha256)
+- Installed app SHA-256 (Tauri NSIS bundle marker applied): $($buildRecord.installedAppSha256)
 - Authenticode: $($buildRecord.installerSignatureStatus)
 - Default per-user installation directory: `%LOCALAPPDATA%\Ganmaoyuan`
 - Default application data: `%APPDATA%\com.ganmaoyuan.desktop`; an explicit `GANMAOYUAN_DATA_DIR` overrides it. The former D-drive data folder is reused only when recognized Ganmaoyuan data files are present.
