@@ -263,7 +263,11 @@ try {
     Invoke-Installer "managed-shortcuts-install" @("/D=$installRoot") | Out-Null
     $installedApp = Join-Path $installRoot "app.exe"
     Add-Check "application installed without shortcut collisions" (Test-Path -LiteralPath $installedApp -PathType Leaf)
-    Add-Check "installed application matches build provenance after shortcut migration" ((Get-FileHash -Algorithm SHA256 -LiteralPath $installedApp).Hash.ToUpperInvariant() -eq $ExpectedAppSha256.ToUpperInvariant())
+    $installedAppHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installedApp).Hash.ToUpperInvariant()
+    $installedAppItem = Get-Item -LiteralPath $installedApp
+    $installedAppVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($installedApp)
+    $appHashDetail = "expected=$($ExpectedAppSha256.ToUpperInvariant()); actual=$installedAppHash; size=$($installedAppItem.Length); fileVersion=$($installedAppVersion.FileVersion); productVersion=$($installedAppVersion.ProductVersion); path=$installedApp"
+    Add-Check "installed application matches build provenance after shortcut migration" ($installedAppHash -eq $ExpectedAppSha256.ToUpperInvariant()) $appHashDetail
     foreach ($link in @($desktopLink, $sendToLink, $startMenuLink)) {
         $snapshot = Get-ShortcutSnapshot $link
         Add-Check "installer created managed shortcut $(Split-Path -Leaf $link)" ($null -ne $snapshot -and $snapshot.target -eq $installedApp) "Target must be the executable in this isolated install directory."
