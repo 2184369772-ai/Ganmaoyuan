@@ -69,6 +69,7 @@ Var UpdateMode
 Var NoShortcutMode
 Var WixMode
 Var OldMainBinaryName
+Var PreviousInstallIsCurrent
 
 Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
@@ -653,6 +654,22 @@ Section Install
   ; Save $INSTDIR in registry for future installations
   WriteRegStr SHCTX "${MANUPRODUCTKEY}" "" $INSTDIR
 
+  ; Preserve shortcut ownership across upgrades only when the existing
+  ; uninstall registration points to this exact install directory.
+  StrCpy $PreviousInstallIsCurrent 0
+  ReadRegStr $R2 SHCTX "${UNINSTKEY}" "InstallLocation"
+  StrCpy $R3 $R2 1 0
+  ${If} $R3 == "$\""
+    StrCpy $R2 $R2 -2 1
+  ${EndIf}
+  ${If} $R2 != ""
+    GetFullPathName $R2 "$R2"
+    GetFullPathName $R3 "$INSTDIR"
+    ${If} $R2 == $R3
+      StrCpy $PreviousInstallIsCurrent 1
+    ${EndIf}
+  ${EndIf}
+
   !if "${INSTALLMODE}" == "both"
     ; Save install mode to be selected by default for the next installation such as updating
     ; or when uninstalling
@@ -758,6 +775,9 @@ Function CreateOrUpdateSendToShortcut
   !insertmacro IsShortcutTarget "$SENDTO\Ganmaoyuan - SendTo.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
   Pop $1
   ${If} $1 = 1
+    ${If} $PreviousInstallIsCurrent = 1
+      WriteRegStr SHCTX "${UNINSTKEY}" "ManagedSendToShortcut" "$SENDTO\Ganmaoyuan - SendTo.lnk"
+    ${EndIf}
     Return
   ${EndIf}
   DetailPrint "Preserving an existing SendTo shortcut with a different target."
@@ -1036,6 +1056,9 @@ Function CreateOrUpdateStartMenuShortcut
     !insertmacro IsShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
     Pop $0
     ${If} $0 = 1
+      ${If} $PreviousInstallIsCurrent = 1
+        WriteRegStr SHCTX "${UNINSTKEY}" "ManagedStartMenuShortcut" "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+      ${EndIf}
       Return
     ${EndIf}
     DetailPrint "Preserving an existing Start Menu shortcut with a different target."
@@ -1049,6 +1072,9 @@ Function CreateOrUpdateStartMenuShortcut
     !insertmacro IsShortcutTarget "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
     Pop $0
     ${If} $0 = 1
+      ${If} $PreviousInstallIsCurrent = 1
+        WriteRegStr SHCTX "${UNINSTKEY}" "ManagedStartMenuShortcut" "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+      ${EndIf}
       Return
     ${EndIf}
     DetailPrint "Preserving an existing Start Menu shortcut with a different target."
@@ -1086,6 +1112,9 @@ Function CreateOrUpdateDesktopShortcut
   !insertmacro IsShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
   Pop $0
   ${If} $0 = 1
+    ${If} $PreviousInstallIsCurrent = 1
+      WriteRegStr SHCTX "${UNINSTKEY}" "ManagedDesktopShortcut" "$DESKTOP\${PRODUCTNAME}.lnk"
+    ${EndIf}
     Return
   ${EndIf}
   DetailPrint "Preserving an existing desktop shortcut with a different target."
