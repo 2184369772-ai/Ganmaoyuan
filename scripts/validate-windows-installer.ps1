@@ -348,6 +348,13 @@ try {
         $snapshot = Get-ShortcutSnapshot $link
         Add-Check "cross-release upgrade retains managed shortcut $(Split-Path -Leaf $link)" ($null -ne $snapshot -and $snapshot.target -eq $upgradedApp)
     }
+    $crossReleaseOwnership = Get-ItemProperty -LiteralPath $upgradedRegistryKey
+    $managedDesktopShortcut = [string]$crossReleaseOwnership.ManagedDesktopShortcut
+    $managedStartMenuShortcut = [string]$crossReleaseOwnership.ManagedStartMenuShortcut
+    $managedSendToShortcut = [string]$crossReleaseOwnership.ManagedSendToShortcut
+    Add-Check "cross-release desktop shortcut ownership is registered" ([string]::Equals($managedDesktopShortcut, $desktopLink, [System.StringComparison]::OrdinalIgnoreCase)) "expected=$desktopLink; actual=$managedDesktopShortcut; installLocation=$($crossReleaseOwnership.InstallLocation)"
+    Add-Check "cross-release Start Menu shortcut ownership is registered" ([string]::Equals($managedStartMenuShortcut, $startMenuLink, [System.StringComparison]::OrdinalIgnoreCase)) "expected=$startMenuLink; actual=$managedStartMenuShortcut"
+    Add-Check "cross-release SendTo shortcut ownership is registered" ([string]::Equals($managedSendToShortcut, $sendToLink, [System.StringComparison]::OrdinalIgnoreCase)) "expected=$sendToLink; actual=$managedSendToShortcut"
 
     $script:startedProcess = Start-Process -FilePath $upgradedApp -PassThru
     Start-Sleep -Seconds 10
