@@ -17,8 +17,6 @@ jobs:
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
-      CARGO_TARGET_DIR: ${{ runner.temp }}\ganmaoyuan-cargo-target
-      GANMAOYUAN_TEST_ROOT: ${{ runner.temp }}\ganmaoyuan-tests
       RUSTUP_TOOLCHAIN: 1.97.1
     steps:
       - name: Checkout source
@@ -52,10 +50,15 @@ jobs:
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 
       - name: Rust unit tests
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\ganmaoyuan-cargo-target
+          GANMAOYUAN_TEST_ROOT: ${{ runner.temp }}\ganmaoyuan-tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 
       - name: Build NSIS package and provenance
         shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\ganmaoyuan-cargo-target
         run: |
           ./scripts/build-windows-release.ps1 -OutputDirectory "$env:RUNNER_TEMP\ganmaoyuan-release" -RequireCleanTree
 
