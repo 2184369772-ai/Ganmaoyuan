@@ -1,8 +1,9 @@
 ﻿import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { type SettingsSection, useAppState } from "../app/AppState";
 import { AppLayout } from "../components/AppLayout";
 import { EmptyState } from "../components/ui";
+import { formatTimestampOrFallback } from "../utils/dateTime";
 import {
   chooseDirectory,
   createLocalBackup,
@@ -48,8 +49,6 @@ const menuItems: Array<{ key: SettingsSection; label: string }> = [
 ];
 
 type SettingsRenderData = {
-  theme: "dark" | "light";
-  toggleTheme: () => void;
   currentTask: string;
   nextStep: string;
   materials: Array<{ title: string; detail: string }>;
@@ -121,9 +120,9 @@ type SettingsRenderData = {
 
 export function SettingsPage() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
   const {
-    theme,
-    toggleTheme,
     selectedSettingsSection,
     setSelectedSettingsSection,
     currentTask,
@@ -177,18 +176,37 @@ export function SettingsPage() {
   const loadedWeeklyDashboardScopeRef = useRef<string | null>(null);
 
   useEffect(() => {
+    const requestedSection = searchParams.get("section");
+    if (requestedSection && menuItems.some((item) => item.key === requestedSection)) {
+      setSelectedSettingsSection(requestedSection as SettingsSection);
+    }
+  }, [searchParams, setSelectedSettingsSection]);
+
+  useEffect(() => {
     setSelectedModelId(deepSeekSettings.selectedModelId);
   }, [deepSeekSettings.selectedModelId]);
 
   useEffect(() => {
-    if (!isDesktopReady) return;
+    if (!isDesktopReady || selectedSettingsSection !== "projects") return;
+    let isCurrentSection = true;
     void getWorkspaceConfig()
-      .then(setWorkspaceConfig)
-      .catch((err) => reportActionError("读取个人文件空间配置", err));
+      .then((config) => {
+        if (isCurrentSection) setWorkspaceConfig(config);
+      })
+      .catch((err) => {
+        if (isCurrentSection) reportActionError("读取个人文件空间配置", err);
+      });
     void listWorkspaceScanBatches()
-      .then(setWorkspaceScanBatches)
-      .catch((err) => reportActionError("读取扫描批次", err));
-  }, [isDesktopReady]);
+      .then((batches) => {
+        if (isCurrentSection) setWorkspaceScanBatches(batches);
+      })
+      .catch((err) => {
+        if (isCurrentSection) reportActionError("读取扫描批次", err);
+      });
+    return () => {
+      isCurrentSection = false;
+    };
+  }, [isDesktopReady, selectedSettingsSection]);
 
   useEffect(() => {
     if (!isDesktopReady || selectedSettingsSection !== "weekly-review") return;
@@ -215,7 +233,12 @@ export function SettingsPage() {
   }
 
   function returnToWork() {
-    navigate(activeProject ? "/work" : "/");
+    const requestedReturnTo = (location.state as { returnTo?: unknown } | null)?.returnTo;
+    const safeReturnTo = typeof requestedReturnTo === "string"
+      && (requestedReturnTo === "/" || requestedReturnTo.startsWith("/work"))
+      ? requestedReturnTo
+      : activeProject ? "/work" : "/";
+    navigate(safeReturnTo, { replace: true });
   }
 
   async function pickDirectory(setter: (value: string) => void) {
@@ -232,7 +255,7 @@ export function SettingsPage() {
     setIsRunningBackupAction(true);
     setActionMessage("");
     try {
-      const result = await createLocalBackup(activeProject ? [activeProject.rootDir] : [], backupDestination);
+      const result = await createLocalBackup([], backupDestination);
       setBackupResult(result);
       setActionMessage("本机备份已生成。");
     } catch (err) {
@@ -244,10 +267,14 @@ export function SettingsPage() {
 
   async function runRestore() {
     if (!isDesktopReady || !restoreSource.trim()) return;
+    const confirmed = window.confirm(
+      "确认导入所选备份？感冒院不能认证其来源，清单标记和 SHA-256 都不能证明是谁创建了它；恶意或错误内容可能带入伪造项目事实。项目会恢复到新目录；其他项目保留，同 ID 项目会在列表中指向恢复副本。新版备份会替换本机全局受管资料目录；旧版备份不含该目录，会保留本机现有资料。便签、Inbox 队列、收件箱路由和模型设置会替换当前对应全局文件；API Key 不会恢复。部分旧版备份没有逐项目文件校验。仅在你能确认来源且愿意信任其内容时继续。",
+    );
+    if (!confirmed) return;
     setIsRunningBackupAction(true);
     setActionMessage("");
     try {
-      const result = await restoreLocalBackup(restoreSource, restoreDestination);
+      const result = await restoreLocalBackup(restoreSource, restoreDestination, confirmed);
       setRestoreResult(result);
       await refreshProjects();
       setActionMessage("备份恢复完成，项目注册表已刷新。");
@@ -385,12 +412,14 @@ export function SettingsPage() {
         </header>
 
         <section className="settings-layout">
-          <aside className="settings-sidebar">
+          <aside className="settings-sidebar" aria-label="设置分区">
             {menuItems.map((item) => (
               <button
                 key={item.key}
                 type="button"
                 className={`settings-menu-item ${selectedSettingsSection === item.key ? "active" : ""}`}
+                aria-current={selectedSettingsSection === item.key ? "page" : undefined}
+                aria-controls="settings-content"
                 onClick={() => setSelectedSettingsSection(item.key)}
               >
                 {item.label}
@@ -398,10 +427,8 @@ export function SettingsPage() {
             ))}
           </aside>
 
-          <section className="settings-content">
+          <section className="settings-content" id="settings-content">
             {renderSection(selectedSettingsSection, {
-              theme,
-              toggleTheme,
               currentTask,
               nextStep,
               materials,
@@ -594,7 +621,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
             />
             <InfoRow
               label="根目录"
-              value={data.workspaceConfig?.workspaceRoot || "尚未初始化，首次初始化时将使用应用默认工作目录"}
+              value={data.workspaceConfig?.workspaceRoot || "尚未初始化，默认使用文档\\Ganmaoyuan\\Workspace"}
               mono
             />
             <InfoRow label="Inbox" value={data.workspaceConfig?.inboxRoot || "00_Inbox"} mono />
@@ -603,7 +630,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
             <InfoRow label="临时资料" value={data.workspaceConfig?.temporaryRoot || "30_Temporary"} mono />
             <InfoRow label="归档目录" value={data.workspaceConfig?.archiveRoot || "40_Archive"} mono />
             <InfoRow label="系统元数据" value={data.workspaceConfig?.systemRoot || ".ganmaoyuan"} mono />
-            <InfoRow label="最近校验" value={data.workspaceConfig?.lastVerifiedAt || "尚未校验"} />
+            <InfoRow label="最近校验" value={formatTimestampOrFallback(data.workspaceConfig?.lastVerifiedAt, "尚未校验")} />
             <div className="settings-action-row">
               <button type="button" className="btn btn-primary" onClick={() => void data.initializeWorkspace()}>
                 初始化工作空间
@@ -749,7 +776,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
       );
     case "ai-context":
       return (
-        <SectionFrame title="AI 上下文" description="发送给 DeepSeek 的上下文只包含项目说明、摘要、关键历史和当前问题。">
+        <SectionFrame title="AI 上下文" description="展示项目理解、聊天与 Inbox 匹配实际发送的字段及边界；旧项目授权范围变更后需要重新确认。">
           {data.aiContextItems.map((item) => (
             <ListCard key={item} title={item} detail="当前为 AI 上下文条目。" />
           ))}
@@ -783,7 +810,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
               ))}
             </select>
           </label>
-          <InfoRow label="最近测试" value={data.deepSeekSettings.lastTestedAt || "尚未测试"} />
+          <InfoRow label="最近测试" value={formatTimestampOrFallback(data.deepSeekSettings.lastTestedAt, "尚未测试")} />
           <div className="settings-action-row">
             <button
               type="button"
@@ -817,6 +844,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
       return (
         <SectionFrame title="数据与备份" description="本机备份、恢复、项目迁移和安全导出都通过桌面端真实执行。">
           <InfoRow label="保存方式" value="项目清单、对话和解析结果保存在项目根目录与本机应用数据目录中。" />
+          <InfoRow label="备份范围与安全" value="包括：每个已登记项目的 .ganmaoyuan 应用数据（聊天、决定、Work Ledger、Codex Task/Run/Result 等）、项目根目录内逐条登记且可安全读取的受管文件，以及应用数据目录中已登记的全局 general/temporary 受管资料和操作记录。恢复后会重建可解析资料的正文缓存。排除：不会遍历或复制项目根目录中的源码仓库、.git、node_modules、构建产物、临时依赖和未登记文件；另排除可重建的分析正文缓存/搜索索引、staging、调试日志、项目根外的登记原始文件、外部用户工作区中的 workspaceCleanup 文件，以及 Windows Credential Manager 中的 API Key。缺失或无法安全纳入的登记资料会列入清单/恢复警告；旧版备份不含全局受管资料，恢复时保留本机现有资料。备份未加密；SHA-256 只校验内容完整性，不认证创建来源。请保存到访问受控的位置，并且只恢复你信任的备份。" />
           <InfoRow label="当前项目" value={data.currentProjectRoot || "尚未打开项目"} mono />
 
           <label className="settings-form-field">
@@ -825,7 +853,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
               <input
                 value={data.backupDestination}
                 onChange={(event) => data.setBackupDestination(event.target.value)}
-                placeholder="留空则保存到应用数据目录的 Backups 子目录"
+                placeholder="留空则使用文档\\Ganmaoyuan\\Backups"
               />
               <button type="button" className="btn" onClick={() => void data.pickBackupDestination()}>
                 选择目录
@@ -861,6 +889,10 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
               lines={[
                 `备份目录：${data.backupResult.backupDir}`,
                 `包含项目：${data.backupResult.projectRoots.length}`,
+                `全局文件：${data.backupResult.globalFiles.length}`,
+                ...(data.backupResult.excludedEntries.length
+                  ? data.backupResult.excludedEntries.map((item) => `未包含：${item}`)
+                  : []),
                 `校验清单：${data.backupResult.checksumManifestPath}`,
               ]}
             />
@@ -887,7 +919,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
               <input
                 value={data.restoreDestination}
                 onChange={(event) => data.setRestoreDestination(event.target.value)}
-                placeholder="留空则在应用数据目录创建 RestoredProjects 子目录"
+                placeholder="留空则使用文档\\Ganmaoyuan\\RestoredProjects"
               />
               <button type="button" className="btn" onClick={() => void data.pickRestoreDestination()}>
                 选择目录
@@ -963,7 +995,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
               <input
                 value={data.exportDestination}
                 onChange={(event) => data.setExportDestination(event.target.value)}
-                placeholder="留空则保存到应用数据目录的 Exports 子目录"
+                placeholder="留空则使用文档\\Ganmaoyuan\\Exports"
               />
               <button type="button" className="btn" onClick={() => void data.pickExportDestination()}>
                 选择目录
@@ -1010,7 +1042,7 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
       return (
         <SectionFrame title="每周复盘" description="每周自动生成跨项目与项目内周报，供回顾和技能沉淀使用。">
           <InfoRow label="生成日" value={data.weeklyReviewSettings ? weekDayLabel(data.weeklyReviewSettings.generationWeekday) : "未设置"} />
-          <InfoRow label="最近生成" value={data.weeklyReviewDashboard?.generatedAt || "暂无"} />
+          <InfoRow label="最近生成" value={formatTimestampOrFallback(data.weeklyReviewDashboard?.generatedAt, "暂无")} />
           <InfoRow label="周报数量" value={String(data.weeklyReports.length)} />
           <label className="settings-form-field">
             <span>生成日设置</span>
@@ -1049,8 +1081,8 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
       );
     case "privacy-security":
       return (
-        <SectionFrame title="隐私安全" description="仅本机项目，不做云同步；导出、备份和诊断日志默认脱敏。">
-          <InfoRow label="外部接口" value="仅 DeepSeek 对话接入，原始文件不直接上传。" />
+        <SectionFrame title="隐私安全" description="仅本机项目，不做云同步；安全导出和诊断日志默认脱敏。本机备份保留项目内容且未加密。">
+          <InfoRow label="外部接口" value="DeepSeek 项目理解会接收限量项目说明、资料摘要/章节、近期对话和只读 Atlas 摘要；聊天会接收本轮问题、当前项目筛选记录、最多 5 轮有限历史对话（最近 3 轮及最多 2 轮相关历史，合计不超过 4,800 字）和最多 3 份相关资料的摘要/正文片段。历史对话仅作讨论背景，不是事实或已确认决定；最多 4 张本轮图片仅发送给支持视觉的模型。Inbox 匹配另会发送待处理资料摘要和最多 3 个已授权候选项目的有限摘要。不发送原文件、完整聊天历史、历史图片或本地路径。" />
           <InfoRow label="敏感信息" value="API Key 保存在 Windows Credential Manager，不写入源码、JSON、备份或日志。" />
           <InfoRow label="云同步" value="未启用，保持仅本机项目。" />
           <div className="settings-action-row">
@@ -1092,13 +1124,8 @@ function renderSection(section: SettingsSection, data: SettingsRenderData) {
       );
     case "appearance":
       return (
-        <SectionFrame title="外观" description="延续当前深色与荧光蓝质感，保留基础主题切换。">
-          <InfoRow label="当前主题" value={data.theme === "dark" ? "深色模式" : "浅色模式"} />
-          <div className="settings-action-row">
-            <button type="button" className="btn" onClick={data.toggleTheme}>
-              切换主题
-            </button>
-          </div>
+        <SectionFrame title="外观" description="保留感冒院原有配色，不在本阶段更改颜色或主题。">
+          <InfoRow label="当前配色" value="暖白底色 · 朱红强调" />
         </SectionFrame>
       );
     case "advanced":

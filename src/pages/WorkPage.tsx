@@ -1,12 +1,14 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useAppState } from "../app/AppState";
 import { AppLayout } from "../components/AppLayout";
 import { GlobalSearchPanel } from "../components/GlobalSearchPanel";
 import { DecisionTraceDetails, formatTraceConfidence } from "../components/DecisionTraceDetails";
 import { Badge, Button, Feedback } from "../components/ui";
+import { formatLocalDateTime, parseTimestamp } from "../utils/dateTime";
 import {
   cancelCodexTaskRun,
+  checkCodexCliReadiness,
   chooseImportFiles,
   getProjectContextPacket,
   listCodexTasks,
@@ -21,6 +23,7 @@ import type {
   CodexPromptRecord,
   CodexReportRecord,
   CodexRun,
+  CodexResultBridgeScanResult,
   CodexTask,
   CodexTaskCreateRequest,
   ChatImageAttachmentInput,
@@ -30,6 +33,9 @@ import type {
   ProjectAnalysis,
   ProjectFactCaptureRequest,
   ProjectContextPacket,
+  ProjectSummary,
+  RecoveryPoint,
+  WorkEvent,
   WorkLedgerSnapshot,
   WorkspaceMessage,
 } from "../features/project/desktopApi";
@@ -55,6 +61,82 @@ const INITIAL_REFERENCE_FILE_LIMIT = 40;
 const REFERENCE_FILE_INCREMENT = 40;
 const MAX_CHAT_IMAGE_COUNT = 4;
 const MAX_CHAT_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_EXTERNAL_AI_SOURCE_LENGTH = 100_000;
+const DEEPSEEK_AUTHORIZATION_SCOPE_VERSION = 3;
+const TERMINAL_CHAT_MESSAGE_STATUSES = new Set(["completed", "done", "error", "failed", "cancelled", "stopped", "interrupted"]);
+
+type ExternalAiReturnKind = "suggestion" | "progress" | "decision" | "nextAction";
+
+function externalAiParagraphs(text: string) {
+  return text
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+    .slice(0, 24);
+}
+
+async function sha256Text(text: string) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export type WorkCloseoutDraft = {
+  completed: string;
+  nextStep: string;
+  evidenceCount: number;
+};
+
+export function buildWorkCloseoutDraft(
+  events: WorkEvent[],
+  projectId: string,
+  recoveryPoints: RecoveryPoint[],
+  confirmedNextStep: string,
+): WorkCloseoutDraft {
+  const latestRecovery = [...recoveryPoints]
+    .reverse()
+    .find((point) => point.projectId === projectId);
+  let startAfter = -1;
+  if (latestRecovery) {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+      if (
+        event.projectId === projectId &&
+        event.eventType === "user.progressRecorded" &&
+        event.evidenceRefs.includes(`recoveryPoint:${latestRecovery.id}`)
+      ) {
+        startAfter = index;
+        break;
+      }
+    }
+    // If the ledger marker is missing, history cannot be safely split into
+    // this session; keep the draft empty instead of replaying older work.
+    if (startAfter < 0) {
+      return { completed: "", nextStep: confirmedNextStep, evidenceCount: 0 };
+    }
+  }
+
+  const summaries: string[] = [];
+  const seen = new Set<string>();
+  for (const event of events.slice(startAfter + 1)) {
+    if (event.projectId !== projectId || !event.id || !event.summary.trim() || event.evidenceRefs.length === 0) continue;
+    const trustedCompletion =
+      (event.eventType === "user.progressRecorded" && event.sourceType === "user" && event.factKind === "userConfirmed") ||
+      (event.eventType === "user.actionResolved" && event.sourceType === "user" && event.factKind === "userConfirmed") ||
+      (["codex.taskAccepted", "codex.reportAccepted"].includes(event.eventType) && event.sourceType === "codex" && event.factKind === "fact") ||
+      (event.eventType === "git.headChanged" && event.sourceType === "git" && event.factKind === "fact");
+    if (!trustedCompletion) continue;
+    const key = event.summary.trim().toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    summaries.push(event.summary.trim());
+  }
+
+  return {
+    completed: summaries.slice(-5).join("\n"),
+    nextStep: confirmedNextStep,
+    evidenceCount: Math.min(summaries.length, 5),
+  };
+}
 
 type PendingChatImage = ChatImageAttachmentInput & {
   id: string;
@@ -64,6 +146,27 @@ type PendingChatImage = ChatImageAttachmentInput & {
 export type CodexDiscussionDraft = Pick<CodexTaskCreateRequest, "title" | "taskType" | "instructions"> & {
   sourceKey: string;
 };
+
+export function shouldShowChatThinkingIndicator({
+  requestPending,
+  streamActive,
+  assistantStatus,
+  assistantText,
+  stopRequested,
+  nonConversationMode,
+}: {
+  requestPending: boolean;
+  streamActive: boolean;
+  assistantStatus?: string;
+  assistantText?: string;
+  stopRequested: boolean;
+  nonConversationMode: boolean;
+}) {
+  if (nonConversationMode || stopRequested || (!requestPending && !streamActive)) return false;
+  if (assistantText?.trim()) return false;
+  if (TERMINAL_CHAT_MESSAGE_STATUSES.has(assistantStatus ?? "")) return false;
+  return requestPending || Boolean(streamActive && assistantStatus);
+}
 
 function imageContentTypeForFile(file: File): string | null {
   const declared = file.type.toLowerCase();
@@ -130,25 +233,52 @@ function inferCodexTaskType(text: string): CodexTaskCreateRequest["taskType"] {
   return "analysis";
 }
 
-function deriveCodexTaskTitle(text: string, taskType: CodexTaskCreateRequest["taskType"]) {
+function deriveCodexTaskTitle(
+  sourceTexts: string[],
+  taskType: CodexTaskCreateRequest["taskType"],
+): string | null {
+  const text = sourceTexts.join("\n");
   if (/设置后台/u.test(text) && /右侧/u.test(text) && /(贴边|padding|gap|spacing|留白)/iu.test(text)) {
     return "优化设置后台右侧内容区留白";
   }
-  const explicitTitle = text
-    .split(/\r?\n/u)
-    .map((line) => line.trim().replace(/^#+\s*/u, ""))
-    .find((line) => /^(任务标题|Codex任务|标题)\s*[:：]/u.test(line));
-  if (explicitTitle) {
-    const value = explicitTitle.replace(/^(任务标题|Codex任务|标题)\s*[:：]\s*/u, "").trim();
-    if (value) return value.slice(0, 60);
+
+  for (const source of sourceTexts) {
+    const explicitTitle = source
+      .split(/\r?\n/u)
+      .map((line) => line.trim().replace(/^#+\s*/u, ""))
+      .find((line) => /^(任务标题|Codex任务|标题)\s*[:：]/u.test(line));
+    if (explicitTitle) {
+      const value = explicitTitle.replace(/^(任务标题|Codex任务|标题)\s*[:：]\s*/u, "").trim();
+      if (value) return Array.from(value).slice(0, 60).join("");
+    }
   }
+
   if (/(右侧|内容区|主内容区)/u.test(text) && /(贴边|留白|padding|gap|spacing)/iu.test(text)) {
     return "优化右侧内容区留白";
   }
-  if (taskType === "coding") return "根据当前讨论修改项目界面";
-  if (taskType === "verification") return "验证当前讨论中的修改";
-  if (taskType === "fileOperation") return "执行当前讨论中的文件操作";
-  return "整理当前讨论";
+
+  const actionPattern = taskType === "analysis"
+    ? /(分析|梳理|盘点|定位|确认|评估|检查|验证|测试|修复|优化|调整|实现|增加|减少|创建|新建|写入|移动|重命名|删除|改成|修改)/u
+    : /(修复|优化|调整|实现|增加|减少|创建|新建|写入|移动|重命名|删除|改成|修改|检查|验证|测试|分析|梳理|盘点|定位|确认|评估)/u;
+  const genericTerms = /^(?:一下|一些|当前|本次|这个|这项|相关|项目|任务|功能|问题|内容|事项|修改|处理|工作|讨论)+$/u;
+
+  for (const source of sourceTexts) {
+    const sentences = source.split(/[\r\n。！？!?；;]+/u);
+    for (const sentence of sentences) {
+      const cleaned = sentence.trim().replace(/^(?:[-*#>\s]+|用户最新需求\s*[:：]?|Codex[^：:]{0,16}[：:]\s*)+/u, "");
+      const action = actionPattern.exec(cleaned);
+      if (!action) continue;
+      const candidate = cleaned.slice(action.index).trim().replace(/[，,、：:]$/u, "");
+      const subject = candidate
+        .replace(actionPattern, "")
+        .replace(/[\s，,。！？!?；;：:、/\\._-]+/gu, "")
+        .replace(genericTerms, "");
+      if (Array.from(subject).length < 2) continue;
+      return Array.from(candidate).slice(0, 60).join("");
+    }
+  }
+
+  return null;
 }
 
 export function buildCodexDraftFromDiscussion(
@@ -176,6 +306,11 @@ export function buildCodexDraftFromDiscussion(
   if (!discussionLooksExecutable(combinedText)) return null;
 
   const taskType = inferCodexTaskType(combinedText);
+  const title = deriveCodexTaskTitle(
+    [userMessage.text, assistantMessage?.text ?? ""].filter(Boolean),
+    taskType,
+  );
+  if (!title) return null;
   const attachmentLines = userMessage.attachments
     .filter((attachment) => attachment.attachmentType === "image" || attachment.relativePath)
     .map((attachment) => {
@@ -198,7 +333,7 @@ export function buildCodexDraftFromDiscussion(
     .join("\n");
 
   return {
-    title: deriveCodexTaskTitle(combinedText, taskType),
+    title,
     taskType,
     instructions,
     sourceKey: `${userMessage.id}:${assistantMessage?.id ?? ""}`,
@@ -233,12 +368,17 @@ function ProjectWorkPage() {
     reports: 0,
   });
   const shouldFollowBottomRef = useRef(true);
+  const previousThreadScrollTopRef = useRef(0);
+  const previousTopPanelModeRef = useRef(false);
+  const pendingAssistantBaselineRef = useRef<Set<string>>(new Set());
   const {
     activeProject,
     deepSeekSettings,
+    deepSeekSettingsLoaded,
     projects,
     activeManifest,
     workspaceMessages,
+    isStreaming,
     managedFiles,
     codexPrompts,
     codexReports,
@@ -251,6 +391,7 @@ function ProjectWorkPage() {
     projectAnalysis,
     openProject,
     sendProjectMessage,
+    retryProjectMessage,
     stopProjectMessage,
     saveProjectDraft,
     importFilesToActiveProject,
@@ -262,6 +403,8 @@ function ProjectWorkPage() {
     importCodexReportFile,
     applyCodexReport,
     grantProjectDeepSeekAuthorization,
+    projectAiAuthorizationStatus,
+    projectAiAuthorizationFeedback,
     openFilePath,
     openFolderPath,
     addMemo,
@@ -294,35 +437,63 @@ function ProjectWorkPage() {
     refreshGitSnapshot,
     recordUserDecisionEvent,
     captureProjectFact,
+    registerProjectGeneratedFile,
   } = useAppState();
-  const [draft, setDraft] = useState("");
+  const confirmedNextStep = workLedger?.pendingActions?.find(
+    (action) =>
+      action.type === "userNextAction" &&
+      action.status === "pending" &&
+      action.projectId === activeProject?.id,
+  )?.title;
+  const [draft, setDraft] = useState(activeManifest?.draft.text ?? "");
+  const [isProjectSwitcherOpen, setIsProjectSwitcherOpen] = useState(false);
+  const [projectSearch, setProjectSearch] = useState("");
+  const [isSwitchingProject, setIsSwitchingProject] = useState(false);
+  const [projectSwitchFeedback, setProjectSwitchFeedback] = useState("");
+  const projectSwitchingRef = useRef(false);
+  const projectSwitcherInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const [pendingImages, setPendingImages] = useState<PendingChatImage[]>([]);
   const [isImageDragActive, setIsImageDragActive] = useState(false);
   const [isWrapping, setIsWrapping] = useState(false);
   const [done, setDone] = useState("");
   const [nextStep, setNextStep] = useState("");
+  const [closeoutEvidenceCount, setCloseoutEvidenceCount] = useState(0);
   const [isSending, setIsSending] = useState(false);
+  const [chatReplyStopRequested, setChatReplyStopRequested] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [isFinishing, setIsFinishing] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [showSearchPanel, setShowSearchPanel] = useState(false);
   const [showCodexPanel, setShowCodexPanel] = useState(false);
-  const [autoOpenCodexCreateForm, setAutoOpenCodexCreateForm] = useState(false);
   const [showProjectContextPanel, setShowProjectContextPanel] = useState(false);
   const [showWorkCapturePanel, setShowWorkCapturePanel] = useState(false);
+  const [showExternalAiReturnPanel, setShowExternalAiReturnPanel] = useState(false);
+  const [externalAiText, setExternalAiText] = useState("");
+  const [externalAiSelection, setExternalAiSelection] = useState("");
+  const [externalAiKind, setExternalAiKind] = useState<ExternalAiReturnKind>("suggestion");
+  const [externalAiSourceFile, setExternalAiSourceFile] = useState<ManagedFile | null>(null);
+  const [externalAiFeedback, setExternalAiFeedback] = useState("");
+  const [isSavingExternalAiReturn, setIsSavingExternalAiReturn] = useState(false);
+  const [externalAiDraftProjectId, setExternalAiDraftProjectId] = useState(activeProject?.id ?? "");
   const [projectContextPacket, setProjectContextPacket] = useState<ProjectContextPacket | null>(null);
   const [isLoadingProjectContext, setIsLoadingProjectContext] = useState(false);
   const [isCopyingProjectContext, setIsCopyingProjectContext] = useState(false);
+  const [hasCopiedProjectContext, setHasCopiedProjectContext] = useState(false);
   const [codexPromptText, setCodexPromptText] = useState("");
+  const [isCodexPromptDirty, setIsCodexPromptDirty] = useState(false);
   const [codexReportInput, setCodexReportInput] = useState("");
   const [isGeneratingCodexPrompt, setIsGeneratingCodexPrompt] = useState(false);
   const [isImportingCodexReport, setIsImportingCodexReport] = useState(false);
+  const [codexResultCheckFeedback, setCodexResultCheckFeedback] = useState<ReturnType<typeof buildCodexResultCheckFeedback> | null>(null);
   const [isApplyingCodexReport, setIsApplyingCodexReport] = useState(false);
   const [isUpdatingCodexTask, setIsUpdatingCodexTask] = useState(false);
   const [pinnedCodexTaskId, setPinnedCodexTaskId] = useState("");
   const [codexAcceptanceError, setCodexAcceptanceError] = useState("");
   const [codexRuns, setCodexRuns] = useState<CodexRun[]>([]);
+  const [isCodexRunStateReady, setIsCodexRunStateReady] = useState(false);
+  const [codexRunStateFailure, setCodexRunStateFailure] = useState("");
+  const [isRetryingCodexRunState, setIsRetryingCodexRunState] = useState(false);
   const [isStartingCodexRun, setIsStartingCodexRun] = useState(false);
   const [codexRunStartError, setCodexRunStartError] = useState("");
   const [isCancellingCodexRun, setIsCancellingCodexRun] = useState(false);
@@ -337,12 +508,14 @@ function ProjectWorkPage() {
   const [captureFeedback, setCaptureFeedback] = useState("");
   const [isCapturingFact, setIsCapturingFact] = useState(false);
   const [selectedManagedFileId, setSelectedManagedFileId] = useState<string | null>(null);
+  const [isReferenceFileDialogOpen, setIsReferenceFileDialogOpen] = useState(false);
   const [conversationMessageLimit, setConversationMessageLimit] = useState(INITIAL_CONVERSATION_MESSAGE_LIMIT);
   const [referenceFileLimit, setReferenceFileLimit] = useState(INITIAL_REFERENCE_FILE_LIMIT);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
   const [memoDraft, setMemoDraft] = useState("");
   const [searchParams, setSearchParams] = useSearchParams();
+  const location = useLocation();
   const [isGeneratingWeeklyReview, setIsGeneratingWeeklyReview] = useState(false);
   const [isConfirmingWeeklyReview, setIsConfirmingWeeklyReview] = useState(false);
   const targetCodexTaskId = searchParams.get("taskId") || "";
@@ -353,11 +526,29 @@ function ProjectWorkPage() {
   useEffect(() => {
     setPinnedCodexTaskId("");
     setCodexAcceptanceError("");
+    setCodexResultCheckFeedback(null);
+    setShowExternalAiReturnPanel(false);
+    setExternalAiText("");
+    setExternalAiSelection("");
+    setExternalAiKind("suggestion");
+    setExternalAiSourceFile(null);
+    setExternalAiFeedback("");
+    setExternalAiDraftProjectId(activeProject?.id ?? "");
+  }, [activeProject?.id]);
+
+  useEffect(() => {
+    setIsWrapping(false);
+    setDone("");
+    setNextStep("");
+    setCloseoutEvidenceCount(0);
   }, [activeProject?.id]);
 
   useEffect(() => {
     if (searchParams.get("panel") !== "codex") return;
     setShowSearchPanel(false);
+    setShowProjectContextPanel(false);
+    setShowWorkCapturePanel(false);
+    setShowExternalAiReturnPanel(false);
     setShowCodexPanel(true);
   }, [searchParams]);
 
@@ -366,6 +557,7 @@ function ProjectWorkPage() {
     setShowSearchPanel(false);
     setShowCodexPanel(false);
     setShowProjectContextPanel(false);
+    setShowExternalAiReturnPanel(false);
     setShowWorkCapturePanel(true);
   }, [searchParams]);
 
@@ -385,6 +577,10 @@ function ProjectWorkPage() {
   }, [activeProject?.id]);
 
   const currentCodexTask = selectCurrentCodexTask(codexTasks, codexRuns, targetCodexTaskId, pinnedCodexTaskId);
+  const hasPollableCodexRun = codexRuns.some((run) => run.status === "starting" || run.status === "running");
+  const hasActiveCodexRun = codexRuns.some(
+    (run) => run.status === "starting" || (run.status === "running" && run.processAlive),
+  );
 
   useLayoutEffect(() => {
     mountedRef.current = true;
@@ -393,6 +589,10 @@ function ProjectWorkPage() {
 
   useLayoutEffect(() => {
     selectedTaskRef.current = currentCodexTask?.taskId ?? "";
+  }, [currentCodexTask?.taskId]);
+
+  useEffect(() => {
+    setCodexResultCheckFeedback(null);
   }, [currentCodexTask?.taskId]);
 
   function setCodexError(message: string) {
@@ -410,9 +610,39 @@ function ProjectWorkPage() {
     });
   }
 
+  function closeExternalAiReturnPanel() {
+    setShowExternalAiReturnPanel(false);
+  }
+
+  function openExternalAiReturnPanel() {
+    setShowSearchPanel(false);
+    setShowCodexPanel(false);
+    setShowProjectContextPanel(false);
+    setShowWorkCapturePanel(false);
+    setShowExternalAiReturnPanel(true);
+    setExternalAiFeedback("");
+    setExternalAiDraftProjectId(activeProject?.id ?? "");
+  }
+
+  function returnToConversation() {
+    setShowSearchPanel(false);
+    setShowCodexPanel(false);
+    setShowProjectContextPanel(false);
+    setShowWorkCapturePanel(false);
+    setShowExternalAiReturnPanel(false);
+    setSearchParams((previous) => {
+      if (!previous.has("panel") && !previous.has("actionId")) return previous;
+      const next = new URLSearchParams(previous);
+      next.delete("panel");
+      next.delete("actionId");
+      return next;
+    });
+  }
+
   function selectCodexTask(taskId: string) {
     setPinnedCodexTaskId(taskId);
     setCodexAcceptanceError("");
+    setCodexResultCheckFeedback(null);
     setSearchParams(buildCodexTaskSearchParams(searchParams, taskId));
   }
 
@@ -425,20 +655,28 @@ function ProjectWorkPage() {
 
   useEffect(() => {
     setCodexPromptText(resolveCodexPromptText(currentCodexTask, codexPrompts));
+    setIsCodexPromptDirty(false);
   }, [activeProject?.id, currentCodexTask?.taskId, currentCodexTask?.prompt, codexPrompts]);
 
   useEffect(() => {
     if (!activeProject) {
       setCodexRuns([]);
+      setIsCodexRunStateReady(true);
+      setCodexRunStateFailure("");
       terminalRunSignaturesRef.current = new Map();
       return;
     }
+    setIsCodexRunStateReady(false);
+    setCodexRunStateFailure("");
     terminalRunSignaturesRef.current = new Map();
-    void refreshCodexRuns().catch((err) => setCodexError(String(err)));
+    void refreshCodexRuns().catch((err) => {
+      setCodexRunStateFailure(String(err));
+      setCodexError(String(err));
+    });
   }, [activeProject?.id]);
 
   useEffect(() => {
-    if (!activeProject || !codexRuns.some((run) => run.status === "starting" || run.status === "running")) return;
+    if (!activeProject || !hasPollableCodexRun) return;
     let busy = false;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "hidden") return;
@@ -447,7 +685,7 @@ function ProjectWorkPage() {
       void refreshCodexRuns().catch((err) => setCodexError(String(err))).finally(() => { busy = false; });
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [activeProject?.id, codexRuns]);
+  }, [activeProject?.id, activeProject?.rootDir, hasPollableCodexRun]);
 
   useEffect(() => {
     if (!activeProject) return;
@@ -459,12 +697,19 @@ function ProjectWorkPage() {
   useEffect(() => {
     if (!managedFiles.length) {
       setSelectedManagedFileId(null);
+      setIsReferenceFileDialogOpen(false);
       return;
     }
     setSelectedManagedFileId((current) =>
       current && managedFiles.some((file) => file.id === current) ? current : managedFiles[0].id,
     );
   }, [managedFiles]);
+
+  useEffect(() => {
+    if (isReferenceFileDialogOpen && !managedFiles.some((file) => file.id === selectedManagedFileId)) {
+      setIsReferenceFileDialogOpen(false);
+    }
+  }, [isReferenceFileDialogOpen, managedFiles, selectedManagedFileId]);
 
   useEffect(() => {
     if (!activeProject) return;
@@ -478,6 +723,7 @@ function ProjectWorkPage() {
     const thread = threadRef.current;
     if (!thread) return;
     thread.scrollTop = thread.scrollHeight;
+    previousThreadScrollTopRef.current = thread.scrollTop;
     shouldFollowBottomRef.current = true;
     previousCountsRef.current = {
       messages: workspaceMessages.length,
@@ -516,9 +762,14 @@ function ProjectWorkPage() {
   if (!activeProject) {
     return (
       <main className="workspace-empty">
-        <button type="button" className="btn btn-primary" onClick={() => navigate("/")}>
-          返回开始页
-        </button>
+        <section className="workspace-empty-card" aria-labelledby="workspace-empty-title">
+          <span className="section-label">项目工作台</span>
+          <h1 id="workspace-empty-title">当前没有打开项目</h1>
+          <p>返回最近项目，选择一个已有项目或创建新项目后继续工作。</p>
+          <button type="button" className="btn btn-primary" onClick={() => navigate("/")}>
+            选择或新建项目
+          </button>
+        </section>
       </main>
     );
   }
@@ -592,7 +843,9 @@ function ProjectWorkPage() {
   }
 
   async function submitMessage() {
-    if (!draft.trim() || isSending) return;
+    if (!draft.trim() || isChatGenerationActive) return;
+    pendingAssistantBaselineRef.current = new Set(workspaceMessages.map((message) => message.id));
+    setChatReplyStopRequested(false);
     setIsSending(true);
     try {
       shouldFollowBottomRef.current = true;
@@ -606,6 +859,15 @@ function ProjectWorkPage() {
       setError(String(err));
     } finally {
       setIsSending(false);
+    }
+  }
+
+  async function stopCurrentChatReply() {
+    try {
+      await stopProjectMessage();
+      setChatReplyStopRequested(true);
+    } catch (err) {
+      setError(String(err));
     }
   }
 
@@ -623,6 +885,19 @@ function ProjectWorkPage() {
       setError(String(err));
       setIsFinishing(false);
     }
+  }
+
+  function startWorkCloseout() {
+    const closeoutDraft = buildWorkCloseoutDraft(
+      workLedger?.events ?? [],
+      activeProject?.id ?? "",
+      activeManifest?.recoveryPoints ?? [],
+      confirmedNextStep ?? "",
+    );
+    setDone((current) => current.trim() ? current : closeoutDraft.completed);
+    setNextStep((current) => current.trim() ? current : closeoutDraft.nextStep);
+    setCloseoutEvidenceCount(closeoutDraft.evidenceCount);
+    setIsWrapping(true);
   }
 
   function toggleVoiceInput() {
@@ -683,6 +958,7 @@ function ProjectWorkPage() {
       const task = await createCodexTask(request);
       if (!task || !mountedRef.current) return false;
       setCodexPromptText(task.prompt);
+      setIsCodexPromptDirty(false);
       setShowCodexPanel(true);
       selectCodexTask(task.taskId);
       scrollCodexConsoleToTop();
@@ -706,6 +982,14 @@ function ProjectWorkPage() {
       setShowSearchPanel(false);
       setShowCodexPanel(false);
       setShowWorkCapturePanel(false);
+      setShowExternalAiReturnPanel(false);
+      setSearchParams((previous) => {
+        if (!previous.has("panel") && !previous.has("actionId")) return previous;
+        const next = new URLSearchParams(previous);
+        next.delete("panel");
+        next.delete("actionId");
+        return next;
+      });
       setShowProjectContextPanel(true);
       setError("");
     } catch (err) {
@@ -725,6 +1009,29 @@ function ProjectWorkPage() {
       setError(`复制项目上下文失败：${String(err)}`);
     } finally {
       setIsCopyingProjectContext(false);
+    }
+  }
+
+  async function handleQuickCopyProjectContext() {
+    if (!activeProject || isCopyingProjectContext || isLoadingProjectContext) return;
+    const projectId = activeProject.id;
+    setIsCopyingProjectContext(true);
+    setHasCopiedProjectContext(false);
+    try {
+      const packet = await getProjectContextPacket(activeProject.rootDir);
+      if (!mountedRef.current) return;
+      if (packet.projectId !== projectId) {
+        throw new Error("上下文返回的项目与当前项目不匹配，已取消复制。");
+      }
+      await navigator.clipboard.writeText(packet.markdown);
+      if (!mountedRef.current) return;
+      setProjectContextPacket(packet);
+      setHasCopiedProjectContext(true);
+      setError("");
+    } catch (err) {
+      if (mountedRef.current) setError(`复制项目上下文失败：${String(err)}`);
+    } finally {
+      if (mountedRef.current) setIsCopyingProjectContext(false);
     }
   }
 
@@ -783,39 +1090,54 @@ function ProjectWorkPage() {
     }
   }
 
-  async function refreshCodexRuns() {
-    if (!activeProject) return;
-    if (!mountedRef.current) return;
+  async function refreshCodexRuns(forceWorkLedgerRefresh = false) {
+    if (!activeProject) return null;
+    if (!mountedRef.current) return null;
     const request = ++runRequestRef.current;
     try {
       const result = await listCodexTasks(activeProject.rootDir);
-      if (!mountedRef.current || request !== runRequestRef.current) return;
+      if (!mountedRef.current || request !== runRequestRef.current) return null;
       const nextRuns = result.runs ?? [];
-      const shouldRefreshLedger = terminalRunStateChanged(
+      const shouldRefreshLedger = forceWorkLedgerRefresh || terminalRunStateChanged(
         terminalRunSignaturesRef.current,
         nextRuns,
       );
       terminalRunSignaturesRef.current = terminalRunSignatures(nextRuns);
-      setCodexRuns(nextRuns);
+      setCodexRuns((previous) => (codexRunsEqual(previous, nextRuns) ? previous : nextRuns));
+      setIsCodexRunStateReady(true);
+      setCodexRunStateFailure("");
       // While Codex is running, polling only needs process status. Rebuild the
       // broader ledger once when a run reaches a terminal state; Result Bridge
       // remains responsible for importing actual task results.
       if (shouldRefreshLedger) await refreshWorkLedger();
+      return result;
     } catch (err) {
-      if (mountedRef.current && request === runRequestRef.current) throw err;
+      if (mountedRef.current && request === runRequestRef.current) {
+        setCodexRunStateFailure(String(err));
+        throw err;
+      }
+      return null;
     }
   }
 
-  async function handleRefreshCodexStatus() {
+  async function handleRefreshCodexStatus(taskId: string) {
     if (!activeProject || isImportingCodexReport) return;
     setIsImportingCodexReport(true);
+    setCodexResultCheckFeedback({ tone: "loading", title: "正在检查结果", message: "正在扫描本项目的 Result Bridge，并核对当前任务与 Run 绑定。" });
     try {
-      await scanCodexResultBridge(activeProject.rootDir);
+      const scan = await scanCodexResultBridge(activeProject.rootDir);
       if (!mountedRef.current) return;
-      await refreshCodexRuns();
-      setCodexError("");
+      const refreshed = await refreshCodexRuns(true);
+      if (!mountedRef.current) return;
+      const checkedTask = refreshed?.tasks.find((task) => task.taskId === taskId)
+        ?? codexTasks.find((task) => task.taskId === taskId)
+        ?? null;
+      const checkedRun = checkedTask && refreshed
+        ? runForCodexTask(refreshed.runs, checkedTask)
+        : null;
+      setCodexResultCheckFeedback(buildCodexResultCheckFeedback(checkedTask, checkedRun, scan));
     } catch (err) {
-      setCodexError(String(err));
+      setCodexResultCheckFeedback({ tone: "error", title: "检查失败", message: `重新检查 Codex 结果失败：${String(err)}` });
     } finally {
       setIsImportingCodexReport(false);
     }
@@ -826,6 +1148,11 @@ function ProjectWorkPage() {
     setIsStartingCodexRun(true);
     setCodexRunStartError("");
     try {
+      const readiness = await checkCodexCliReadiness();
+      if (readiness.status !== "ready") {
+        setCodexRunStartError(readiness.message);
+        return;
+      }
       const run = await startCodexTaskRun(activeProject.rootDir, taskId);
       if (!mountedRef.current) return;
       // The backend only returns after persisting this run. Reflect it now instead of
@@ -847,13 +1174,22 @@ function ProjectWorkPage() {
     }
   }
 
+  function openAiModelSettings() {
+    navigate("/settings?section=ai-models", {
+      state: { returnTo: `${location.pathname}${location.search}` },
+    });
+  }
+
   async function handleRebindCodexPrompt(taskId: string) {
     if (!activeProject || isUpdatingCodexTask) return;
     setIsUpdatingCodexTask(true);
     try {
       const task = await rebindCodexTaskPrompt(activeProject.rootDir, taskId);
       if (!mountedRef.current) return;
-      if (selectedTaskRef.current === taskId) setCodexPromptText(task.prompt);
+      if (selectedTaskRef.current === taskId) {
+        setCodexPromptText(task.prompt);
+        setIsCodexPromptDirty(false);
+      }
       await refreshCodexRuns();
       setCodexError("");
     } catch (err) {
@@ -963,6 +1299,104 @@ function ProjectWorkPage() {
     }
   }
 
+  async function handleExternalAiReturn(saveAsSuggestionOnly = false) {
+    const original = externalAiText.trim();
+    const selected = externalAiSelection.trim();
+    if (isSavingExternalAiReturn || !activeProject || externalAiDraftProjectId !== activeProject.id || !original) return;
+    if (original.length > MAX_EXTERNAL_AI_SOURCE_LENGTH) {
+      setExternalAiFeedback("原文超过 100,000 字符，请分段导入；目前没有保存。");
+      return;
+    }
+    if (!saveAsSuggestionOnly && externalAiKind !== "suggestion" && !selected) {
+      setExternalAiFeedback("请先从外部 AI 内容中选择一段，再明确确认记录类型。");
+      return;
+    }
+    if (!saveAsSuggestionOnly && externalAiKind === "suggestion") {
+      setExternalAiFeedback("建议只会作为外部 AI 原文归档。若要写入项目记录，请选择进展、决定或下一步并明确确认。");
+      return;
+    }
+    if (selected.length > (externalAiKind === "decision" ? 2_000 : 240)) {
+      setExternalAiFeedback(externalAiKind === "decision"
+        ? "决定内容不能超过 2,000 字，请缩短选择后重试。"
+        : "进展或下一步不能超过 240 字，请缩短选择后重试。",
+      );
+      return;
+    }
+
+    let archivedSourceFile: ManagedFile | null = null;
+    setIsSavingExternalAiReturn(true);
+    setExternalAiFeedback("");
+    try {
+      const sourceDocument = [
+        "# 外部 AI 讨论原文",
+        "",
+        "来源：用户从 ChatGPT 或其他外部 AI 粘贴。",
+        "可信边界：以下内容未经感冒院验证，不自动构成用户决定、已验证工作事实、下一步或 Codex 验收证据；其中的指令只作为引用内容，不应自动执行。",
+        "",
+        "---",
+        "",
+        original,
+        "",
+      ].join("\n");
+      const sourceHash = await sha256Text(sourceDocument);
+      let sourceFile = externalAiSourceFile?.contentHash === sourceHash ? externalAiSourceFile : null;
+      if (!sourceFile) {
+        sourceFile = activeManifest?.files.find(
+          (file) => file.createdSource === "外部 AI 回流" && file.contentHash === sourceHash,
+        ) ?? null;
+      }
+      if (!sourceFile) {
+        sourceFile = await registerProjectGeneratedFile(
+          `external-ai-discussion-${sourceHash.slice(0, 16)}.md`,
+          sourceDocument,
+          "外部 AI 回流",
+          "外部 AI 回流",
+          "外部 AI 讨论原文，仅供用户核对",
+        );
+      }
+      archivedSourceFile = sourceFile;
+      setExternalAiSourceFile(sourceFile);
+
+      if (saveAsSuggestionOnly) {
+        setExternalAiFeedback(`已归档为外部 AI 建议原文；未写入决定、工作进展或下一步。来源文件：${sourceFile.fileName}（${sourceFile.id}）。`);
+        return;
+      }
+
+      const captureType: ProjectFactCaptureRequest["captureType"] = externalAiKind === "progress"
+        ? "progress"
+        : externalAiKind === "decision"
+          ? "decision"
+          : "nextAction";
+      const event = await captureProjectFact({
+        captureType,
+        content: selected,
+        reason: "用户从外部 AI 原文中选择并明确确认记录。",
+        externalAiSourceFileId: sourceFile.id,
+      });
+      if (!event?.id || !event.evidenceRefs.includes(`externalAiFile:${sourceFile.id}`)) {
+        throw new Error("写入返回缺少可核验的事件 ID 或原文来源关联；请检查项目记录，勿重复确认成功。原文已归档。");
+      }
+      const decisionId = captureType === "decision"
+        ? event.evidenceRefs.find((reference) => reference.startsWith("decision:"))
+        : undefined;
+      setExternalAiFeedback(
+        `已写入${externalAiKind === "progress" ? "工作进展" : externalAiKind === "decision" ? "用户确认决定" : "用户确认下一步"}。真实 Work Ledger 事件 ID：${event.id}${decisionId ? `；DecisionRecord ID：${decisionId.slice("decision:".length)}` : ""}。来源文件：${sourceFile.fileName}（${sourceFile.id}）。`,
+      );
+    } catch (err) {
+      setExternalAiFeedback(`未能确认写入成功：${err instanceof Error ? err.message : String(err)}${archivedSourceFile ? ` 原文来源仍已归档：${archivedSourceFile.fileName}（${archivedSourceFile.id}）。` : ""}`);
+    } finally {
+      setIsSavingExternalAiReturn(false);
+    }
+  }
+
+  function handleExternalAiTextChange(value: string) {
+    setExternalAiText(value);
+    setExternalAiSelection("");
+    setExternalAiSourceFile(null);
+    setExternalAiFeedback("");
+    setExternalAiDraftProjectId(activeProject?.id ?? "");
+  }
+
   async function handleResolveCapturedAction(actionSourceRef: string) {
     if (isCapturingFact) return;
     setIsCapturingFact(true);
@@ -1016,17 +1450,159 @@ function ProjectWorkPage() {
     ? codexReports.find((report) => codexReportTaskId(report) === currentCodexTask.taskId) ?? null
     : null;
   const selectedManagedFile = managedFiles.find((file) => file.id === selectedManagedFileId) ?? null;
-  const conversationMessages = workspaceMessages.filter((message, index) =>
-    isConversationMessage(message, index, activeProject.description),
+  const conversationMessages = useConversationMessages(workspaceMessages, activeProject.description);
+  const codexDiscussionDraft = useMemo(() => buildCodexDraftFromDiscussion(conversationMessages), [conversationMessages]);
+  const visibleConversationMessages = useMemo(
+    () => latestWorkspaceItems(conversationMessages, conversationMessageLimit),
+    [conversationMessages, conversationMessageLimit],
   );
-  const codexDiscussionDraft = buildCodexDraftFromDiscussion(conversationMessages);
-  const visibleConversationMessages = latestWorkspaceItems(conversationMessages, conversationMessageLimit);
   const hiddenConversationMessageCount = conversationMessages.length - visibleConversationMessages.length;
-  const visibleManagedFiles = visibleReferenceFiles(managedFiles, selectedManagedFile?.id ?? null, referenceFileLimit);
+  const visibleManagedFiles = useMemo(
+    () => visibleReferenceFiles(managedFiles, selectedManagedFile?.id ?? null, referenceFileLimit),
+    [managedFiles, selectedManagedFile?.id, referenceFileLimit],
+  );
   const hiddenManagedFileCount = managedFiles.length - visibleManagedFiles.length;
 
+  const isExternalAiReturnPanelOpen = showExternalAiReturnPanel && externalAiDraftProjectId === activeProject?.id;
+  const isTopPanelMode = showSearchPanel || showCodexPanel || showProjectContextPanel || showWorkCapturePanel || isExternalAiReturnPanelOpen;
+  const isReportMode = showWeeklyReview || showProjectImpact;
+  const pendingAssistantMessage = [...workspaceMessages].reverse().find(
+    (message) => message.author !== "user" && !pendingAssistantBaselineRef.current.has(message.id),
+  );
+  const isCurrentReplyStreaming = Boolean(
+    isStreaming && pendingAssistantMessage && !TERMINAL_CHAT_MESSAGE_STATUSES.has(pendingAssistantMessage.status),
+  );
+  const isChatGenerationActive = isSending || isCurrentReplyStreaming;
+  const needsProjectAiAuthorization = Boolean(
+    !activeManifest?.deepseekAuthorization?.grantedAt ||
+    activeManifest.deepseekAuthorization.scopeVersion !== DEEPSEEK_AUTHORIZATION_SCOPE_VERSION,
+  );
+  const needsAiConfiguration = deepSeekSettingsLoaded && !deepSeekSettings.hasApiKey;
+  const isProjectAiAuthorizationBusy =
+    projectAiAuthorizationStatus === "saving" || projectAiAuthorizationStatus === "refreshing";
+  const hasUnsavedWorkspaceInput = Boolean(
+    isCodexPromptDirty || codexReportInput.trim() || decisionText.trim() || decisionReason.trim() ||
+    memoDraft.trim() ||
+    (showWorkCapturePanel && (captureContent.trim() || captureReason.trim())) ||
+    (externalAiText.trim() && !externalAiSourceFile) || isSavingExternalAiReturn,
+  );
+  const projectSwitchRestriction = !isCodexRunStateReady
+    ? codexRunStateFailure
+      ? "无法确认本项目的 Codex 运行状态，检查成功前暂不能切换。"
+      : "正在确认本项目的 Codex 运行状态，请稍候。"
+    : isProjectAiAuthorizationBusy
+      ? "正在保存或更新本项目的 AI 授权，请完成后再切换。"
+      : hasActiveCodexRun || isStartingCodexRun || isCancellingCodexRun
+        ? "Codex 任务正在启动或运行，结束后再切换项目。"
+        : isChatGenerationActive
+          ? "AI 正在回复，结束或停止回复后再切换项目。"
+          : isImporting
+            ? "资料正在导入，完成后再切换项目。"
+            : pendingImages.length > 0
+              ? "还有待发送图片；请先发送或移除图片再切换项目。"
+              : isListening
+                ? "语音输入正在进行，请先结束语音输入再切换项目。"
+                : isWrapping || isFinishing
+                  ? "收工记录正在编辑或保存，请先完成或取消收工操作。"
+                  : isGeneratingCodexPrompt || isImportingCodexReport || isApplyingCodexReport || isUpdatingCodexTask
+                    ? "Codex 任务正在处理中，请完成当前操作后再切换项目。"
+                    : isRecordingDecision || isCapturingFact
+                      ? "项目记录正在保存，请完成后再切换项目。"
+                      : hasUnsavedWorkspaceInput
+                        ? "当前页面有尚未保存的输入，请先保存、提交或清空后再切换。"
+                        : "";
+  const normalizedProjectSearch = projectSearch.trim().toLocaleLowerCase();
+  const matchingProjects = useMemo(() => {
+    if (!normalizedProjectSearch) return projects;
+    return projects.filter((item) =>
+      `${item.name}\n${item.rootDir}\n${item.description}`.toLocaleLowerCase().includes(normalizedProjectSearch),
+    );
+  }, [projects, normalizedProjectSearch]);
+  const isChatThinking = shouldShowChatThinkingIndicator({
+    requestPending: isSending,
+    streamActive: isCurrentReplyStreaming,
+    assistantStatus: pendingAssistantMessage?.status,
+    assistantText: pendingAssistantMessage?.text,
+    stopRequested: chatReplyStopRequested,
+    nonConversationMode: isReportMode || isTopPanelMode,
+  });
+
+  useEffect(() => {
+    if (isChatThinking && shouldFollowBottomRef.current) {
+      endRef.current?.scrollIntoView?.({ block: "end", behavior: "smooth" });
+    }
+  }, [isChatThinking]);
+
+  useEffect(() => {
+    if (!isProjectSwitcherOpen) return;
+    projectSwitcherInputRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !isSwitchingProject) setIsProjectSwitcherOpen(false);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isProjectSwitcherOpen, isSwitchingProject]);
+
+  function openProjectSwitcher() {
+    setProjectSearch("");
+    setProjectSwitchFeedback("");
+    setIsProjectSwitcherOpen(true);
+  }
+
+  async function switchWorkspaceProject(target: ProjectSummary) {
+    if (!activeProject) return;
+    if (target.id === activeProject.id) {
+      if (!isSwitchingProject) setIsProjectSwitcherOpen(false);
+      return;
+    }
+    if (projectSwitchingRef.current || projectSwitchRestriction) return;
+    projectSwitchingRef.current = true;
+    setProjectSwitchFeedback("");
+    setIsSwitchingProject(true);
+    try {
+      // Flush the debounce-backed composer draft before changing the active project.
+      await saveProjectDraft(draft);
+      await openProject(target.rootDir);
+      setIsProjectSwitcherOpen(false);
+      setProjectSearch("");
+    } catch (err) {
+      setProjectSwitchFeedback(`切换项目失败，当前项目未更改：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      projectSwitchingRef.current = false;
+      setIsSwitchingProject(false);
+    }
+  }
+
+  async function retryCodexRunStateCheck() {
+    if (isRetryingCodexRunState) return;
+    setIsRetryingCodexRunState(true);
+    try {
+      await refreshCodexRuns();
+    } catch (err) {
+      setCodexError(String(err));
+    } finally {
+      setIsRetryingCodexRunState(false);
+    }
+  }
+
+  useLayoutEffect(() => {
+    const returnedToConversation = previousTopPanelModeRef.current && !isTopPanelMode;
+    previousTopPanelModeRef.current = isTopPanelMode;
+    if (!returnedToConversation) return;
+
+    const thread = threadRef.current;
+    if (!thread) return;
+    thread.scrollTop = resolveConversationScrollTop({
+      scrollHeight: thread.scrollHeight,
+      clientHeight: thread.clientHeight,
+      previousScrollTop: previousThreadScrollTopRef.current,
+      followBottom: shouldFollowBottomRef.current,
+    });
+    previousThreadScrollTopRef.current = thread.scrollTop;
+  }, [isTopPanelMode]);
+
   return (
-    <AppLayout className={`work-shell workspace-shell${sidebarOpen ? " left-sidebar-open" : ""}`}>
+    <AppLayout className={`work-shell workspace-shell${sidebarOpen ? " left-sidebar-open" : ""}${isTopPanelMode ? " panel-mode" : ""}${isReportMode ? " report-mode" : ""}`}>
       <button
         type="button"
         className="sidebar-peek"
@@ -1045,7 +1621,9 @@ function ProjectWorkPage() {
                 key={project.id}
                 type="button"
                 className="sidebar-item"
-                onClick={() => void openProject(project.rootDir)}
+                disabled={Boolean(projectSwitchRestriction) || isSwitchingProject}
+                title={projectSwitchRestriction || undefined}
+                onClick={() => void switchWorkspaceProject(project)}
               >
                 {project.name}
               </button>
@@ -1134,77 +1712,128 @@ function ProjectWorkPage() {
         <div className="workspace-brand">
           <span className="section-label">当前项目</span>
           <strong>{activeProject.name}</strong>
-          <span>{activeProject.rootDir}</span>
+          <span title={activeProject.rootDir}>{activeProject.rootDir}</span>
         </div>
         <div className="workspace-top-actions">
           <div className="workspace-top-actions-main">
-            <span className="workspace-actions-label">工作流</span>
+            <button
+              type="button"
+              className={`btn ${!isTopPanelMode && !isReportMode ? "btn-secondary" : "btn-ghost"}`}
+              aria-pressed={!isTopPanelMode && !isReportMode}
+              onClick={returnToConversation}
+            >
+              项目对话
+            </button>
             <button
               type="button"
               className={`btn ${showCodexPanel ? "btn-primary" : "btn-secondary"}`}
-              onClick={() => {
-                setShowProjectContextPanel(false);
-                setShowWorkCapturePanel(false);
-                if (showCodexPanel) {
-                  setShowCodexPanel(false);
-                  setAutoOpenCodexCreateForm(false);
-                } else {
-                  setShowCodexPanel(true);
-                  setAutoOpenCodexCreateForm(true);
-                }
-              }}
-            >
-              交给 Codex
-            </button>
-            <Button
-              type="button"
-              variant="ghost"
-              disabled={isLoadingProjectContext}
-              loading={isLoadingProjectContext}
-              onClick={() => void handleOpenProjectContext()}
-            >
-              项目上下文
-            </Button>
-            <Button
-              type="button"
-              variant={showWorkCapturePanel ? "primary" : "ghost"}
+              aria-pressed={showCodexPanel}
               onClick={() => {
                 setShowSearchPanel(false);
-                setShowCodexPanel(false);
-                setShowProjectContextPanel(false);
-                if (showWorkCapturePanel) {
-                  closeWorkCapturePanel();
-                } else {
-                  setShowWorkCapturePanel(true);
-                }
-                setCaptureFeedback("");
-              }}
-            >
-              记录工作
-            </Button>
-            <button
-              type="button"
-              className={`btn ${showSearchPanel ? "btn-primary" : "btn-ghost"}`}
-              onClick={() => {
                 setShowProjectContextPanel(false);
                 setShowWorkCapturePanel(false);
-                setShowSearchPanel((value) => !value);
+                setShowExternalAiReturnPanel(false);
+                if (showCodexPanel) {
+                  returnToConversation();
+                } else {
+                  setShowCodexPanel(true);
+                  setSearchParams((previous) => {
+                    const next = new URLSearchParams(previous);
+                    next.set("panel", "codex");
+                    next.delete("actionId");
+                    return next;
+                  });
+                }
               }}
             >
-              全局搜索
+              Codex 任务
             </button>
             <details className="workspace-more-actions" open={showWeeklyReview || showProjectImpact}>
-              <summary className={`btn ${showWeeklyReview || showProjectImpact ? "btn-secondary" : "btn-ghost"}`}>
-                更多
+              <summary className={`btn ${showProjectContextPanel || showWorkCapturePanel || isExternalAiReturnPanelOpen || showSearchPanel || showWeeklyReview || showProjectImpact ? "btn-secondary" : "btn-ghost"}`}>
+                更多工具
               </summary>
               <div className="workspace-more-actions-menu">
                 <button
                   type="button"
+                  className={`btn ${showSearchPanel ? "btn-primary" : "btn-ghost"}`}
+                  aria-pressed={showSearchPanel}
+                  onClick={() => {
+                    const nextOpen = !showSearchPanel;
+                    setShowCodexPanel(false);
+                    setShowProjectContextPanel(false);
+                    setShowWorkCapturePanel(false);
+                    setShowExternalAiReturnPanel(false);
+                    setShowSearchPanel(nextOpen);
+                    setSearchParams((previous) => {
+                      const next = new URLSearchParams(previous);
+                      next.delete("panel");
+                      next.delete("actionId");
+                      return next;
+                    });
+                  }}
+                >
+                  全局搜索
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${showProjectContextPanel ? "btn-primary" : "btn-ghost"}`}
+                  aria-pressed={showProjectContextPanel}
+                  disabled={isLoadingProjectContext}
+                  onClick={() => void handleOpenProjectContext()}
+                >
+                  项目上下文
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  disabled={isLoadingProjectContext || isCopyingProjectContext}
+                  aria-live="polite"
+                  onClick={() => void handleQuickCopyProjectContext()}
+                >
+                  {isCopyingProjectContext ? "正在复制…" : hasCopiedProjectContext ? "已复制项目上下文" : "复制项目上下文"}
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${showWorkCapturePanel ? "btn-primary" : "btn-ghost"}`}
+                  aria-pressed={showWorkCapturePanel}
+                  onClick={() => {
+                    if (showWorkCapturePanel) {
+                      closeWorkCapturePanel();
+                      return;
+                    }
+                    setShowSearchPanel(false);
+                    setShowCodexPanel(false);
+                    setShowProjectContextPanel(false);
+                    setShowExternalAiReturnPanel(false);
+                    setShowWorkCapturePanel(true);
+                    setCaptureFeedback("");
+                    setSearchParams((previous) => {
+                      const next = new URLSearchParams(previous);
+                      next.set("panel", "work-capture");
+                      return next;
+                    });
+                  }}
+                >
+                  记录工作
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${isExternalAiReturnPanelOpen ? "btn-primary" : "btn-ghost"}`}
+                  aria-pressed={isExternalAiReturnPanelOpen}
+                  onClick={() => isExternalAiReturnPanelOpen ? closeExternalAiReturnPanel() : openExternalAiReturnPanel()}
+                >
+                  外部 AI 回流
+                </button>
+                <button
+                  type="button"
                   className={`btn ${showWeeklyReview ? "btn-primary" : "btn-ghost"}`}
+                  aria-pressed={showWeeklyReview}
                   onClick={() => {
                     setShowSearchPanel(false);
                     setShowCodexPanel(false);
+                    setShowProjectContextPanel(false);
                     setShowWorkCapturePanel(false);
+                    setShowExternalAiReturnPanel(false);
                     setSearchParams((previous) => {
                       const next = new URLSearchParams(previous);
                       if (next.get("panel") === "weekly-review") {
@@ -1221,10 +1850,13 @@ function ProjectWorkPage() {
                 <button
                   type="button"
                   className={`btn ${showProjectImpact ? "btn-primary" : "btn-ghost"}`}
+                  aria-pressed={showProjectImpact}
                   onClick={() => {
                     setShowSearchPanel(false);
                     setShowCodexPanel(false);
+                    setShowProjectContextPanel(false);
                     setShowWorkCapturePanel(false);
+                    setShowExternalAiReturnPanel(false);
                     setSearchParams((previous) => {
                       const next = new URLSearchParams(previous);
                       if (next.get("panel") === "project-impact") {
@@ -1238,28 +1870,105 @@ function ProjectWorkPage() {
                 >
                   项目影响与行动
                 </button>
+                <button type="button" className="btn btn-ghost" onClick={startWorkCloseout}>
+                  收工并保存进度
+                </button>
               </div>
             </details>
           </div>
           <div className="workspace-top-actions-side">
-            <span className="workspace-actions-label">工具</span>
-            <button type="button" className="btn btn-ghost" onClick={() => setRightSidebarOpen((value) => !value)}>
-              {rightSidebarOpen ? "隐藏文件" : "显示文件"}
+            <button type="button" className="btn btn-ghost workspace-files-toggle" aria-expanded={rightSidebarOpen} onClick={() => setRightSidebarOpen((value) => !value)}>
+              {rightSidebarOpen ? "收起侧栏" : "项目资料"}
             </button>
-            <button type="button" className="btn btn-ghost" onClick={() => navigate("/")}>
+            <button type="button" className="btn btn-ghost" onClick={openProjectSwitcher}>
               切换项目
             </button>
-            <button type="button" className="btn" onClick={() => setIsWrapping(true)}>
-              收工
-            </button>
-            <button type="button" className="icon-btn" onClick={() => navigate("/settings")} aria-label="设置">
+            <button
+              type="button"
+              className="icon-btn"
+              title="设置"
+              onClick={() => navigate("/settings", { state: { returnTo: `${location.pathname}${location.search}` } })}
+              aria-label="设置"
+            >
               ⚙
             </button>
           </div>
         </div>
       </header>
 
-      {showSearchPanel || showCodexPanel || showProjectContextPanel || showWorkCapturePanel ? (
+      {isProjectSwitcherOpen ? (
+        <div className="project-switcher-overlay">
+          <button
+            type="button"
+            className="project-switcher-backdrop"
+            aria-label="关闭项目选择器"
+            disabled={isSwitchingProject}
+            onClick={() => setIsProjectSwitcherOpen(false)}
+          />
+          <section className="project-switcher-dialog" role="dialog" aria-modal="true" aria-labelledby="project-switcher-title">
+            <header className="project-switcher-header">
+              <div>
+                <span className="section-label">工作台</span>
+                <h2 id="project-switcher-title">切换项目</h2>
+              </div>
+              <button type="button" className="btn btn-ghost" disabled={isSwitchingProject} onClick={() => setIsProjectSwitcherOpen(false)}>
+                取消
+              </button>
+            </header>
+            <label className="sr-only" htmlFor="project-switcher-search">搜索已登记项目</label>
+            <input
+              ref={projectSwitcherInputRef}
+              id="project-switcher-search"
+              className="project-switcher-search"
+              type="search"
+              placeholder="搜索全部已登记项目…"
+              value={projectSearch}
+              disabled={isSwitchingProject}
+              onChange={(event) => setProjectSearch(event.target.value)}
+            />
+            {projectSwitchRestriction ? (
+              <div className="project-switcher-notice-row">
+                <p className="project-switcher-notice" role="status">{projectSwitchRestriction}</p>
+                {codexRunStateFailure ? (
+                  <button type="button" className="btn btn-ghost" disabled={isRetryingCodexRunState} onClick={() => void retryCodexRunStateCheck()}>
+                    {isRetryingCodexRunState ? "正在重试…" : "重试检查"}
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+            {projectSwitchFeedback ? (
+              <p className="project-switcher-error" role="alert">{projectSwitchFeedback}</p>
+            ) : null}
+            <div className="project-switcher-list" aria-label="已登记项目">
+              {matchingProjects.length ? matchingProjects.map((item) => {
+                const isCurrent = item.id === activeProject.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className="project-switcher-item"
+                    disabled={isSwitchingProject || (!isCurrent && Boolean(projectSwitchRestriction))}
+                    aria-current={isCurrent ? "page" : undefined}
+                    onClick={() => void switchWorkspaceProject(item)}
+                  >
+                    <span className="project-switcher-item-copy">
+                      <strong>{item.name}</strong>
+                      <small title={item.rootDir}>{item.rootDir}</small>
+                    </span>
+                    <span className="project-switcher-item-state">
+                      {isSwitchingProject && !isCurrent ? "正在切换…" : isCurrent ? "当前项目" : "打开"}
+                    </span>
+                  </button>
+                );
+              }) : (
+                <p className="project-switcher-empty">没有找到匹配的已登记项目。</p>
+              )}
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {showSearchPanel || showCodexPanel || showProjectContextPanel || showWorkCapturePanel || isExternalAiReturnPanelOpen ? (
         <section className="workspace-top-panels">
           <div className="thread-inner workspace-top-panels-inner">
             {showSearchPanel ? <GlobalSearchPanel autoFocus /> : null}
@@ -1289,12 +1998,35 @@ function ProjectWorkPage() {
                 onClose={closeWorkCapturePanel}
               />
             ) : null}
+            {isExternalAiReturnPanelOpen ? (
+              <ExternalAiReturnPanel
+                key={activeProject.id}
+                text={externalAiText}
+                selection={externalAiSelection}
+                kind={externalAiKind}
+                sourceFile={externalAiSourceFile}
+                isSaving={isSavingExternalAiReturn}
+                feedback={externalAiFeedback}
+                onTextChange={handleExternalAiTextChange}
+                onSelectParagraph={(value) => {
+                  setExternalAiSelection(value);
+                  setExternalAiFeedback("");
+                }}
+                onSelectionChange={setExternalAiSelection}
+                onKindChange={setExternalAiKind}
+                onSaveSuggestion={() => void handleExternalAiReturn(true)}
+                onConfirm={() => void handleExternalAiReturn(false)}
+                onClose={closeExternalAiReturnPanel}
+              />
+            ) : null}
             {showCodexPanel ? (
               <CodexCollaborationPanel
                 promptText={codexPromptText}
                 discussionDraft={codexDiscussionDraft}
-                autoOpenCreateTaskForm={autoOpenCodexCreateForm}
-                onPromptChange={setCodexPromptText}
+                onPromptChange={(text) => {
+                  setCodexPromptText(text);
+                  setIsCodexPromptDirty(true);
+                }}
                 onCreateTask={handleCreateCodexTask}
                 onCopyPrompt={handleCopyCodexPrompt}
                 onRebindTaskPrompt={handleRebindCodexPrompt}
@@ -1304,6 +2036,7 @@ function ProjectWorkPage() {
                 onRejectTask={handleRejectCodexTask}
                 onSelectTask={selectCodexTask}
                 onRefreshCodexStatus={handleRefreshCodexStatus}
+                resultCheckFeedback={codexResultCheckFeedback}
                 reportInput={codexReportInput}
                 onReportInputChange={setCodexReportInput}
                 onImportReportText={handleImportCodexReportText}
@@ -1345,22 +2078,26 @@ function ProjectWorkPage() {
           ref={threadRef}
           className="workspace-thread"
           onScroll={(event) => {
+            if (isTopPanelMode || isReportMode) return;
+            previousThreadScrollTopRef.current = event.currentTarget.scrollTop;
             shouldFollowBottomRef.current = isNearBottom(event.currentTarget);
           }}
         >
           <div className="thread-inner">
             {error ? <div className="restore-note">{error}</div> : null}
-            <div className="restore-note">
-              <span>项目恢复信息</span>
-              <strong>{activeProject.nextStep}</strong>
-            </div>
+            {!isReportMode ? (
+              <div className="restore-note">
+                <span>项目恢复信息</span>
+                <strong>{confirmedNextStep || "暂无用户确认的下一步"}</strong>
+              </div>
+            ) : null}
 
             {showWeeklyReview ? (
               <section className="restore-note weekly-review-note">
                 <div className="weekly-review-hero">
                   <div className="wrap-inline-head">
                     <span className="section-label">本周复盘</span>
-                    <strong>{weeklyReviewDashboard?.generatedAt || "等待生成"}</strong>
+                    <strong>{weeklyReviewDashboard?.generatedAt ? formatLocalDateTime(weeklyReviewDashboard.generatedAt) : "等待生成"}</strong>
                   </div>
                   {weeklyReviewDashboard ? (
                     <div className="weekly-review-conclusion">
@@ -1516,7 +2253,7 @@ function ProjectWorkPage() {
               />
             ) : null}
 
-            {conversationMessages.length ? (
+            {!isReportMode && conversationMessages.length ? (
               <>
                 {hiddenConversationMessageCount ? (
                   <div className="thread-history-control">
@@ -1533,10 +2270,12 @@ function ProjectWorkPage() {
                     readChatAttachment={readChatAttachment}
                     openFilePath={openFilePath}
                     openFolderPath={openFolderPath}
+                    onRetry={retryProjectMessage}
+                    readOnlyRecovery={Boolean(activeManifest?.recoveredFromBackup)}
                   />
                 ))}
               </>
-            ) : (
+            ) : !isReportMode ? (
               <section className="conversation-empty-start">
                 <span className="section-label">新的工作线程</span>
                 <strong>项目已经准备好，先说今天要推进什么。</strong>
@@ -1553,7 +2292,7 @@ function ProjectWorkPage() {
                   </button>
                 </div>
               </section>
-            )}
+            ) : null}
 
             {isWrapping ? (
               <section className="wrap-inline">
@@ -1561,6 +2300,11 @@ function ProjectWorkPage() {
                   <span className="section-label">收工</span>
                   <strong>保存项目恢复点</strong>
                 </div>
+                <p className="codex-panel-hint">
+                  {closeoutEvidenceCount > 0
+                    ? "已从本项目的用户进展、已验收 Codex 结果和 Git 记录整理草稿，可编辑后保存；普通聊天和 AI 建议不会自动计为事实。"
+                    : "没有找到本轮可自动整理的已核验进展；聊天仍会保留。你可以补充本次完成内容，或先继续工作。"}
+                </p>
                 <label>
                   <span>今天完成了什么</span>
                   <textarea rows={3} value={done} onChange={(event) => setDone(event.target.value)} />
@@ -1579,6 +2323,13 @@ function ProjectWorkPage() {
                 </div>
               </section>
             ) : null}
+            {isChatThinking ? (
+              <div className="chat-thinking-indicator" role="status" aria-label="感冒院正在回复">
+                <span aria-hidden="true" />
+                <span aria-hidden="true" />
+                <span aria-hidden="true" />
+              </div>
+            ) : null}
             <div ref={endRef} />
           </div>
         </section>
@@ -1591,7 +2342,12 @@ function ProjectWorkPage() {
               workLedger={workLedger}
               activeNextStep={activeManifest?.project.nextStep ?? ""}
               activeTasks={tasks}
-              needsAuthorization={!activeManifest?.deepseekAuthorization?.grantedAt}
+              needsAuthorization={needsProjectAiAuthorization}
+              authorizationStatus={projectAiAuthorizationStatus}
+              authorizationFeedback={projectAiAuthorizationFeedback}
+              authorizationBusy={isProjectAiAuthorizationBusy}
+              needsAiConfiguration={needsAiConfiguration}
+              onOpenAiSettings={openAiModelSettings}
               onGrantAuthorization={grantProjectDeepSeekAuthorization}
             />
             <div className="workspace-sidebar-head workspace-reference-head">
@@ -1623,7 +2379,14 @@ function ProjectWorkPage() {
                           </span>
                           <p className="workspace-reference-summary" title={summary}>{summary}</p>
                           <div className="workspace-reference-actions">
-                            <button type="button" className="btn btn-ghost" onClick={() => setSelectedManagedFileId(file.id)}>
+                            <button
+                              type="button"
+                              className="btn btn-ghost"
+                              onClick={() => {
+                                setSelectedManagedFileId(file.id);
+                                setIsReferenceFileDialogOpen(true);
+                              }}
+                            >
                               展开详情
                             </button>
                             <button type="button" className="btn btn-ghost" onClick={() => void openFilePath(file.managedPath).catch(() => undefined)}>
@@ -1651,10 +2414,10 @@ function ProjectWorkPage() {
         </aside>
       </section>
 
-      {selectedManagedFile ? (
+      {isReferenceFileDialogOpen && selectedManagedFile ? (
         <ReferenceFileDialog
           file={selectedManagedFile}
-          onClose={() => setSelectedManagedFileId(null)}
+          onClose={() => setIsReferenceFileDialogOpen(false)}
           openFilePath={openFilePath}
           openFolderPath={openFolderPath}
         />
@@ -1662,17 +2425,33 @@ function ProjectWorkPage() {
 
       <footer className={`workspace-composer${rightSidebarOpen ? "" : " sidebar-hidden"}`}>
         <div className="composer-inner">
-          <div className="composer-context-strip">
-            {!activeManifest?.deepseekAuthorization?.grantedAt ? (
-              <button type="button" onClick={() => void grantProjectDeepSeekAuthorization()}>
-                启用 AI 回复
-              </button>
-            ) : (
-              <span>AI 回复已启用</span>
-            )}
-            {pendingReviews.length ? <span>{pendingReviews.length} 个资料待确认</span> : <span>资料确认项清空</span>}
-            <span>{managedFiles.length} 个项目文件</span>
-          </div>
+          {(needsProjectAiAuthorization || needsAiConfiguration || projectAiAuthorizationStatus !== "idle") ? (
+            <div className="composer-context-strip">
+              {needsProjectAiAuthorization ? (
+                <button
+                  type="button"
+                  disabled={isProjectAiAuthorizationBusy}
+                  aria-busy={isProjectAiAuthorizationBusy}
+                  onClick={() => void grantProjectDeepSeekAuthorization()}
+                >
+                  {isProjectAiAuthorizationBusy ? "正在启用 AI 回复…" : "启用 AI 回复"}
+                </button>
+              ) : null}
+              {needsAiConfiguration ? (
+                <>
+                  <span>未配置 AI 连接</span>
+                  <button type="button" onClick={openAiModelSettings}>配置 AI</button>
+                </>
+              ) : null}
+              {projectAiAuthorizationFeedback ? (
+                <span className={`project-authorization-feedback status-${projectAiAuthorizationStatus}`} role="status" aria-live="polite">
+                  {projectAiAuthorizationFeedback}
+                </span>
+              ) : (
+                <span>先确认项目资料与聊天记录的发送范围；旧授权需重新确认</span>
+              )}
+            </div>
+          ) : null}
           {pendingImages.length ? (
             <div className="composer-image-previews" aria-label="待发送图片">
               {pendingImages.map((image) => (
@@ -1694,6 +2473,8 @@ function ProjectWorkPage() {
           <input
             ref={imageInputRef}
             className="sr-only"
+            aria-label="选择要附加到消息的图片"
+            tabIndex={-1}
             type="file"
             accept="image/png,image/jpeg,image/webp"
             multiple
@@ -1722,7 +2503,7 @@ function ProjectWorkPage() {
               图片
             </button>
             <textarea
-              rows={3}
+              rows={2}
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               placeholder="告诉感冒院你现在要做什么……"
@@ -1734,21 +2515,23 @@ function ProjectWorkPage() {
               }}
             />
             <button type="button" className="btn composer-voice-button" onClick={toggleVoiceInput}>
-              {isListening ? "停止语音" : "语音输入"}
+              {isListening ? "停止语音" : "语音"}
             </button>
-          </div>
-          <div className="composer-actions">
-            <button
-              type="button"
-              className="btn btn-primary composer-send"
-              disabled={!draft.trim() || isSending}
-              onClick={() => void submitMessage()}
-            >
-              {isSending ? "发送中..." : "发送"}
-            </button>
-            <button type="button" className="btn composer-stop" onClick={() => void stopProjectMessage()}>
-              停止生成
-            </button>
+            <div className="composer-actions">
+              <button
+                type="button"
+                className="btn btn-primary composer-send"
+                disabled={!draft.trim() || isChatGenerationActive}
+                onClick={() => void submitMessage()}
+              >
+                {isChatGenerationActive ? "生成中..." : "发送"}
+              </button>
+              {isChatGenerationActive ? (
+                <button type="button" className="btn composer-stop" disabled={chatReplyStopRequested} onClick={() => void stopCurrentChatReply()}>
+                  {chatReplyStopRequested ? "正在停止..." : "停止"}
+                </button>
+              ) : null}
+            </div>
           </div>
         </div>
       </footer>
@@ -1791,12 +2574,30 @@ function ProjectContextPacketPanel({
       {!isLoading && packet ? (
         <div className="project-context-sheet">
           <p className="project-context-privacy">{packet.privacyNotice}</p>
-          {packet.focus ? (
+          {packet.readWarnings.length ? (
+            <ContextPacketList title="读取限制">
+              {packet.readWarnings.map((warning) => <li key={warning}>{warning}</li>)}
+            </ContextPacketList>
+          ) : null}
+          <section className="project-context-section">
+            <span className="section-label">用户确认的下一步</span>
+            <strong>{packet.nextStep || "暂无用户确认的下一步"}</strong>
+            {packet.focus?.title === packet.nextStep && packet.nextStep ? (
+              <p>{packet.focus.summary}</p>
+            ) : null}
+          </section>
+          {packet.focus && packet.focus.title !== packet.nextStep ? (
             <section className="project-context-section project-context-focus">
               <span className="section-label">当前焦点</span>
               <strong>{packet.focus.title}</strong>
               <p>{packet.focus.summary}</p>
               {packet.focus.evidence.length ? <small>依据：{packet.focus.evidence.join("；")}</small> : null}
+            </section>
+          ) : !packet.focus ? (
+            <section className="project-context-section project-context-focus">
+              <span className="section-label">当前焦点</span>
+              <strong>暂无可优先执行的事项</strong>
+              <p>文件和目录提醒仍保留在“待你处理”中，不会自动成为下一步。</p>
             </section>
           ) : null}
           {packet.recentActivity.length ? (
@@ -1829,6 +2630,44 @@ function ProjectContextPacketPanel({
               ))}
             </ContextPacketList>
           ) : null}
+          <ContextPacketList title="项目理由" className="project-context-rationale-list">
+            {packet.rationaleContext.entries.length ? (
+              packet.rationaleContext.entries.map((entry) => (
+                <li className="project-context-rationale" key={`${entry.sourceFile}-${entry.lineStart}-${entry.title}`}>
+                  <strong>{entry.title}</strong>
+                  <div className="project-context-rationale-meta">
+                    <span>类型：{entry.types.join(" / ") || "未分类"}</span>
+                    <span>状态：{rationaleStatusLabel(entry.status)}</span>
+                    <span>依据：{rationaleEvidenceLabel(entry.evidence)}</span>
+                    {entry.unresolvedConflict ? <span>同题记录冲突，未自动裁定</span> : null}
+                  </div>
+                  {entry.reason ? <p className="project-context-rationale-text"><strong>理由</strong>{entry.reason}</p> : null}
+                  {entry.rejectedAlternatives.length ? (
+                    <div className="project-context-rationale-notes">
+                      {entry.rejectedAlternatives.map((alternative) => (
+                        <p className="project-context-rationale-text" key={alternative}>
+                          <strong>曾否决</strong>{alternative}
+                        </p>
+                      ))}
+                    </div>
+                  ) : null}
+                  <div className="project-context-rationale-evidence">
+                    <small>来源：{entry.sourceFile}:L{entry.lineStart}-L{entry.lineEnd}</small>
+                    {entry.verifiedLinks.map((link) => <small key={link}>关联依据：{link}</small>)}
+                  </div>
+                </li>
+              ))
+            ) : (
+              <li>
+                <span>
+                  {packet.rationaleContext.status === "invalid" || packet.rationaleContext.status === "unavailable"
+                    ? "理由来源当前不可用；不会从 Git 或 AI 分析补出原因。"
+                    : "当前项目没有 Keep the Why 理由记录；可在项目 AI 对话中查询现有决定，但不会猜测决定动机。"}
+                </span>
+              </li>
+            )}
+            {packet.rationaleContext.warnings.map((warning) => <li key={warning}><span>{warning}</span></li>)}
+          </ContextPacketList>
           {packet.codexResult ? (
             <section className="project-context-section">
               <span className="section-label">最近 Codex 结果</span>
@@ -1848,11 +2687,164 @@ function ProjectContextPacketPanel({
   );
 }
 
-function ContextPacketList({ title, children }: { title: string; children: ReactNode }) {
+function rationaleStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    active: "当前记录",
+    superseded: "历史已替代",
+    open: "尚无结论",
+    "needs-review": "需要复核",
+    "pending-confirmation": "待确认",
+  };
+  return labels[status] ?? status;
+}
+
+function rationaleEvidenceLabel(evidence: string) {
+  const labels: Record<string, string> = {
+    confirmed: "记录标注为已确认",
+    inferred: "记录标注为推断",
+    unknown: "证据未知",
+  };
+  return labels[evidence] ?? evidence;
+}
+
+function ContextPacketList({ title, children, className = "" }: { title: string; children: ReactNode; className?: string }) {
   return (
     <section className="project-context-section">
       <span className="section-label">{title}</span>
-      <ul className="project-context-list">{children}</ul>
+      <ul className={`project-context-list${className ? ` ${className}` : ""}`}>{children}</ul>
+    </section>
+  );
+}
+
+function ExternalAiReturnPanel({
+  text,
+  selection,
+  kind,
+  sourceFile,
+  isSaving,
+  feedback,
+  onTextChange,
+  onSelectParagraph,
+  onSelectionChange,
+  onKindChange,
+  onSaveSuggestion,
+  onConfirm,
+  onClose,
+}: {
+  text: string;
+  selection: string;
+  kind: ExternalAiReturnKind;
+  sourceFile: ManagedFile | null;
+  isSaving: boolean;
+  feedback: string;
+  onTextChange: (value: string) => void;
+  onSelectParagraph: (value: string) => void;
+  onSelectionChange: (value: string) => void;
+  onKindChange: (value: ExternalAiReturnKind) => void;
+  onSaveSuggestion: () => void;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const paragraphs = externalAiParagraphs(text);
+  const confirmLabel = kind === "progress"
+    ? "确认并记录已核实进展"
+    : kind === "decision"
+      ? "确认并记录为我的决定"
+      : "确认并设为项目下一步";
+
+  return (
+    <section className="project-context-panel work-capture-panel" aria-labelledby="external-ai-return-title">
+      <header className="project-context-head">
+        <div>
+          <span className="section-label">外部 AI · 用户确认后才写入</span>
+          <h2 id="external-ai-return-title">带回外部讨论结果</h2>
+          <p>粘贴 ChatGPT 等外部 AI 的回复。原文会作为未验证来源保存；不会自动变成事实、决定、下一步或 Codex 验收结果。</p>
+        </div>
+        <div className="project-context-actions">
+          <Button type="button" variant="ghost" disabled={isSaving} onClick={onClose}>关闭</Button>
+        </div>
+      </header>
+
+      <div className="work-capture-sheet">
+        <label className="work-capture-field">
+          <span>外部 AI 回复原文</span>
+          <textarea
+            rows={7}
+            maxLength={MAX_EXTERNAL_AI_SOURCE_LENGTH}
+            value={text}
+            disabled={isSaving}
+            onChange={(event) => onTextChange(event.target.value)}
+            placeholder="在这里粘贴外部 AI 的回复……"
+          />
+          <small>{text.length.toLocaleString()} / {MAX_EXTERNAL_AI_SOURCE_LENGTH.toLocaleString()} 字符；内容只保存在当前项目，不会自动发送给 AI。</small>
+        </label>
+
+        {paragraphs.length ? (
+          <section className="project-context-section" aria-label="选择要保留的内容">
+            <span className="section-label">从原文选择一段</span>
+            <div className="external-ai-paragraph-list">
+              {paragraphs.map((paragraph, index) => (
+                <button
+                  key={`${index}-${paragraph.slice(0, 32)}`}
+                  type="button"
+                  className={`btn ${selection === paragraph ? "btn-secondary" : "btn-ghost"}`}
+                  disabled={isSaving}
+                  aria-pressed={selection === paragraph}
+                  onClick={() => onSelectParagraph(paragraph)}
+                >
+                  {paragraph.length > 220 ? `${paragraph.slice(0, 220)}…` : paragraph}
+                </button>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        <label className="work-capture-field">
+          <span>准备保留的结论（可在确认前编辑）</span>
+          <textarea
+            rows={3}
+            maxLength={kind === "decision" ? 2_000 : 240}
+            value={selection}
+            disabled={isSaving}
+            onChange={(event) => onSelectionChange(event.target.value)}
+            placeholder="先粘贴原文，再从上方选择一段内容。"
+          />
+          <small>{selection.length} / {kind === "decision" ? "2,000" : "240"} 字符</small>
+        </label>
+
+        <label className="work-capture-field">
+          <span>如何处理这段内容</span>
+          <select
+            value={kind}
+            disabled={isSaving}
+            onChange={(event) => onKindChange(event.target.value as ExternalAiReturnKind)}
+          >
+            <option value="suggestion">仅作为外部 AI 建议，不写入工作记录</option>
+            <option value="progress">我已核实：记录为工作进展</option>
+            <option value="decision">我确认采纳：记录为项目决定</option>
+            <option value="nextAction">我确认：设为项目下一步</option>
+          </select>
+        </label>
+
+        {sourceFile ? (
+          <p className="section-label" role="note">原文来源已归档：{sourceFile.fileName} · {sourceFile.id}</p>
+        ) : null}
+        {feedback ? <Feedback tone={feedback.startsWith("已") ? "success" : "warning"} title="回流结果">{feedback}</Feedback> : null}
+        <div className="work-capture-actions">
+          <Button type="button" variant="secondary" loading={isSaving} disabled={!text.trim()} onClick={onSaveSuggestion}>
+            仅归档外部 AI 原文
+          </Button>
+          <Button
+            type="button"
+            variant="primary"
+            loading={isSaving}
+            disabled={!text.trim() || !selection.trim() || kind === "suggestion"}
+            onClick={onConfirm}
+          >
+            {confirmLabel}
+          </Button>
+        </div>
+      </div>
     </section>
   );
 }
@@ -2016,7 +3008,6 @@ function captureMode(type: ProjectFactCaptureRequest["captureType"]) {
 function CodexCollaborationPanel({
   promptText,
   discussionDraft,
-  autoOpenCreateTaskForm,
   onPromptChange,
   onCreateTask,
   onCopyPrompt,
@@ -2027,6 +3018,7 @@ function CodexCollaborationPanel({
   onRejectTask,
   onSelectTask,
   onRefreshCodexStatus,
+  resultCheckFeedback,
   reportInput,
   onReportInputChange,
   onImportReportText,
@@ -2060,7 +3052,6 @@ function CodexCollaborationPanel({
 }: {
   promptText: string;
   discussionDraft: CodexDiscussionDraft | null;
-  autoOpenCreateTaskForm: boolean;
   onPromptChange: (value: string) => void;
   onCreateTask: (request: {
     title: string;
@@ -2074,7 +3065,8 @@ function CodexCollaborationPanel({
   onAcceptTask: (taskId: string, resultId: string) => Promise<void>;
   onRejectTask: (taskId: string, resultId: string) => Promise<void>;
   onSelectTask: (taskId: string) => void;
-  onRefreshCodexStatus: () => Promise<void>;
+  onRefreshCodexStatus: (taskId: string) => Promise<void>;
+  resultCheckFeedback: ReturnType<typeof buildCodexResultCheckFeedback> | null;
   reportInput: string;
   onReportInputChange: (value: string) => void;
   onImportReportText: () => Promise<void>;
@@ -2110,18 +3102,12 @@ function CodexCollaborationPanel({
   const currentRun = currentTask ? runForCodexTask(codexRuns, currentTask) : null;
   const view = buildCodexTaskView(currentTask, currentRun);
   const currentTaskType = currentTask ? resolveCodexTaskDisplayType(currentTask) : "analysis";
-  const [showCreateTaskForm, setShowCreateTaskForm] = useState(autoOpenCreateTaskForm);
+  const [showCreateTaskForm, setShowCreateTaskForm] = useState(false);
   const [newTaskTitle, setNewTaskTitle] = useState(discussionDraft?.title ?? "");
   const [newTaskType, setNewTaskType] = useState<"analysis" | "coding" | "verification" | "fileOperation">(discussionDraft?.taskType ?? "analysis");
   const [newTaskInstructions, setNewTaskInstructions] = useState(discussionDraft?.instructions ?? "");
-
-  useEffect(() => {
-    if (!autoOpenCreateTaskForm || !discussionDraft) return;
-    setShowCreateTaskForm(true);
-    setNewTaskTitle(discussionDraft.title);
-    setNewTaskType(discussionDraft.taskType);
-    setNewTaskInstructions(discussionDraft.instructions);
-  }, [autoOpenCreateTaskForm, discussionDraft?.sourceKey]);
+  const [historyVisibleCount, setHistoryVisibleCount] = useState(8);
+  const sortedTaskHistory = useMemo(() => sortCodexTasksByRecency(codexTasks, codexRuns), [codexTasks, codexRuns]);
 
   function applyDiscussionDraft() {
     if (!discussionDraft) return;
@@ -2261,7 +3247,7 @@ function CodexCollaborationPanel({
                 </Button>
               ) : null}
               {view.primaryAction === "checkResult" ? (
-                <Button type="button" variant="secondary" disabled={isImportingReport} loading={isImportingReport} onClick={() => void onRefreshCodexStatus()}>
+                <Button type="button" variant="secondary" disabled={isImportingReport} loading={isImportingReport} onClick={() => void onRefreshCodexStatus(currentTask.taskId)}>
                   重新检查结果
                 </Button>
               ) : null}
@@ -2314,6 +3300,11 @@ function CodexCollaborationPanel({
       )}
 
       {actionError ? <Feedback tone="error" title="验收未完成">{actionError}</Feedback> : null}
+      {resultCheckFeedback ? (
+        <Feedback tone={resultCheckFeedback.tone} title={resultCheckFeedback.title}>
+          {resultCheckFeedback.message}
+        </Feedback>
+      ) : null}
 
       {currentRun && (currentRun.status === "starting" || currentRun.status === "running") ? (
         <CodexRunObservability run={currentRun} />
@@ -2360,7 +3351,7 @@ function CodexCollaborationPanel({
             <span className="section-label">最近 Codex 任务</span>
             <strong>{codexTasks.length} 个任务</strong>
           </div>
-          {sortCodexTasksByRecency(codexTasks, codexRuns).slice(0, 8).map((task) => (
+          {sortedTaskHistory.slice(0, historyVisibleCount).map((task) => (
             <details key={task.taskId} className="codex-task-row codex-history-row">
               <summary onClick={() => onSelectTask(task.taskId)}>
                 <span className="codex-history-title">
@@ -2384,6 +3375,11 @@ function CodexCollaborationPanel({
               <InsightBlock title="证据" items={task.evidenceRefs} empty="未记录证据。" />
             </details>
           ))}
+          {historyVisibleCount < sortedTaskHistory.length ? (
+            <Button type="button" variant="ghost" onClick={() => setHistoryVisibleCount((count) => count + 8)}>
+              查看更早的 {Math.min(8, sortedTaskHistory.length - historyVisibleCount)} 个任务
+            </Button>
+          ) : null}
         </div>
       ) : null}
 
@@ -2954,7 +3950,9 @@ function codexPublicGitStatusText(status?: string) {
 }
 
 export function buildCodexTaskView(
-  task: Pick<CodexTask, "status" | "summary" | "manualAcceptance" | "gitVerification"> | null,
+  task: Pick<CodexTask, "status" | "summary" | "manualAcceptance" | "gitVerification">
+    & Partial<Pick<CodexTask, "resultId" | "resultReceivedAt" | "remainingIssues" | "expectedResultPath">>
+    | null,
   run: Pick<CodexRun, "status" | "exitCode" | "error"> | null,
 ) {
   if (!task) {
@@ -2969,6 +3967,7 @@ export function buildCodexTaskView(
   }
 
   const hasTaskOutcome = ["resultReceived", "verifying", "awaitingAcceptance", "completed", "needsReview", "failed", "cancelled"].includes(task.status);
+  const hasResult = Boolean(task.resultId?.trim());
   if (!hasTaskOutcome && (run?.status === "running" || run?.status === "starting")) {
     return {
       statusLabel: "Codex 执行中",
@@ -2977,6 +3976,24 @@ export function buildCodexTaskView(
       primaryAction: "stop" as CodexPrimaryAction,
       secondaryActions: [] as CodexSecondaryAction[],
       tone: "info",
+    };
+  }
+
+  const runEndedWithoutResult = !hasResult
+    && (["needsReview", "awaitingAcceptance", "resultReceived", "verifying"].includes(task.status)
+      || (task.status === "awaitingResult"
+        && Boolean(run && ["exited", "failed", "cancelled", "unknownAfterRestart"].includes(run.status))));
+  if (runEndedWithoutResult) {
+    const reason = task.remainingIssues?.find((item) => item.trim()) || run?.error;
+    return {
+      statusLabel: "结果未回流",
+      description: reason
+        ? `没有收到绑定本次任务的结果文件。${reason}重新检查只会扫描结果目录，不会重新执行任务。`
+        : "没有收到绑定本次任务的结果文件。重新检查只会扫描结果目录，不会重新执行任务。",
+      progressTitle: "等待检查结果文件",
+      primaryAction: "checkResult" as CodexPrimaryAction,
+      secondaryActions: [] as CodexSecondaryAction[],
+      tone: "warning",
     };
   }
 
@@ -3092,12 +4109,59 @@ export function buildCodexTaskView(
   };
 }
 
+export function buildCodexResultCheckFeedback(
+  task: Pick<CodexTask, "title" | "status" | "resultId" | "resultReceivedAt" | "expectedResultPath"> | null,
+  run: Pick<CodexRun, "status" | "error"> | null,
+  scan: Pick<CodexResultBridgeScanResult, "scannedCount" | "importedCount">,
+): CodexResultCheckFeedback {
+  if (!task) {
+    return {
+      tone: "error" as const,
+      title: "无法确认当前任务",
+      message: "检查完成，但持久化任务列表中找不到这条任务。没有重新执行任务或更改验收状态。",
+    };
+  }
+  if (task.resultId.trim()) {
+    return {
+      tone: "success" as const,
+      title: "已找到本次任务结果",
+      message: `已重新读取“${task.title}”的持久化结果；当前任务状态为 ${task.status}。`,
+    };
+  }
+
+  const expectedPath = task.expectedResultPath.trim()
+    ? `预期结果文件：${task.expectedResultPath}。`
+    : "该任务没有记录预期结果文件路径。";
+  const runState = run?.status ? `最近一次运行状态：${run.status}。` : "没有找到该任务的运行记录。";
+  if (scan.scannedCount === 0) {
+    return {
+      tone: "warning" as const,
+      title: "未找到结果文件",
+      message: `检查完成：结果目录中没有可读取的结果文件。${expectedPath}${runState}任务保持未回流状态，没有重新执行或标记完成。`,
+    };
+  }
+  if (scan.importedCount > 0) {
+    return {
+      tone: "warning" as const,
+      title: "未找到当前任务的结果",
+      message: `检查完成：项目中导入了 ${scan.importedCount} 条结果，但没有一条绑定到“${task.title}”。${expectedPath}${runState}任务保持未回流状态。`,
+    };
+  }
+  return {
+    tone: "warning" as const,
+    title: "未找到当前任务的结果",
+    message: `检查完成：扫描了 ${scan.scannedCount} 个结果文件，但没有找到绑定到“${task.title}”及其运行记录的结果。${expectedPath}${runState}任务保持未回流状态。`,
+  };
+}
+
+type CodexResultCheckFeedback = {
+  tone: "info" | "success" | "warning" | "error" | "loading";
+  title: string;
+  message: string;
+};
+
 function parseCodexTimestamp(value?: string) {
-  if (!value?.trim()) return null;
-  const numeric = Number(value);
-  if (Number.isFinite(numeric) && numeric > 0) return numeric;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  return parseTimestamp(value);
 }
 
 export function formatCodexElapsed(startedAt: string, now = Date.now()) {
@@ -3117,19 +4181,7 @@ export function formatCodexLastActivity(lastActivityAt: string, now = Date.now()
 }
 
 export function formatCodexTaskDate(value: string, now = Date.now()) {
-  const timestamp = parseCodexTimestamp(value);
-  if (!timestamp) return "时间未知";
-  const date = new Date(timestamp);
-  const current = new Date(now);
-  const pad = (part: number) => String(part).padStart(2, "0");
-  if (
-    date.getFullYear() === current.getFullYear() &&
-    date.getMonth() === current.getMonth() &&
-    date.getDate() === current.getDate()
-  ) {
-    return `今天 ${pad(date.getHours())}:${pad(date.getMinutes())}`;
-  }
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return formatLocalDateTime(value, now);
 }
 
 function formatCodexDuration(startedAt: string, endedAt: string, now = Date.now()) {
@@ -3170,7 +4222,28 @@ export function sortCodexTasksByRecency(tasks: CodexTask[], runs: CodexRun[]) {
   });
 }
 
-export function buildCodexRunObservability(run: Pick<CodexRun, "status" | "startedAt" | "processAlive" | "lastActivityAt" | "recentActivity">, now = Date.now()) {
+export function codexActivityStatus(activity: string) {
+  const event = activity.replace(/^(stdout|stderr)\s*[:：]\s*/i, "").trim();
+  if (/[\u3400-\u9fff]/u.test(event)) return event;
+  const labels: Record<string, string> = {
+    "thread.started": "Codex 已建立任务会话",
+    "turn.started": "Codex 已开始处理任务",
+    "item.started": "Codex 已开始一项操作",
+    "item.updated": "Codex 更新了一项操作的执行信息",
+    "item.completed": "Codex 已结束一项操作",
+    "turn.completed": "Codex 本轮处理已结束",
+    "turn.failed": "Codex 本轮处理失败",
+    "error": "Codex 报告了执行错误",
+  };
+  // The backend may retain an event name followed by its message text.
+  const type = event.split(/\s|[:：]/, 1)[0];
+  if (labels[type]) return labels[type];
+  if (event === "Codex CLI 进程已启动。") return "Codex 已启动";
+  if (event === "已创建 CodexRun，等待 Codex CLI 启动。") return "正在等待 Codex 启动";
+  return "Codex 收到新的执行活动";
+}
+
+export function buildCodexRunObservability(run: Pick<CodexRun, "status" | "startedAt" | "processAlive" | "lastActivityAt" | "recentActivity"> & Partial<Pick<CodexRun, "rawActivity">>, now = Date.now()) {
   const lastActivity = parseCodexTimestamp(run.lastActivityAt);
   const quiet = run.status === "running" && run.processAlive && !!lastActivity && now - lastActivity >= 3 * 60 * 1000;
   const processText = run.status === "starting"
@@ -3178,7 +4251,8 @@ export function buildCodexRunObservability(run: Pick<CodexRun, "status" | "start
     : run.processAlive
       ? "进程正常"
       : "进程状态待确认";
-  const latestActivity = run.recentActivity?.[run.recentActivity.length - 1] || "等待 Codex 输出";
+  const latest = run.recentActivity?.[run.recentActivity.length - 1];
+  const latestActivity = latest ? codexActivityStatus(latest) : "等待 Codex 输出";
   return {
     headline: run.status === "starting" ? "Codex 正在启动" : "Codex 正在执行",
     elapsedText: formatCodexElapsed(run.startedAt, now),
@@ -3186,6 +4260,7 @@ export function buildCodexRunObservability(run: Pick<CodexRun, "status" | "start
     lastActivityText: formatCodexLastActivity(run.lastActivityAt, now),
     latestActivity,
     recentActivity: run.recentActivity ?? [],
+    rawActivity: run.rawActivity ?? [],
     quiet,
   };
 }
@@ -3201,7 +4276,7 @@ function CodexRunObservability({ run }: { run: CodexRun }) {
       <p>当前：{observability.latestActivity}</p>
       {observability.quiet ? <small>Codex 仍在运行，但已经数分钟没有新的 CLI 输出。</small> : null}
       <details className="codex-live-activity">
-        <summary>查看实时进展</summary>
+        <summary>查看执行详情</summary>
         {observability.recentActivity.length ? (
           <ol>
             {observability.recentActivity.map((activity, index) => <li key={`${activity}-${index}`}>{activity}</li>)}
@@ -3209,6 +4284,16 @@ function CodexRunObservability({ run }: { run: CodexRun }) {
         ) : (
           <p>暂时没有可展示的 Codex 输出。</p>
         )}
+        <details className="codex-live-raw-activity">
+          <summary>查看近期原始 CLI 事件</summary>
+          {observability.rawActivity.length ? (
+            <ol>
+              {observability.rawActivity.map((activity, index) => <li key={`${activity}-${index}`}><code>{activity}</code></li>)}
+            </ol>
+          ) : (
+            <p>当前运行尚无可展开的原始事件；旧运行可能只保留整理后的活动摘要。</p>
+          )}
+        </details>
       </details>
     </section>
   );
@@ -3409,15 +4494,71 @@ function codexRunStatusText(status?: string) {
 export function selectCurrentCodexTask(tasks: CodexTask[], runs: CodexRun[], targetTaskId = "", pinnedTaskId = "") {
   if (!tasks.length) return null;
   const taskById = new Map(tasks.map((task) => [task.taskId, task]));
+  const pinnedTask = pinnedTaskId && pinnedTaskId === targetTaskId ? taskById.get(pinnedTaskId) : null;
+  if (pinnedTask) return pinnedTask;
   const targetTask = targetTaskId ? taskById.get(targetTaskId) : null;
-  if (targetTask && (!["completed", "cancelled"].includes(targetTask.status) || targetTask.taskId === pinnedTaskId)) {
+  const recency = (task: CodexTask) =>
+    parseCodexTimestamp(task.updatedAt) ?? parseCodexTimestamp(task.createdAt) ?? 0;
+  const hasBoundResult = (task: CodexTask) =>
+    Boolean(task.resultId.trim()) &&
+    task.resultSource.toLowerCase() !== "runnerfallback" &&
+    !task.evidenceRefs.some((reference) => reference.startsWith("runnerFallback:"));
+  const liveRuns = [...runs]
+    .filter((run) => run.processAlive && ["starting", "running"].includes(run.status))
+    .sort((left, right) => (parseCodexTimestamp(right.startedAt) ?? 0) - (parseCodexTimestamp(left.startedAt) ?? 0));
+  const hasMatchingLiveRun = (task: CodexTask) =>
+    liveRuns.some(
+      (run) =>
+        run.taskId === task.taskId &&
+        (!task.projectId || !run.projectId || task.projectId === run.projectId),
+    );
+  const taskHasCurrentEvidence = (task: CodexTask) =>
+    task.status === "ready" ||
+    (["starting", "running", "handedOff", "awaitingResult"].includes(task.status) && hasMatchingLiveRun(task)) ||
+    (["resultReceived", "verifying", "needsReview", "awaitingAcceptance"].includes(task.status) &&
+      hasBoundResult(task));
+  const targetStillActionable =
+    targetTask &&
+    taskHasCurrentEvidence(targetTask);
+  if (targetTask && targetStillActionable) {
     return targetTask;
   }
-  for (const run of [...runs].sort((left, right) => right.startedAt.localeCompare(left.startedAt))) {
-    const task = taskById.get(run.taskId);
-    if (task && !["completed", "cancelled"].includes(task.status)) return task;
+  for (const liveRun of liveRuns) {
+    const runningTask = taskById.get(liveRun.taskId);
+    if (
+      runningTask &&
+      hasMatchingLiveRun(runningTask) &&
+      ["starting", "running", "handedOff", "awaitingResult"].includes(runningTask.status) &&
+      !["completed", "cancelled"].includes(runningTask.status)
+    ) {
+      return runningTask;
+    }
   }
-  return tasks.find((task) => !["completed", "cancelled"].includes(task.status)) ?? tasks[0];
+  const actionable = tasks
+    .filter(taskHasCurrentEvidence)
+    .sort((left, right) => recency(right) - recency(left));
+  if (actionable.length) return actionable[0];
+
+  const resultRecovery = tasks
+    .filter(
+      (task) =>
+        ["starting", "running", "handedOff", "awaitingResult", "resultReceived", "verifying", "needsReview"].includes(task.status) &&
+        !hasBoundResult(task) &&
+        runs.some(
+          (run) =>
+            run.taskId === task.taskId &&
+            ["exited", "failed", "unknownAfterRestart"].includes(run.status),
+        ),
+    )
+    .sort((left, right) => recency(right) - recency(left))[0];
+  if (resultRecovery) return resultRecovery;
+
+  const completed = tasks
+    .filter((task) => task.status === "completed")
+    .sort((left, right) => recency(right) - recency(left))[0];
+  if (completed) return completed;
+
+  return null;
 }
 
 function codexActionErrorMessage(error: unknown) {
@@ -3471,6 +4612,39 @@ export function mergeCodexRuns(existing: CodexRun[], next: CodexRun) {
   return [next, ...withoutCurrent].sort((left, right) => (parseCodexTimestamp(right.startedAt) ?? 0) - (parseCodexTimestamp(left.startedAt) ?? 0));
 }
 
+export function codexRunsEqual(left: CodexRun[], right: CodexRun[]) {
+  if (left.length !== right.length) return false;
+  return left.every((run, index) => {
+    const next = right[index];
+    if (!next) return false;
+    const sameState =
+      run.id === next.id &&
+      run.taskId === next.taskId &&
+      run.status === next.status &&
+      run.startedAt === next.startedAt &&
+      run.endedAt === next.endedAt &&
+      run.pid === next.pid &&
+      run.processAlive === next.processAlive &&
+      run.exitCode === next.exitCode &&
+      run.lastActivityAt === next.lastActivityAt &&
+      run.outputLastMessagePath === next.outputLastMessagePath &&
+      run.stdoutSummary === next.stdoutSummary &&
+      run.stderrSummary === next.stderrSummary &&
+      run.error === next.error &&
+      sameRecentActivity(run.recentActivity, next.recentActivity);
+
+    // Raw output is append-only in the runner. Compare its size and visible tail
+    // instead of serializing the complete log on every status poll.
+    const previousRaw = run.rawActivity ?? [];
+    const nextRaw = next.rawActivity ?? [];
+    return sameState && previousRaw.length === nextRaw.length && sameRecentActivity(previousRaw.slice(-4), nextRaw.slice(-4));
+  });
+}
+
+function sameRecentActivity(left: string[] = [], right: string[] = []) {
+  return left.length === right.length && left.every((entry, index) => entry === right[index]);
+}
+
 function WorkspaceActivityPanel({
   projectAnalysis,
   pendingReviews,
@@ -3478,6 +4652,11 @@ function WorkspaceActivityPanel({
   activeNextStep,
   activeTasks,
   needsAuthorization,
+  authorizationStatus,
+  authorizationFeedback,
+  authorizationBusy,
+  needsAiConfiguration,
+  onOpenAiSettings,
   onGrantAuthorization,
 }: {
   projectAnalysis: ProjectAnalysis | null;
@@ -3486,6 +4665,11 @@ function WorkspaceActivityPanel({
   activeNextStep: string;
   activeTasks: Array<{ status: string; title: string }>;
   needsAuthorization: boolean;
+  authorizationStatus: string;
+  authorizationFeedback: string;
+  authorizationBusy: boolean;
+  needsAiConfiguration: boolean;
+  onOpenAiSettings: () => void;
   onGrantAuthorization: () => Promise<void>;
 }) {
   const projectDefinition =
@@ -3509,30 +4693,69 @@ function WorkspaceActivityPanel({
       </div>
 
       <div className="workspace-activity-body">
-        {needsAuthorization ? (
+        {needsAuthorization || needsAiConfiguration ? (
           <div className="workspace-activity-callout">
-            <strong>AI 回复尚未启用</strong>
-            <p>首次发送前，需要你明确授权只发送项目说明、摘要、关键历史和当前问题，不上传原始文件。</p>
-            <button type="button" className="btn btn-primary" onClick={() => void onGrantAuthorization()}>
-              启用 AI 回复
-            </button>
+            <strong>{needsAiConfiguration ? "需要配置 AI 连接" : "需要授权或重新确认数据范围"}</strong>
+            {needsAiConfiguration ? (
+              <p>尚未配置 DeepSeek API Key。请先保存 Key 并测试连接；这只配置 AI 连接，不会授权发送本项目数据。</p>
+            ) : null}
+            {needsAuthorization ? (
+              <>
+                <p>启用会立即把当前项目的限量说明、资料摘要/章节、近期对话和只读工程状态摘要发送给外部 AI 服务生成项目理解。之后每次聊天会发送本轮问题、按问题筛选的项目记录，以及最多 5 轮历史对话（最近 3 轮，另加最多 2 轮相关历史；合计不超过 4,800 字，每条历史文本最多 700 字）；历史对话仅用于延续当前讨论，不作为已确认事实或决定。命中资料时还会发送最多 3 份资料的摘要与正文片段，本轮图片仅在所选模型支持视觉时发送。不会发送整份资料文件、完整聊天历史或历史图片。</p>
+                {needsAiConfiguration ? (
+                  <p className="workspace-authorization-setup-note">保存 Key 并测试连接后，返回此处仍需单独确认本项目授权。</p>
+                ) : null}
+              </>
+            ) : null}
+            {needsAiConfiguration ? (
+              <button type="button" className="btn btn-ghost" onClick={onOpenAiSettings}>
+                配置/测试 AI 连接
+              </button>
+            ) : null}
+            {needsAuthorization ? (
+              <details className="workspace-authorization-details">
+                <summary>查看发送范围</summary>
+                <p>项目理解：项目名称/说明和下一步、最多 24 份登记资料的名称/类别/摘要/章节、最多 18 条近期消息（每条最多 1,000 字），以及当前只读 Atlas 状态摘要；不含文件正文、本地路径或完整聊天历史。聊天：本轮问题最多 8,000 字；按问题选取当前项目的可信记录；最多 5 轮历史对话（最近 3 轮，另加最多 2 轮相关历史），合计不超过 4,800 字，每条历史文本最多 700 字。历史对话仅用于理解当前讨论，不作为事实或已确认决定。命中时最多 3 份登记资料，每份正文最多 1,800 字。最多 4 张本轮图片（单张不超过 8 MB、总计不超过 20 MB）仅发送给支持视觉的模型。Inbox 匹配会发送待处理资料的限量摘要，以及最多 3 个分别授权候选项目的说明、项目理解、资料/任务/决定摘要和规则匹配理由。原文件、本地来源路径、完整聊天历史和历史图片不发送；疑似密钥与本地路径会脱敏。API Key 保存在 Windows Credential Manager，仅用于请求授权头。</p>
+              </details>
+            ) : null}
+            {authorizationFeedback ? (
+              <p className={`project-authorization-feedback status-${authorizationStatus}`} role="status" aria-live="polite">
+                {authorizationFeedback}
+              </p>
+            ) : null}
+            {needsAuthorization ? (
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={authorizationBusy}
+                aria-busy={authorizationBusy}
+                onClick={() => void onGrantAuthorization()}
+              >
+                {authorizationBusy ? "正在启用 AI 回复…" : "启用 AI 回复"}
+              </button>
+            ) : null}
+          </div>
+        ) : authorizationFeedback ? (
+          <div className={`workspace-activity-callout authorization-status-callout status-${authorizationStatus}`}>
+            <strong>AI 回复授权状态</strong>
+            <p role="status" aria-live="polite">{authorizationFeedback}</p>
           </div>
         ) : null}
 
-        <details className="workspace-activity-details" open>
+        <details className="workspace-activity-details workspace-activity-understanding" open>
           <summary>
             <span>项目理解</span>
             <strong>{projectAnalysisStatusLabel(projectAnalysis?.status)}</strong>
           </summary>
           <p>{projectDefinition}</p>
           <div className="workspace-activity-metrics">
-            <span>待确认 {currentPendingCount}</span>
-            <span>下一步 {currentActionCount}</span>
-            <span>待检查 {pendingReviews.length}</span>
+            <div><span>待确认</span><strong>{currentPendingCount}</strong></div>
+            <div><span>下一步</span><strong>{currentActionCount}</strong></div>
+            <div><span>待检查</span><strong>{pendingReviews.length}</strong></div>
           </div>
         </details>
 
-        <details className="workspace-activity-details">
+        <details className="workspace-activity-details workspace-activity-recent">
           <summary>
             <span>最近变化</span>
             <strong>{recentFacts.length}</strong>
@@ -3541,7 +4764,6 @@ function WorkspaceActivityPanel({
             <div className="workspace-activity-list">
               {recentFacts.map((fact) => (
                 <article key={fact} className="workspace-activity-item">
-                  <span>真实事实</span>
                   <p>{fact}</p>
                 </article>
               ))}
@@ -3625,6 +4847,7 @@ function isConversationMessage(message: WorkspaceMessage, index: number, project
 }
 
 export function workspaceActivityLabel(message: Pick<WorkspaceMessage, "kind" | "status">) {
+  if (message.status === "interrupted") return "生成已中断";
   if (message.status === "failed" || message.status === "error") return "需要检查";
   if (message.kind === "review") return "待确认";
   if (message.status === "pending" || message.status === "running") return "处理中";
@@ -3641,6 +4864,7 @@ export function projectAnalysisStatusLabel(status?: ProjectAnalysis["status"] | 
 }
 
 export function workspaceMessageDisplayLabel(message: Pick<WorkspaceMessage, "kind" | "status">) {
+  if (message.status === "interrupted") return "生成已中断";
   if (message.status === "failed" || message.status === "error") return "需要检查";
   if (message.status === "pending" || message.status === "running") return "处理中";
   if (message.kind === "fileLocation") return "文件已整理";
@@ -3668,6 +4892,28 @@ export function latestWorkspaceItems<T>(items: T[], limit: number) {
   return items.slice(-Math.max(1, limit));
 }
 
+export function resolveConversationScrollTop({
+  scrollHeight,
+  clientHeight,
+  previousScrollTop,
+  followBottom,
+}: {
+  scrollHeight: number;
+  clientHeight: number;
+  previousScrollTop: number;
+  followBottom: boolean;
+}) {
+  const maxScrollTop = Math.max(0, scrollHeight - clientHeight);
+  return followBottom ? maxScrollTop : Math.min(Math.max(0, previousScrollTop), maxScrollTop);
+}
+
+export function useConversationMessages(messages: WorkspaceMessage[], projectDescription: string) {
+  return useMemo(
+    () => messages.filter((message, index) => isConversationMessage(message, index, projectDescription)),
+    [messages, projectDescription],
+  );
+}
+
 export function visibleReferenceFiles<T extends { id: string }>(items: T[], selectedId: string | null, limit: number) {
   const visible = items.slice(0, Math.max(1, limit));
   if (!selectedId || visible.some((item) => item.id === selectedId)) return visible;
@@ -3682,15 +4928,22 @@ function Message({
   readChatAttachment: loadChatAttachment,
   openFilePath,
   openFolderPath,
+  onRetry,
+  readOnlyRecovery,
 }: {
   message: WorkspaceMessage;
   projectRoot: string;
   readChatAttachment: typeof readChatAttachment;
   openFilePath: (path: string) => Promise<void>;
   openFolderPath: (path: string) => Promise<void>;
+  onRetry: (messageId: string) => Promise<void>;
+  readOnlyRecovery: boolean;
 }) {
   const [imageUrls, setImageUrls] = useState<Record<string, string>>({});
-  const facts = message.evidenceItems.filter((item) => item.basisKind === "fact");
+  const operationReceipts = message.evidenceItems.filter((item) => item.contentType === "operationReceipt");
+  const facts = message.evidenceItems.filter(
+    (item) => item.basisKind === "fact" && item.contentType !== "operationReceipt",
+  );
   const inference = message.evidenceItems.filter((item) => item.basisKind === "inference");
   const pending = message.evidenceItems.filter((item) => item.basisKind === "pending");
   const evidenceCount = facts.length + inference.length + pending.length;
@@ -3732,6 +4985,28 @@ function Message({
         <span>{workspaceMessageDisplayLabel(message)}</span>
       </div>
       <p>{message.text}</p>
+      {message.status === "interrupted" ? (
+        <div className="message-interrupted-note" role="status">
+          <span>{message.text.trim() ? "以上仅为已保存的部分内容，不是完整回答。" : "AI 回复在完成前中断，未生成可恢复正文。"}</span>
+          {readOnlyRecovery ? (
+            <span>当前项目正在使用旧备份只读回退；核对并恢复主数据前不能重试。</span>
+          ) : (
+            <button type="button" className="btn btn-compact" onClick={() => void onRetry(message.id)}>
+              用原问题重试
+            </button>
+          )}
+        </div>
+      ) : null}
+      {operationReceipts.length ? (
+        <div className="message-operation-receipts" role="status" aria-label="项目记录保存回执">
+          {operationReceipts.map((item) => (
+            <div key={item.id} className="message-operation-receipt">
+              <strong>{item.title}</strong>
+              <p>{item.summary}</p>
+            </div>
+          ))}
+        </div>
+      ) : null}
       {message.attachments.length ? (
         <div className="message-attachments" aria-label="消息附件">
           {message.attachments.map((attachment) => {
@@ -3793,6 +5068,9 @@ function EvidenceGroup({
               <span>{formatEvidenceType(item.contentType)}</span>
             </div>
             <p>{item.summary || "无摘要"}</p>
+            {item.sourceRecordId && ["decision", "workLedger", "gitSnapshot"].includes(item.contentType) ? (
+              <small className="evidence-record-id">记录 ID：{item.sourceRecordId}</small>
+            ) : null}
             {item.managedPath ? (
               <div className="file-result-actions">
                 <button type="button" className="btn" onClick={() => void openFilePath(item.managedPath).catch(() => undefined)}>
@@ -3822,6 +5100,10 @@ function formatEvidenceType(contentType: string) {
       return "对话记录";
     case "decision":
       return "项目决定";
+    case "workLedger":
+      return "工作记录";
+    case "gitSnapshot":
+      return "Git 状态";
     case "projectAnalysis":
       return "项目分析";
     case "pendingReview":

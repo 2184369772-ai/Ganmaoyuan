@@ -30,9 +30,15 @@
       }
 
       body {
+        display: block;
+        padding: 0;
+      }
+
+      body:has(.boot-fallback) #root {
         display: grid;
-        place-items: center;
+        min-height: 100dvh;
         padding: 24px;
+        place-items: center;
       }
 
       .boot-fallback {

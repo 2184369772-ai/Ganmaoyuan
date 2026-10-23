@@ -1,0 +1,13 @@
+# Windows Package Validation
+
+Ganmaoyuan's Windows package is built from the checked-out source with the pinned Node.js and Rust toolchains, locked npm/Cargo dependencies, and the custom NSIS template rendered by Tauri. `scripts/build-windows-release.ps1` stages the NSIS installer, app executable, SHA-256 sums, build provenance, and installation notes without copying anything to the developer's `builds/current` directory.
+
+The release build is produced by `scripts/build-windows-release.ps1`. It records the source revision, working-tree state digest, Node/Rust/C compiler versions, installer/app SHA-256, and Authenticode status. Rust and native C/C++ source paths are remapped during release compilation; `clang-cl` is required to remove dependency `__FILE__` paths from native error diagnostics. The script never copies build output to `builds/current` and aborts if the release `app.exe` is already running.
+
+The `Windows package validation` workflow runs on pull requests, pushes to `master`, and manual dispatch. It uses an ephemeral `windows-2022` runner, requires a clean source tree, runs frontend/Rust tests, builds the NSIS package, and validates the exact installer SHA-256. In addition to `/UPDATE` and the semantic-version branch, it downloads the public v0.1.1 installer, checks its pinned SHA-256, installs it in an isolated test directory, and upgrades that installation to the newly built version. The checks cover the installed app hash, version registration, shortcut ownership/collisions, process startup, uninstall, and synthetic app-data preservation. The workflow uploads an Actions artifact only; it does not create a GitHub Release or publish a download.
+
+The installer remains unsigned unless the provenance record reports a valid signing status. The automated process-start check is not interactive GUI acceptance. The runner validation also does not replace testing on a separately maintained physical Windows machine.
+
+New installations use Tauri's per-user install location and user data directories. An explicitly configured `GANMAOYUAN_DATA_DIR` is honored. The historic `D:\GanMaoYuan\AppData` data directory is selected only when recognized Ganmaoyuan data files are present, so another computer's unrelated D: drive is not treated as an application data location. Existing configured project/workspace roots are not moved.
+
+Uninstall leaves application data in place by default. Deletion is available only as an explicit interactive choice. Backups, restored projects, safe exports, diagnostics, and global weekly reports default to locations under the current user's Documents or application-data directory; users may choose another location.

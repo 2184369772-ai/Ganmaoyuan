@@ -221,6 +221,23 @@ fn current_context_value(packet: crate::models::ProjectContextPacket, level: u64
         "recentActivity": packet.recent_activity.iter().take(3).cloned().collect::<Vec<_>>(),
         "pendingActions": packet.pending_actions.iter().take(3).cloned().collect::<Vec<_>>(),
         "decisions": packet.decisions.iter().take(3).cloned().collect::<Vec<_>>(),
+        "rationaleContext": {
+            "status": packet.rationale_context.status.clone(),
+            "entries": packet.rationale_context.entries.iter().take(3).map(|entry| json!({
+                "title": entry.title,
+                "types": entry.types,
+                "status": entry.status,
+                "evidence": entry.evidence,
+                "reason": entry.reason,
+                "rejectedAlternatives": entry.rejected_alternatives.iter().take(1).cloned().collect::<Vec<_>>(),
+                "sourceFile": entry.source_file,
+                "lineStart": entry.line_start,
+                "lineEnd": entry.line_end,
+                "verifiedLinks": entry.verified_links.iter().take(1).cloned().collect::<Vec<_>>(),
+                "unresolvedConflict": entry.unresolved_conflict
+            })).collect::<Vec<_>>(),
+            "warnings": packet.rationale_context.warnings.iter().take(2).cloned().collect::<Vec<_>>()
+        },
         "codexResult": packet.codex_result.clone(),
         "gitFacts": packet.git_facts.clone(),
         "risks": packet.risks.iter().take(3).cloned().collect::<Vec<_>>(),

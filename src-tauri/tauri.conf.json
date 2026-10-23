@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Ganmaoyuan",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "com.ganmaoyuan.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -41,7 +41,7 @@
     },
     "windows": {
       "nsis": {
-        "installerHooks": "installer/sendto-hooks.nsh"
+        "template": "installer/sendto-installer.nsi"
       }
     }
   }

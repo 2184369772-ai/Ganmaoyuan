@@ -1,7 +1,7 @@
 {
   "name": "ganmaoyuan-frontend-shell",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,8 @@
     "tauri:dev": "tauri dev",
     "pretauri:build": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-tauri-build.ps1",
     "tauri:build": "tauri build",
-    "release:diagnostics": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/release-diagnostics.ps1"
+    "release:diagnostics": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/release-diagnostics.ps1",
+    "release:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-release.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

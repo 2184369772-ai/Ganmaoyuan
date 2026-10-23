@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Runtime};
 use windows::{
@@ -118,12 +118,7 @@ pub async fn list_models() -> Result<Vec<DeepSeekModelInfo>, String> {
         .map_err(map_network_error)?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(http_status_error(
-            status,
-            "获取 DeepSeek 模型列表失败",
-            &body,
-        ));
+        return Err(http_status_error(status, "获取 DeepSeek 模型列表失败"));
     }
     let payload: DeepSeekModelsResponse = response
         .json()
@@ -174,10 +169,21 @@ pub fn model_supports_vision(model_id: &str) -> bool {
 
 pub fn stop_stream(project_root: &str) {
     if let Ok(mut guard) = active_streams().lock() {
-        if let Some(flag) = guard.remove(project_root) {
+        if let Some(flag) = guard.remove(&stream_project_key(project_root)) {
             flag.store(true, Ordering::SeqCst);
         }
     }
+}
+
+pub fn has_active_stream(project_root: &str) -> bool {
+    active_streams()
+        .lock()
+        .map(|guard| {
+            guard
+                .get(&stream_project_key(project_root))
+                .is_some_and(|flag| !flag.load(Ordering::SeqCst))
+        })
+        .unwrap_or(false)
 }
 
 pub fn start_stream_guard(project_root: &str) -> Result<Arc<AtomicBool>, String> {
@@ -185,7 +191,7 @@ pub fn start_stream_guard(project_root: &str) -> Result<Arc<AtomicBool>, String>
     let mut guard = active_streams()
         .lock()
         .map_err(|_| "DeepSeek 流状态锁已损坏，请重试。".to_string())?;
-    if let Some(previous) = guard.insert(project_root.to_string(), token.clone()) {
+    if let Some(previous) = guard.insert(stream_project_key(project_root), token.clone()) {
         previous.store(true, Ordering::SeqCst);
     }
     Ok(token)
@@ -193,18 +199,36 @@ pub fn start_stream_guard(project_root: &str) -> Result<Arc<AtomicBool>, String>
 
 pub fn finish_stream_guard(project_root: &str) {
     if let Ok(mut guard) = active_streams().lock() {
-        guard.remove(project_root);
+        guard.remove(&stream_project_key(project_root));
     }
 }
 
-pub async fn stream_chat<R: Runtime>(
+fn stream_project_key(project_root: &str) -> String {
+    let path = PathBuf::from(project_root);
+    let normalized = path.canonicalize().unwrap_or(path);
+    let value = path_to_string(&normalized);
+    #[cfg(windows)]
+    {
+        value.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        value
+    }
+}
+
+pub async fn stream_chat<R: Runtime, F>(
     app: AppHandle<R>,
     project_root: String,
     message_id: String,
     model_id: String,
     messages: serde_json::Value,
     cancel_flag: Arc<AtomicBool>,
-) -> Result<String, String> {
+    mut persist_progress: F,
+) -> Result<String, String>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
     let api_key = load_api_key()?.ok_or_else(|| "尚未保存 DeepSeek API Key。".to_string())?;
     let response = reqwest_client()?
         .post(format!("{DEEPSEEK_API_BASE}/chat/completions"))
@@ -221,12 +245,13 @@ pub async fn stream_chat<R: Runtime>(
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(http_status_error(status, "DeepSeek 请求失败", &body));
+        return Err(http_status_error(status, "DeepSeek 请求失败"));
     }
 
     let mut full_text = String::new();
-    let mut buffer = String::new();
+    let mut buffer = Vec::new();
+    let mut last_persisted_at: Option<Instant> = None;
+    let mut last_persisted_len = 0_usize;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         if cancel_flag.load(Ordering::SeqCst) {
@@ -246,10 +271,7 @@ pub async fn stream_chat<R: Runtime>(
         }
 
         let chunk = chunk.map_err(map_network_error)?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(index) = buffer.find("\n\n") {
-            let frame = buffer[..index].to_string();
-            buffer = buffer[index + 2..].to_string();
+        for frame in append_sse_chunk(&mut buffer, &chunk)? {
             for line in frame.lines() {
                 let line = line.trim();
                 if !line.starts_with("data:") {
@@ -281,6 +303,17 @@ pub async fn stream_chat<R: Runtime>(
                     continue;
                 }
                 full_text.push_str(&delta);
+                let now = Instant::now();
+                let should_persist = last_persisted_at.is_none()
+                    || full_text.len().saturating_sub(last_persisted_len) >= 512
+                    || last_persisted_at.is_some_and(|previous| {
+                        now.duration_since(previous) >= Duration::from_millis(500)
+                    });
+                if should_persist {
+                    persist_progress(&full_text)?;
+                    last_persisted_at = Some(now);
+                    last_persisted_len = full_text.len();
+                }
                 emit_stream_event(
                     &app,
                     DeepSeekStreamEvent {
@@ -298,6 +331,22 @@ pub async fn stream_chat<R: Runtime>(
     }
 
     Err("DeepSeek 流式响应意外结束。".to_string())
+}
+
+fn append_sse_chunk(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<Vec<String>, String> {
+    buffer.extend_from_slice(chunk);
+    let mut frames = Vec::new();
+
+    while let Some(index) = buffer.windows(2).position(|window| window == b"\n\n") {
+        let frame = buffer[..index].to_vec();
+        buffer.drain(..index + 2);
+        frames.push(
+            String::from_utf8(frame)
+                .map_err(|err| format!("解析 DeepSeek 流响应失败：SSE 帧不是有效 UTF-8：{err}"))?,
+        );
+    }
+
+    Ok(frames)
 }
 
 pub async fn complete_chat(
@@ -321,8 +370,7 @@ pub async fn complete_chat(
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(http_status_error(status, "DeepSeek 请求失败", &body));
+        return Err(http_status_error(status, "DeepSeek 请求失败"));
     }
     let payload: DeepSeekChatResponse = response
         .json()
@@ -360,17 +408,17 @@ fn map_network_error(error: reqwest::Error) -> String {
     if error.is_connect() {
         return "无法连接 DeepSeek，请检查网络。".to_string();
     }
-    format!("DeepSeek 请求失败：{error}")
+    "DeepSeek 请求失败，请检查网络后重试。".to_string()
 }
 
-fn http_status_error(status: reqwest::StatusCode, prefix: &str, body: &str) -> String {
+fn http_status_error(status: reqwest::StatusCode, prefix: &str) -> String {
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return "DeepSeek 认证失败（401），请检查 API Key。".to_string();
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return "DeepSeek 请求过于频繁（429），请稍后再试。".to_string();
     }
-    format!("{prefix}（{}）：{}", status.as_u16(), body)
+    format!("{prefix}（HTTP {}）。", status.as_u16())
 }
 
 fn settings_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
@@ -449,7 +497,7 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{http_status_error, model_supports_vision};
+    use super::{append_sse_chunk, http_status_error, model_supports_vision};
 
     #[test]
     fn identifies_deepseek_vision_models_without_promoting_text_models() {
@@ -461,12 +509,32 @@ mod tests {
 
     #[test]
     fn maps_rate_limit_status_to_friendly_message() {
-        let message = http_status_error(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            "DeepSeek 请求失败",
-            "{\"error\":\"rate limit\"}",
-        );
+        let message =
+            http_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "DeepSeek 请求失败");
 
         assert_eq!(message, "DeepSeek 请求过于频繁（429），请稍后再试。");
+    }
+
+    #[test]
+    fn reduces_provider_failures_to_status_without_response_content() {
+        let message = http_status_error(reqwest::StatusCode::BAD_REQUEST, "DeepSeek 请求失败");
+        assert!(message.contains("HTTP 400"));
+    }
+
+    #[test]
+    fn preserves_utf8_characters_split_across_sse_chunks() {
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"证据保留期限\"}}]}\n\n";
+        let split = frame.find("保留").unwrap() + 1;
+        let mut buffer = Vec::new();
+
+        assert!(append_sse_chunk(&mut buffer, &frame.as_bytes()[..split])
+            .unwrap()
+            .is_empty());
+        let frames = append_sse_chunk(&mut buffer, &frame.as_bytes()[split..]).unwrap();
+
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].contains("证据保留期限"));
+        assert!(!frames[0].contains('\u{fffd}'));
+        assert!(buffer.is_empty());
     }
 }

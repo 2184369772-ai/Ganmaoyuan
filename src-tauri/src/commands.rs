@@ -2,28 +2,31 @@ use crate::{
     deepseek, launch_inbox,
     models::{
         BackupRestoreResult, ChatAttachmentData, ChatImageAttachmentInput, CleanupExecutionBatch,
-        CleanupPlan, CleanupPlanReviewFilter, CodexPromptResult, CodexReportApplyResult,
-        CodexReportImportResult, CodexResultBridgeScanResult, CodexRun, CodexTask,
-        CodexTaskCreateRequest, CodexTaskList, DailyContinueSnapshot, DeepSeekConnectionResult,
-        DeepSeekModelInfo, DeepSeekSettings, ExecutionRecord, FileProjection, FinishWorkResult,
-        GeneratedFileResult, GitSnapshot, GlobalManagedFile, GlobalSearchResult, ImportResult,
-        InboxRoutingSettings, LocalBackupResult, MaterialInboxItem, MaterialInboxRouteResult,
-        MemoItem, MessageResult, PrivacyArtifactsResult, ProjectActionCandidate, ProjectAttention,
-        ProjectContextPacket, ProjectCreateResult, ProjectFactCaptureRequest,
-        ProjectFactSyncResult, ProjectImpactAnalysis, ProjectManifest, ProjectMigrationResult,
-        ProjectStateProposal, ProjectSummary, SafeExportResult, TodayWorkspace,
-        WeeklyReportExportResult, WeeklyReportRecord, WeeklyReviewDashboard, WeeklyReviewSettings,
-        WorkEvent, WorkLedgerSnapshot, WorkspaceConfig, WorkspaceDraft, WorkspaceScanBatch,
+        CleanupPlan, CleanupPlanReviewFilter, CodexCliReadiness, CodexPromptResult,
+        CodexReportApplyResult, CodexReportImportResult, CodexResultBridgeScanResult, CodexRun,
+        CodexTask, CodexTaskCreateRequest, CodexTaskList, DailyContinueSnapshot,
+        DeepSeekConnectionResult, DeepSeekModelInfo, DeepSeekSettings, ExecutionRecord,
+        FileProjection, FinishWorkResult, GeneratedFileResult, GitSnapshot, GlobalManagedFile,
+        GlobalSearchResult, ImportResult, InboxRoutingSettings, LocalBackupResult,
+        MaterialInboxItem, MaterialInboxRouteResult, MemoItem, MessageResult,
+        PrivacyArtifactsResult, ProjectActionCandidate, ProjectAttention, ProjectContextPacket,
+        ProjectCreateResult, ProjectFactCaptureRequest, ProjectFactSyncResult,
+        ProjectImpactAnalysis, ProjectManifest, ProjectMigrationResult, ProjectStateProposal,
+        ProjectSummary, SafeExportResult, TodayWorkspace, WeeklyReportExportResult,
+        WeeklyReportRecord, WeeklyReviewDashboard, WeeklyReviewSettings, WorkEvent,
+        WorkLedgerSnapshot, WorkspaceConfig, WorkspaceDraft, WorkspaceScanBatch,
     },
     project_service, release_service,
-    storage::{append_json_line, path_to_string},
+    storage::{
+        append_json_line, global_data_dir_from_environment, path_to_string,
+        take_json_recovery_notices,
+    },
     weekly_review,
 };
 #[cfg(target_os = "windows")]
 use std::os::windows::{ffi::OsStrExt, process::CommandExt};
 use std::{
     ffi::OsStr,
-    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -232,6 +235,11 @@ pub fn load_project(project_root: String) -> Result<ProjectManifest, String> {
 }
 
 #[tauri::command]
+pub fn take_storage_recovery_notices() -> Vec<crate::storage::JsonRecoveryNotice> {
+    take_json_recovery_notices()
+}
+
+#[tauri::command]
 pub async fn create_project<R: Runtime>(
     app: tauri::AppHandle<R>,
     name: String,
@@ -272,7 +280,38 @@ pub async fn send_project_message<R: Runtime>(
         text,
         image_attachments.unwrap_or_default(),
     )?;
+    Ok(start_project_message_stream(app, project_root, initial))
+}
+
+#[tauri::command]
+pub async fn retry_interrupted_project_message<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    project_root: String,
+    interrupted_message_id: String,
+) -> Result<MessageResult, String> {
+    let retry_root = project_root.clone();
+    let retry_app = app.clone();
+    let initial = tauri::async_runtime::spawn_blocking(move || {
+        project_service::prepare_interrupted_message_retry(
+            &retry_app,
+            retry_root,
+            interrupted_message_id,
+        )
+    })
+    .await
+    .map_err(|err| format!("准备聊天重试失败：{err}"))??;
+    Ok(start_project_message_stream(app, project_root, initial))
+}
+
+fn start_project_message_stream<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    project_root: String,
+    initial: MessageResult,
+) -> MessageResult {
     let message_id = initial.stream_message_id.clone();
+    if message_id.is_empty() {
+        return initial;
+    }
     let model_id = initial
         .messages
         .iter()
@@ -309,7 +348,7 @@ pub async fn send_project_message<R: Runtime>(
             );
         }
     });
-    Ok(initial)
+    initial
 }
 
 #[tauri::command]
@@ -381,6 +420,11 @@ pub fn mark_codex_task_handed_off(
 #[tauri::command]
 pub fn start_codex_task_run(project_root: String, task_id: String) -> Result<CodexRun, String> {
     project_service::start_codex_task_run(project_root, task_id)
+}
+
+#[tauri::command]
+pub fn check_codex_cli_readiness() -> CodexCliReadiness {
+    project_service::check_codex_cli_readiness()
 }
 
 #[tauri::command]
@@ -824,8 +868,9 @@ pub fn restore_local_backup<R: Runtime>(
     app: tauri::AppHandle<R>,
     backup_dir: String,
     restore_projects_base_dir: String,
+    confirmed: bool,
 ) -> Result<BackupRestoreResult, String> {
-    release_service::restore_local_backup(&app, backup_dir, restore_projects_base_dir)
+    release_service::restore_local_backup(&app, backup_dir, restore_projects_base_dir, confirmed)
 }
 
 #[tauri::command]
@@ -1184,7 +1229,6 @@ fn record_open_folder_debug(
     rust_received_path: Option<String>,
     note: Option<&str>,
 ) {
-    let log_path = open_folder_debug_log_path();
     let payload = serde_json::json!({
         "timestamp": crate::storage::now_string(),
         "stage": stage,
@@ -1194,25 +1238,9 @@ fn record_open_folder_debug(
         "exists": normalized_absolute_path.map(PathBuf::from).map(|path| path.exists()).unwrap_or(false),
         "note": note.unwrap_or(""),
     });
-    let _ = append_json_line(&log_path, &payload);
-}
-
-fn open_folder_debug_log_path() -> PathBuf {
-    let root = std::env::var_os("GANMAOYUAN_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let legacy = PathBuf::from(r"D:\GanMaoYuan\AppData");
-            if legacy.exists() {
-                legacy
-            } else {
-                std::env::var_os("APPDATA")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("com.ganmaoyuan.desktop")
-            }
-        });
-    let _ = fs::create_dir_all(&root);
-    root.join("open-folder-debug.jsonl")
+    if let Ok(root) = global_data_dir_from_environment() {
+        let _ = append_json_line(&root.join("open-folder-debug.jsonl"), &payload);
+    }
 }
 
 fn open_file_with_default_app(path: &Path) -> Result<(), String> {

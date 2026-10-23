@@ -7,8 +7,8 @@ use crate::{
     },
     project_service,
     storage::{
-        global_data_dir, new_id, now_string, path_to_string, read_json, write_json_atomic,
-        write_text_atomic,
+        default_documents_child, global_data_dir, new_id, now_string, path_to_string, read_json,
+        write_json_atomic, write_text_atomic,
     },
 };
 use std::{
@@ -216,7 +216,7 @@ pub fn export_weekly_report<R: Runtime>(
         .find(|item| item.id == report_id)
         .ok_or_else(|| "周报记录不存在。".to_string())?;
     let destination = if destination_dir.trim().is_empty() {
-        crate::release_service::default_release_directory(&global_data_dir(app)?, "Exports")
+        default_documents_child(app, "Exports")?
     } else {
         PathBuf::from(destination_dir)
     };
@@ -282,6 +282,7 @@ fn generate_report_for_scope<R: Runtime>(
         .unwrap_or(0)
         + 1;
     let report = build_report(
+        app,
         project_root,
         project_name,
         week_key,
@@ -295,7 +296,8 @@ fn generate_report_for_scope<R: Runtime>(
     Ok(report)
 }
 
-fn build_report(
+fn build_report<R: Runtime>(
+    app: &tauri::AppHandle<R>,
     project_root: &str,
     project_name: &str,
     week_key: &str,
@@ -431,7 +433,7 @@ fn build_report(
         &skill_candidates,
         &manifest,
     );
-    let report_dir = build_report_dir(project_root, week_key, version);
+    let report_dir = build_report_dir(app, project_root, week_key, version)?;
     fs::create_dir_all(&report_dir)
         .map_err(|err| format!("创建周报目录失败：{}：{err}", path_to_string(&report_dir)))?;
     let json_path = report_dir.join("report.json");
@@ -1051,32 +1053,23 @@ fn project_reports_path(root: &Path) -> PathBuf {
     root.join(".ganmaoyuan/weekly-reports/reports.json")
 }
 
-fn build_report_dir(project_root: &str, week_key: &str, version: u32) -> PathBuf {
+fn build_report_dir<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_root: &str,
+    week_key: &str,
+    version: u32,
+) -> Result<PathBuf, String> {
     if project_root.trim().is_empty() {
-        default_global_reports_root()
+        Ok(global_data_dir(app)?
+            .join("weekly-reports")
             .join(week_key)
-            .join(format!("v{version}"))
+            .join(format!("v{version}")))
     } else {
-        PathBuf::from(project_root)
+        Ok(PathBuf::from(project_root)
             .join(".ganmaoyuan/weekly-reports")
             .join(week_key)
-            .join(format!("v{version}"))
+            .join(format!("v{version}")))
     }
-}
-
-fn default_global_reports_root() -> PathBuf {
-    if let Some(configured) = std::env::var_os("GANMAOYUAN_DATA_DIR") {
-        return PathBuf::from(configured).join("weekly-reports");
-    }
-    let legacy = PathBuf::from(r"D:\GanMaoYuan\AppData");
-    if legacy.exists() {
-        return legacy.join("weekly-reports");
-    }
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("com.ganmaoyuan.desktop")
-        .join("weekly-reports")
 }
 
 fn current_week_window() -> (String, String, String) {

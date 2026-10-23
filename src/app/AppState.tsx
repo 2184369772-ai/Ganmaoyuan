@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   applyCodexReport as applyDesktopCodexReport,
   createCodexTask as createDesktopCodexTask,
@@ -16,6 +17,7 @@ import {
   importCodexReportText as importDesktopCodexReportText,
   ingestMaterialInboxFiles as ingestDesktopMaterialInboxFiles,
   receiveInboxFiles as receiveDesktopInboxFiles,
+  retryInterruptedProjectMessage as retryDesktopInterruptedProjectMessage,
   refineInboxEntryWithAi as refineDesktopInboxEntryWithAi,
   updateInboxRouteDecision as updateDesktopInboxRouteDecision,
   ignoreInboxEntry as ignoreDesktopInboxEntry,
@@ -54,6 +56,7 @@ import {
   scanCodexResultBridge as scanDesktopCodexResultBridge,
   saveMemos,
   sendProjectMessage as sendDesktopProjectMessage,
+  takeStorageRecoveryNotices,
   stopProjectMessage as stopDesktopProjectMessage,
   testDeepSeekConnection as testDesktopDeepSeekConnection,
   getImpactAnalyses as getDesktopImpactAnalyses,
@@ -75,6 +78,7 @@ import {
   updatePendingReviewStatus as updateDesktopPendingReviewStatus,
   markTodayDone as markDesktopTodayDone,
   recordUserDecisionEvent as recordDesktopUserDecisionEvent,
+  registerGeneratedFile as registerDesktopGeneratedFile,
   refreshGitSnapshot as refreshDesktopGitSnapshot,
   setStateAutoApply as setDesktopStateAutoApply,
   type AtlasAssessment,
@@ -119,6 +123,7 @@ import {
 } from "../features/project/desktopApi";
 
 type ThemeMode = "dark" | "light";
+type ProjectAiAuthorizationStatus = "idle" | "saving" | "refreshing" | "success" | "failed" | "cancelled" | "timeout";
 
 export type SettingsSection =
   | "general"
@@ -157,7 +162,10 @@ type AppStateValue = {
   projectMemory: string[];
   aiContextItems: string[];
   deepSeekSettings: DeepSeekSettings;
+  deepSeekSettingsLoaded: boolean;
   deepSeekModels: DeepSeekModelInfo[];
+  projectAiAuthorizationStatus: ProjectAiAuthorizationStatus;
+  projectAiAuthorizationFeedback: string;
   isStreaming: boolean;
   isDesktopReady: boolean;
   isStartupHydrated: boolean;
@@ -191,6 +199,7 @@ type AppStateValue = {
   createProject: (name: string, rootDir: string, filePaths: string[], description: string) => Promise<void>;
   importFilesToActiveProject: (filePaths: string[], relatedTask: string) => Promise<void>;
   sendProjectMessage: (text: string, imageAttachments?: ChatImageAttachmentInput[]) => Promise<void>;
+  retryProjectMessage: (interruptedMessageId: string) => Promise<void>;
   stopProjectMessage: () => Promise<void>;
   saveProjectDraft: (text: string, pendingFilePaths?: string[]) => Promise<void>;
   finishProjectWork: (done: string, nextStep: string) => Promise<void>;
@@ -251,6 +260,13 @@ type AppStateValue = {
   refreshGitSnapshot: (repositoryPath?: string) => Promise<GitSnapshot>;
   recordUserDecisionEvent: (decision: string, reason?: string) => Promise<WorkEvent>;
   captureProjectFact: (request: ProjectFactCaptureRequest) => Promise<WorkEvent>;
+  registerProjectGeneratedFile: (
+    fileName: string,
+    content: string,
+    createdSource: string,
+    relatedTask: string,
+    purpose: string,
+  ) => Promise<ManagedFile>;
   refreshProjectImpact: () => Promise<void>;
   refreshDailyContinue: () => Promise<void>;
   regenerateDailyContinue: () => Promise<void>;
@@ -298,7 +314,12 @@ const demoPendingMaterials = [
 ];
 
 const projectMemory = ["正式页面只保留启动页、工作页、设置页。", "感冒院 v0.1 的核心能力是项目文件位置掌控。"];
-const aiContextItems = ["DeepSeek 对话只发送项目说明、摘要和关键历史，不上传原始文件。", "文件导入、复制、登记和打开由 Tauri 命令负责。"];
+const aiContextItems = [
+  "项目理解授权会立即发送项目名称/说明/下一步、最多 24 份资料的名称/类别/摘要/章节、最多 18 条近期消息（每条最多 1,000 字）及只读 Atlas 状态摘要；不发送资料正文、完整聊天历史或本地路径。",
+  "聊天发送本轮问题（最多 8,000 字）、当前项目按问题筛选的可信记录，以及最多 5 轮历史对话（最近 3 轮，另加最多 2 轮相关历史；合计不超过 4,800 字，每条历史文本最多 700 字）。只有询问项目背景/目标时才附项目说明，只有询问下一步/当前工作时才附已确认下一步及相关状态。Work Ledger 最多 5 条、任务最多 4 条、成果和待确认事项各最多 3 条。命中时最多 3 份资料的摘要及正文片段（每份正文最多 1,800 字）。最多 4 张本轮图片（单张不超过 8 MB、总计不超过 20 MB）仅发送给支持视觉的模型；不附带历史图片或完整聊天历史。历史对话仅用于理解当前讨论，不作为已确认决定或事实。",
+  "Inbox 匹配发送待处理资料摘要，以及最多 3 个已分别授权候选项目的限量说明、项目理解、资料/任务/决定摘要和匹配理由；不发送原文件或本地路径。API Key 仅作请求授权头。",
+  "文件导入、复制、登记和打开由 Tauri 命令负责。",
+];
 
 const AppStateContext = createContext<AppStateValue | null>(null);
 
@@ -315,7 +336,7 @@ function readUiState() {
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const uiState = readUiState();
-  const [theme, setTheme] = useState<ThemeMode>(uiState.theme === "light" ? "light" : "dark");
+  const [theme, setTheme] = useState<ThemeMode>(uiState.theme === "dark" ? "dark" : "light");
   const [selectedSettingsSection, setSelectedSettingsSection] = useState<SettingsSection>(uiState.selectedSettingsSection ?? "general");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [activeProject, setActiveProject] = useState<ProjectSummary | null>(null);
@@ -338,13 +359,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const projectViewRef = useRef({ root: "", generation: 0 });
   const displayedRootRef = useRef("");
   const ledgerRequestRef = useRef(0);
+  const todayWorkspaceRequestRef = useRef(0);
+  const dailyContinueRequestRef = useRef(0);
   const [projectStateAutoApply, setProjectStateAutoApply] = useState(false);
   const [deepSeekSettings, setDeepSeekSettings] = useState<DeepSeekSettings>({
     hasApiKey: false,
     selectedModelId: "",
     lastTestedAt: "",
   });
+  const [deepSeekSettingsLoaded, setDeepSeekSettingsLoaded] = useState(false);
   const [deepSeekModels, setDeepSeekModels] = useState<DeepSeekModelInfo[]>([]);
+  const [projectAiAuthorizationStatus, setProjectAiAuthorizationStatus] = useState<ProjectAiAuthorizationStatus>("idle");
+  const [projectAiAuthorizationFeedback, setProjectAiAuthorizationFeedback] = useState("");
+  const projectAiAuthorizationInFlightRef = useRef(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [lastInboxReceptionAt, setLastInboxReceptionAt] = useState("");
   const memosRef = useRef<MemoItem[]>([]);
@@ -390,6 +417,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   async function synchronizeProjectFacts(view: { root: string; generation: number }) {
     if (!isCurrentProjectView(view) || !view.root) return;
+    const todayRequest = ++todayWorkspaceRequestRef.current;
     const result = await synchronizeDesktopProjectFacts(view.root).catch(() => null);
     if (!isCurrentProjectView(view)) return;
     if (!result) {
@@ -398,21 +426,34 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (scan.changed) {
         setActiveManifest(scan.manifest);
         setActiveProject(scan.manifest.project);
+        setProjects((previous) =>
+          [scan.manifest.project, ...previous.filter((project) => project.id !== scan.manifest.project.id)].sort(
+            (left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt),
+          ),
+        );
       }
       const ledger = await getDesktopWorkLedger(view.root);
       if (!isCurrentProjectView(view)) return;
       setWorkLedger(ledger);
       setCodexTasks(ledger.codexTasks ?? []);
+      await refreshTodayWorkspace();
       return;
     }
     setActiveManifest(result.manifest);
     setActiveProject(result.manifest.project);
+    setProjects((previous) =>
+      [result.manifest.project, ...previous.filter((project) => project.id !== result.manifest.project.id)].sort(
+        (left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt),
+      ),
+    );
     setWorkLedger(result.workLedger);
     setCodexTasks(result.workLedger.codexTasks ?? []);
-    setTodayWorkspace(result.todayWorkspace);
+    if (todayRequest === todayWorkspaceRequestRef.current) {
+      setTodayWorkspace(result.todayWorkspace);
+    }
   }
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
 
@@ -438,8 +479,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const hydrateStartup = async () => {
       try {
         await refreshProjects();
-        const workspace = await getDesktopTodayWorkspace();
-        if (!disposed) setTodayWorkspace(workspace);
+        await refreshTodayWorkspace();
       } catch (err) {
         if (!disposed) setError(String(err));
       } finally {
@@ -453,7 +493,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       void listMemos().then(setMemos).catch((err) => setError(String(err)));
       void listInboxEntries().then(setMaterialInbox).catch((err) => setError(String(err)));
       void loadDesktopInboxRoutingSettings().then(setInboxRoutingSettings).catch((err) => setError(String(err)));
-      void loadDesktopDeepSeekSettings().then(setDeepSeekSettings).catch((err) => setError(String(err)));
+      void loadDesktopDeepSeekSettings()
+        .then((settings) => {
+          setDeepSeekSettings(settings);
+          setDeepSeekSettingsLoaded(true);
+        })
+        .catch((err) => setError(String(err)));
       void listDesktopDeepSeekModels().then(setDeepSeekModels).catch(() => undefined);
       void loadDesktopWeeklyReviewSettings().then(setWeeklyReviewSettings).catch((err) => setError(String(err)));
     }, 250);
@@ -564,6 +609,26 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!isDesktopReady) return;
     let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen("codex-run-close-blocked", () => {
+      if (!disposed) {
+        setError("Codex 任务仍在执行，已暂缓关闭感冒院。请等待结果回流或先停止任务，再关闭应用。");
+      }
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
+    }).catch((err) => {
+      if (!disposed) setError(String(err));
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [isDesktopReady]);
+
+  useEffect(() => {
+    if (!isDesktopReady) return;
+    let disposed = false;
     void listenDeepSeekStream((event) => {
       if (disposed) return;
       setActiveManifest((previous) => {
@@ -574,7 +639,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
                 ...message,
                 text: event.text || message.text,
                 status: event.status,
-                source: "deepseek",
+                source: event.modelId === "system" ? "system" : "deepseek",
                 modelId: event.modelId || message.modelId,
               }
             : message,
@@ -615,6 +680,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
     try {
       const nextProjects = await listProjects();
       setProjects(nextProjects);
+      try {
+        const notices = await takeStorageRecoveryNotices();
+        if (notices.length) setError(notices.map((notice) => notice.message).join("\n"));
+      } catch {
+        // Older desktop builds may not expose recovery notices yet.
+      }
       const lastRoot = readUiState().lastProjectRoot;
       const projectToLoad = nextProjects.find((item) => item.rootDir === lastRoot);
       if (projectToLoad && !displayedRootRef.current && generation === projectViewRef.current.generation) {
@@ -647,6 +718,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }
 
   async function openProject(projectRoot: string) {
+    if (projectAiAuthorizationInFlightRef.current && projectRoot !== displayedRootRef.current) {
+      throw new Error("正在保存或更新本项目的 AI 授权，请完成后再切换项目。");
+    }
+    const isChangingProject = projectRoot !== displayedRootRef.current;
     // Invalidate outstanding reads immediately, including A -> B -> A switches.
     const view = { root: projectRoot, generation: projectViewRef.current.generation + 1 };
     projectViewRef.current = view;
@@ -667,15 +742,30 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setActiveProject(openedProject);
       setProjects((current) => [openedProject, ...current.filter((item) => item.id !== openedProject.id)]);
       setActiveManifest(manifest);
+      setIsStreaming(!manifest.recoveredFromBackup && manifest.messages.some((message) => message.status === "streaming"));
+      if (isChangingProject) {
+        setProjectAiAuthorizationStatus("idle");
+        setProjectAiAuthorizationFeedback("");
+      }
       setWorkLedger(null);
       setCodexTasks([]);
-      setError("");
+      const recoveryMessages = [manifest.recoveryNotice ?? ""];
+      if (isTauriRuntime()) {
+        try {
+          recoveryMessages.push(...(await takeStorageRecoveryNotices()).map((notice) => notice.message));
+        } catch {
+          // The loaded manifest still carries its project-specific recovery notice.
+        }
+      }
+      setError([...new Set(recoveryMessages.filter(Boolean))].join("\n"));
 
       // Project switches keep the existing responsive behavior; startup is
       // gated separately until the initial registry and Today snapshot load.
-      void synchronizeProjectFacts(view).catch((err) => {
-        if (isCurrentProjectView(view)) setError(String(err));
-      });
+      if (!manifest.recoveredFromBackup) {
+        void synchronizeProjectFacts(view).catch((err) => {
+          if (isCurrentProjectView(view)) setError(String(err));
+        });
+      }
     } catch (err) {
       if (!isCurrentProjectView(view)) return;
       projectViewRef.current = { root: displayedRootRef.current, generation: view.generation + 1 };
@@ -849,7 +939,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
   async function sendProjectMessage(text: string, imageAttachments: ChatImageAttachmentInput[] = []) {
     const trimmed = text.trim();
     if (!trimmed || !activeProject) return;
-    const result = await sendDesktopProjectMessage(activeProject.rootDir, trimmed, imageAttachments);
+    const view = captureProjectView();
+    const result = await sendDesktopProjectMessage(view.root, trimmed, imageAttachments);
+    if (!isCurrentProjectView(view)) return;
+    const hasCanonicalReceipt = result.messages.some((message) =>
+      message.evidenceItems.some((item) => item.contentType === "operationReceipt" && item.basisKind === "fact"),
+    );
     setIsStreaming(Boolean(result.streamMessageId));
     setActiveProject(result.project);
     setActiveManifest((previous) =>
@@ -863,22 +958,69 @@ export function AppProvider({ children }: { children: ReactNode }) {
         : previous,
     );
     setError("");
+
+    if (hasCanonicalReceipt) {
+      try {
+        const [manifest, ledger] = await Promise.all([
+          loadProject(view.root),
+          getDesktopWorkLedger(view.root),
+        ]);
+        if (!isCurrentProjectView(view)) return;
+        setActiveManifest(manifest);
+        setActiveProject(manifest.project);
+        setWorkLedger(ledger);
+        setCodexTasks(ledger.codexTasks ?? []);
+        setProjects((previous) =>
+          [manifest.project, ...previous.filter((project) => project.id !== manifest.project.id)].sort(
+            (left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt),
+          ),
+        );
+      } catch (err) {
+        if (isCurrentProjectView(view)) {
+          setError(`项目记录已有可核验回执，但刷新界面失败：${String(err)}`);
+        }
+      }
+    }
+  }
+
+  async function retryProjectMessage(interruptedMessageId: string) {
+    if (!activeProject) return;
+    const view = captureProjectView();
+    try {
+      const result = await retryDesktopInterruptedProjectMessage(view.root, interruptedMessageId);
+      if (!isCurrentProjectView(view)) return;
+      setIsStreaming(true);
+      setActiveProject(result.project);
+      setActiveManifest((previous) =>
+        previous
+          ? { ...previous, project: result.project, messages: [...previous.messages, ...result.messages] }
+          : previous,
+      );
+      setError("");
+    } catch (err) {
+      if (isCurrentProjectView(view)) setError(String(err));
+    }
   }
 
   async function stopProjectMessage() {
     if (!activeProject) return;
-    await stopDesktopProjectMessage(activeProject.rootDir);
+    const view = captureProjectView();
+    await stopDesktopProjectMessage(view.root);
   }
 
   async function saveProjectDraft(text: string, pendingFilePaths: string[] = []) {
     if (!activeProject) return;
-    const draft = await saveDesktopProjectDraft(activeProject.rootDir, text, pendingFilePaths);
+    const view = captureProjectView();
+    const draft = await saveDesktopProjectDraft(view.root, text, pendingFilePaths);
+    if (!isCurrentProjectView(view)) return;
     setActiveManifest((previous) => (previous ? { ...previous, draft } : previous));
   }
 
   async function finishProjectWork(done: string, nextStep: string) {
     if (!activeProject) return;
+    const view = captureProjectView();
     const result = await finishDesktopProjectWork(activeProject.rootDir, done, nextStep);
+    if (!isCurrentProjectView(view)) return;
     setActiveProject(result.project);
     setActiveManifest((previous) =>
       previous
@@ -896,6 +1038,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
         right.lastOpenedAt.localeCompare(left.lastOpenedAt),
       ),
     );
+    await refreshScopedWorkLedger(view);
+    if (!isCurrentProjectView(view)) return;
+    await refreshDailyContinue();
+    if (!isCurrentProjectView(view)) return;
+    await refreshTodayWorkspace();
+    if (!isCurrentProjectView(view)) return;
     setError("");
   }
 
@@ -1011,12 +1159,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
   async function saveDeepSeekApiKey(apiKey: string, selectedModelId: string) {
     const settings = await saveDesktopDeepSeekApiKey(apiKey, selectedModelId);
     setDeepSeekSettings(settings);
+    setDeepSeekSettingsLoaded(true);
     setError("");
   }
 
   async function deleteDeepSeekApiKey() {
     const settings = await deleteDesktopDeepSeekApiKey();
     setDeepSeekSettings(settings);
+    setDeepSeekSettingsLoaded(true);
     setDeepSeekModels([]);
     setError("");
   }
@@ -1029,17 +1179,52 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }
 
   async function grantProjectDeepSeekAuthorization() {
-    if (!activeProject) throw new Error("请先打开一个项目。");
-    let manifest = await grantDesktopDeepSeekAuthorization(activeProject.rootDir);
-    let refreshError = "";
-    try {
-      manifest = await refreshDesktopProjectUnderstanding(activeProject.rootDir);
-    } catch (err) {
-      refreshError = String(err);
+    if (projectAiAuthorizationInFlightRef.current) return;
+    if (!activeProject) {
+      setProjectAiAuthorizationStatus("failed");
+      setProjectAiAuthorizationFeedback("请先打开一个项目。");
+      return;
     }
-    setActiveManifest(manifest);
-    setActiveProject(manifest.project);
-    setError(refreshError);
+    projectAiAuthorizationInFlightRef.current = true;
+    const view = captureProjectView();
+    setProjectAiAuthorizationStatus("saving");
+    setProjectAiAuthorizationFeedback("正在保存本项目的 AI 授权…");
+    setError("");
+    try {
+      const grantedManifest = await grantDesktopDeepSeekAuthorization(view.root);
+      if (!isCurrentProjectView(view)) return;
+      setActiveManifest(grantedManifest);
+      setActiveProject(grantedManifest.project);
+      setProjectAiAuthorizationStatus("refreshing");
+      setProjectAiAuthorizationFeedback("授权已保存，正在更新项目理解…");
+
+      try {
+        const refreshedManifest = await refreshDesktopProjectUnderstanding(view.root);
+        if (!isCurrentProjectView(view)) return;
+        setActiveManifest(refreshedManifest);
+        setActiveProject(refreshedManifest.project);
+        setProjectAiAuthorizationStatus("success");
+        setProjectAiAuthorizationFeedback("AI 回复授权已保存，项目理解已更新。");
+      } catch (err) {
+        if (isCurrentProjectView(view)) {
+          const message = err instanceof Error ? err.message : String(err);
+          const status = projectAiAuthorizationFailureStatus(message);
+          const reason = status === "cancelled" ? "已取消" : status === "timeout" ? "超时" : "失败";
+          setProjectAiAuthorizationStatus(status);
+          setProjectAiAuthorizationFeedback(`AI 回复授权已保存，但项目理解更新${reason}：${message}`);
+        }
+      }
+    } catch (err) {
+      if (isCurrentProjectView(view)) {
+        const message = err instanceof Error ? err.message : String(err);
+        const status = projectAiAuthorizationFailureStatus(message);
+        const reason = status === "cancelled" ? "已取消" : status === "timeout" ? "请求超时" : "失败";
+        setProjectAiAuthorizationStatus(status);
+        setProjectAiAuthorizationFeedback(`AI 授权${reason}：${message}`);
+      }
+    } finally {
+      projectAiAuthorizationInFlightRef.current = false;
+    }
   }
 
   async function refreshProjectUnderstanding() {
@@ -1095,54 +1280,66 @@ export function AppProvider({ children }: { children: ReactNode }) {
     await exportDesktopWeeklyReport(target.projectRoot, reportId, destinationDir);
   }
 
-  async function refreshProjectImpact() {
-    if (!activeProject) return;
-    const root = activeProject.rootDir;
+  async function refreshProjectImpact(view = captureProjectView()) {
+    if (!view.root || !isCurrentProjectView(view)) return;
     try {
       const [impacts, candidates, proposals] = await Promise.all([
-        getDesktopImpactAnalyses(root),
-        getDesktopActionCandidates(root),
-        getDesktopStateProposals(root),
+        getDesktopImpactAnalyses(view.root),
+        getDesktopActionCandidates(view.root),
+        getDesktopStateProposals(view.root),
       ]);
+      if (!isCurrentProjectView(view)) return;
+      const manifest = await loadProject(view.root);
+      if (!isCurrentProjectView(view)) return;
       setImpactAnalyses(impacts);
       setActionCandidates(candidates);
       setStateProposals(proposals);
-      setActiveManifest(await loadProject(root));
+      setActiveManifest(manifest);
+      setActiveProject(manifest.project);
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view)) setError(String(err));
     }
   }
 
   async function refreshDailyContinue() {
-    if (!activeProject) return;
+    const view = captureProjectView();
+    if (!view.root || !isCurrentProjectView(view)) return;
+    const request = ++dailyContinueRequestRef.current;
     try {
-      const snapshot = await getDesktopDailyContinue(activeProject.rootDir);
+      const snapshot = await getDesktopDailyContinue(view.root);
+      if (!isCurrentProjectView(view) || request !== dailyContinueRequestRef.current) return;
       setDailyContinue(snapshot);
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view) && request === dailyContinueRequestRef.current) setError(String(err));
     }
   }
 
   async function regenerateDailyContinueAction() {
-    if (!activeProject) return;
+    const view = captureProjectView();
+    if (!view.root || !isCurrentProjectView(view)) return;
+    const request = ++dailyContinueRequestRef.current;
     try {
-      const snapshot = await regenerateDesktopDailyContinue(activeProject.rootDir);
+      const snapshot = await regenerateDesktopDailyContinue(view.root);
+      if (!isCurrentProjectView(view) || request !== dailyContinueRequestRef.current) return;
       setDailyContinue(snapshot);
       setError("");
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view) && request === dailyContinueRequestRef.current) setError(String(err));
     }
   }
 
   async function refreshTodayWorkspace(options?: { refreshFacts?: boolean }) {
     if (!isDesktopReady) return;
+    const request = ++todayWorkspaceRequestRef.current;
     try {
-      setTodayWorkspace(
-        await (options?.refreshFacts ? refreshDesktopTodayWorkspace() : getDesktopTodayWorkspace()),
-      );
+      const workspace = await (options?.refreshFacts
+        ? refreshDesktopTodayWorkspace()
+        : getDesktopTodayWorkspace());
+      if (request !== todayWorkspaceRequestRef.current) return;
+      setTodayWorkspace(workspace);
       setError("");
     } catch (err) {
-      setError(String(err));
+      if (request === todayWorkspaceRequestRef.current) setError(String(err));
     }
   }
 
@@ -1150,7 +1347,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     projectId: string,
     options: { pinned?: boolean; snoozedUntil?: string },
   ) {
-    setTodayWorkspace(await updateDesktopContinueProjectPreference(projectId, options));
+    const request = ++todayWorkspaceRequestRef.current;
+    const workspace = await updateDesktopContinueProjectPreference(projectId, options);
+    if (request === todayWorkspaceRequestRef.current) setTodayWorkspace(workspace);
   }
 
   async function refreshWorkLedger() {
@@ -1203,6 +1402,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const view = captureProjectView();
     const event = await captureDesktopProjectFact(activeProject.rootDir, request);
     if (!isCurrentProjectView(view)) return event;
+    const manifest = await loadProject(view.root);
+    if (!isCurrentProjectView(view)) return event;
+    setActiveManifest(manifest);
+    setActiveProject(manifest.project);
+    setProjects((previous) =>
+      [manifest.project, ...previous.filter((project) => project.id !== manifest.project.id)].sort(
+        (left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt),
+      ),
+    );
     await refreshScopedWorkLedger(view);
     if (!isCurrentProjectView(view)) return event;
     await refreshTodayWorkspace();
@@ -1210,64 +1418,119 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return event;
   }
 
+  async function registerProjectGeneratedFile(
+    fileName: string,
+    content: string,
+    createdSource: string,
+    relatedTask: string,
+    purpose: string,
+  ) {
+    if (!activeProject) throw new Error("请先打开一个项目。");
+    const view = captureProjectView();
+    const result = await registerDesktopGeneratedFile(
+      view.root,
+      fileName,
+      content,
+      createdSource,
+      relatedTask,
+      purpose,
+    );
+    if (!isCurrentProjectView(view)) return result.file;
+    const manifest = await loadProject(view.root);
+    if (!isCurrentProjectView(view)) return result.file;
+    setActiveManifest(manifest);
+    setActiveProject(manifest.project);
+    setProjects((previous) =>
+      [manifest.project, ...previous.filter((project) => project.id !== manifest.project.id)].sort(
+        (left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt),
+      ),
+    );
+    await refreshScopedWorkLedger(view);
+    if (!isCurrentProjectView(view)) return result.file;
+    await refreshTodayWorkspace();
+    if (isCurrentProjectView(view)) setError("");
+    return result.file;
+  }
+
   async function updateProjectAttentionAction(attentionId: string, status: "confirmed" | "ignored" | "later") {
     if (!activeProject) return;
+    const view = captureProjectView();
     try {
-      await updateDesktopProjectAttention(activeProject.rootDir, attentionId, status);
-      const manifest = await loadProject(activeProject.rootDir);
+      await updateDesktopProjectAttention(view.root, attentionId, status);
+      if (!isCurrentProjectView(view)) return;
+      const manifest = await loadProject(view.root);
+      if (!isCurrentProjectView(view)) return;
       setActiveManifest(manifest);
+      setActiveProject(manifest.project);
       await refreshTodayWorkspace();
+      if (!isCurrentProjectView(view)) return;
       setError("");
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view)) setError(String(err));
     }
   }
 
   async function updateDataHealthStatusAction(recordId: string, status: "resolved" | "ignored") {
     if (!activeProject) return;
+    const view = captureProjectView();
+    ++dailyContinueRequestRef.current;
     try {
-      const manifest = await updateDesktopDataHealthStatus(activeProject.rootDir, recordId, status);
+      const manifest = await updateDesktopDataHealthStatus(view.root, recordId, status);
+      if (!isCurrentProjectView(view)) return;
       setActiveManifest(manifest);
-      setDailyContinue(manifest.dailyContinueSnapshots[manifest.dailyContinueSnapshots.length - 1] ?? null);
+      setActiveProject(manifest.project);
+      await refreshDailyContinue();
+      if (!isCurrentProjectView(view)) return;
       await refreshTodayWorkspace();
+      if (!isCurrentProjectView(view)) return;
       setError("");
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view)) setError(String(err));
     }
   }
 
   async function updatePendingReviewStatusAction(reviewId: string, status: "open" | "pending" | "resolved" | "ignored") {
     if (!activeProject) return;
+    const view = captureProjectView();
+    ++dailyContinueRequestRef.current;
     try {
-      const manifest = await updateDesktopPendingReviewStatus(activeProject.rootDir, reviewId, status);
+      const manifest = await updateDesktopPendingReviewStatus(view.root, reviewId, status);
+      if (!isCurrentProjectView(view)) return;
       setActiveManifest(manifest);
-      setDailyContinue(manifest.dailyContinueSnapshots[manifest.dailyContinueSnapshots.length - 1] ?? null);
+      setActiveProject(manifest.project);
+      await refreshDailyContinue();
+      if (!isCurrentProjectView(view)) return;
       await refreshTodayWorkspace();
+      if (!isCurrentProjectView(view)) return;
       setError("");
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view)) setError(String(err));
     }
   }
 
   async function confirmActionCandidateAction(candidateId: string) {
     if (!activeProject) return;
+    const view = captureProjectView();
     try {
-      await confirmDesktopActionCandidate(activeProject.rootDir, candidateId);
-      await refreshProjectImpact();
-      setError("");
+      await confirmDesktopActionCandidate(view.root, candidateId);
+      if (!isCurrentProjectView(view)) return;
+      await refreshProjectImpact(view);
+      if (isCurrentProjectView(view)) setError("");
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view)) setError(String(err));
     }
   }
 
   async function ignoreActionCandidateAction(candidateId: string) {
     if (!activeProject) return;
+    const view = captureProjectView();
     try {
-      await ignoreDesktopActionCandidate(activeProject.rootDir, candidateId);
-      await refreshProjectImpact();
-      setError("");
+      await ignoreDesktopActionCandidate(view.root, candidateId);
+      if (!isCurrentProjectView(view)) return;
+      await refreshProjectImpact(view);
+      if (isCurrentProjectView(view)) setError("");
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view)) setError(String(err));
     }
   }
 
@@ -1279,59 +1542,75 @@ export function AppProvider({ children }: { children: ReactNode }) {
     suggestedDueDate: string,
   ) {
     if (!activeProject) return;
+    const view = captureProjectView();
     try {
-      await updateDesktopActionCandidate(activeProject.rootDir, candidateId, title, description, suggestedPriority, suggestedDueDate);
-      await refreshProjectImpact();
-      setError("");
+      await updateDesktopActionCandidate(view.root, candidateId, title, description, suggestedPriority, suggestedDueDate);
+      if (!isCurrentProjectView(view)) return;
+      await refreshProjectImpact(view);
+      if (isCurrentProjectView(view)) setError("");
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view)) setError(String(err));
     }
   }
 
   async function applyStateProposalAction(proposalId: string) {
     if (!activeProject) return;
+    const view = captureProjectView();
     try {
-      await applyDesktopStateProposal(activeProject.rootDir, proposalId);
-      await refreshProjectImpact();
-      setError("");
+      await applyDesktopStateProposal(view.root, proposalId);
+      if (!isCurrentProjectView(view)) return;
+      await refreshProjectImpact(view);
+      if (isCurrentProjectView(view)) setError("");
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view)) setError(String(err));
     }
   }
 
   async function undoStateProposalAction(proposalId: string) {
     if (!activeProject) return;
+    const view = captureProjectView();
     try {
-      await undoDesktopStateProposal(activeProject.rootDir, proposalId);
-      await refreshProjectImpact();
-      setError("");
+      await undoDesktopStateProposal(view.root, proposalId);
+      if (!isCurrentProjectView(view)) return;
+      await refreshProjectImpact(view);
+      if (isCurrentProjectView(view)) setError("");
     } catch (err) {
-      setError(String(err));
+      if (isCurrentProjectView(view)) setError(String(err));
     }
   }
 
   async function markTodayDoneAction(completed: string, nextStep: string) {
     if (!activeProject) return;
     try {
-      const result = await markDesktopTodayDone(activeProject.rootDir, completed, nextStep);
+      const view = captureProjectView();
+      const result = await markDesktopTodayDone(view.root, completed, nextStep);
+      if (!isCurrentProjectView(view)) return;
+      const dailyContinueRequest = ++dailyContinueRequestRef.current;
       setActiveProject(result.project);
       setActiveManifest((previous) =>
         previous
           ? {
               ...previous,
               project: result.project,
-              messages: [...previous.messages, result.message],
+              messages: result.message.id ? [...previous.messages, result.message] : previous.messages,
               recoveryPoints: [...previous.recoveryPoints, result.recoveryPoint],
               draft: { ...previous.draft, text: "", pendingFilePaths: [] },
             }
           : previous,
       );
-      await refreshDailyContinue();
       setProjects((previous) =>
         [result.project, ...previous.filter((project) => project.id !== result.project.id)].sort((left, right) =>
           right.lastOpenedAt.localeCompare(left.lastOpenedAt),
         ),
       );
+      await refreshScopedWorkLedger(view);
+      if (!isCurrentProjectView(view)) return;
+      const dailyContinue = await getDesktopDailyContinue(view.root);
+      if (!isCurrentProjectView(view)) return;
+      if (dailyContinueRequest !== dailyContinueRequestRef.current) return;
+      setDailyContinue(dailyContinue);
+      await refreshTodayWorkspace();
+      if (!isCurrentProjectView(view)) return;
       setError("");
     } catch (err) {
       setError(String(err));
@@ -1383,7 +1662,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       projectMemory,
       aiContextItems,
       deepSeekSettings,
+      deepSeekSettingsLoaded,
       deepSeekModels,
+      projectAiAuthorizationStatus,
+      projectAiAuthorizationFeedback,
       isStreaming,
       isStartupHydrated,
       isDesktopReady,
@@ -1421,6 +1703,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       createProject,
       importFilesToActiveProject,
       sendProjectMessage,
+      retryProjectMessage,
       stopProjectMessage,
       saveProjectDraft,
       finishProjectWork,
@@ -1495,6 +1778,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       refreshGitSnapshot,
       recordUserDecisionEvent,
       captureProjectFact,
+      registerProjectGeneratedFile,
       refreshProjectImpact,
       refreshDailyContinue,
       regenerateDailyContinue: regenerateDailyContinueAction,
@@ -1537,7 +1821,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       regenerateDailyContinueAction,
       isDesktopReady,
       deepSeekSettings,
+      deepSeekSettingsLoaded,
       deepSeekModels,
+      projectAiAuthorizationStatus,
+      projectAiAuthorizationFeedback,
       isStreaming,
     ],
   );
@@ -1561,6 +1848,17 @@ function semanticLocationForInboxItem(item: MaterialInboxItem) {
     提示词: "development",
   };
   return categoryMap[item.recommendedCategory] || "other";
+}
+
+function projectAiAuthorizationFailureStatus(message: string): "failed" | "cancelled" | "timeout" {
+  const normalized = message.toLocaleLowerCase();
+  if (/\b(cancelled|canceled|abort(?:ed)?)\b/.test(normalized) || /取消/.test(message)) {
+    return "cancelled";
+  }
+  if (/\b(timeout|timed out)\b/.test(normalized) || /超时/.test(message)) {
+    return "timeout";
+  }
+  return "failed";
 }
 
 export function useAppState() {

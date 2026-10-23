@@ -19,7 +19,7 @@ fn handle_windows_shell_commands() -> Result<bool, String> {
     if first == "--register-sendto" {
         app_lib::shell_integration::register_sendto_shortcut(&current_exe)?;
     } else {
-        app_lib::shell_integration::unregister_sendto_shortcut()?;
+        app_lib::shell_integration::unregister_sendto_shortcut(&current_exe)?;
     }
     Ok(true)
 }

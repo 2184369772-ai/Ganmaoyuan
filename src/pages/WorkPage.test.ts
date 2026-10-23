@@ -1,13 +1,19 @@
+import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
+import { useState } from "react";
 import {
   buildCodexTaskSearchParams,
   buildCodexDraftFromDiscussion,
   buildCodexTaskView,
+  buildCodexResultCheckFeedback,
   codexDisplayTaskTitle,
   codexHistoryGitSummary,
   codexReportTaskId,
   codexShortCommit,
   buildCodexRunObservability,
+  buildWorkCloseoutDraft,
+  codexRunsEqual,
+  codexActivityStatus,
   formatCodexElapsed,
   formatCodexLastActivity,
   formatCodexTaskDate,
@@ -17,19 +23,166 @@ import {
   codexTaskSteps,
   codexUserResultSummary,
   latestWorkspaceItems,
+  resolveConversationScrollTop,
   mergeCodexRuns,
   resolveCodexTaskDisplayType,
   resolveCodexPromptText,
   selectCurrentCodexTask,
   terminalRunSignatures,
   terminalRunStateChanged,
+  useConversationMessages,
   visibleReferenceFiles,
   workspaceActivityLabel,
   workspaceMessageDisplayLabel,
+  shouldShowChatThinkingIndicator,
   sanitizeWorkspacePublicText,
   projectAnalysisStatusLabel,
 } from "./WorkPage";
-import type { CodexRun, CodexTask, WorkspaceMessage } from "../features/project/desktopApi";
+import type { CodexRun, CodexTask, RecoveryPoint, WorkEvent, WorkspaceMessage } from "../features/project/desktopApi";
+
+describe("chat reply thinking indicator", () => {
+  const base = {
+    requestPending: false,
+    streamActive: false,
+    stopRequested: false,
+    nonConversationMode: false,
+  };
+
+  it("stays visible only while the real request is waiting for the first answer text", () => {
+    expect(shouldShowChatThinkingIndicator({ ...base, requestPending: true })).toBe(true);
+    expect(shouldShowChatThinkingIndicator({ ...base, streamActive: true, assistantStatus: "streaming", assistantText: "" })).toBe(true);
+    expect(shouldShowChatThinkingIndicator({ ...base, streamActive: true, assistantStatus: "streaming", assistantText: "第一段正文" })).toBe(false);
+    expect(shouldShowChatThinkingIndicator({ ...base, requestPending: true, assistantStatus: "completed", assistantText: "完整回答" })).toBe(false);
+  });
+
+  it("clears for terminal, stopped, and non-chat states", () => {
+    for (const assistantStatus of ["completed", "error", "failed", "cancelled", "stopped"]) {
+      expect(shouldShowChatThinkingIndicator({ ...base, requestPending: true, assistantStatus })).toBe(false);
+    }
+    expect(shouldShowChatThinkingIndicator({ ...base, requestPending: true, stopRequested: true })).toBe(false);
+    expect(shouldShowChatThinkingIndicator({ ...base, requestPending: true, nonConversationMode: true })).toBe(false);
+    expect(shouldShowChatThinkingIndicator(base)).toBe(false);
+  });
+});
+
+describe("evidence-backed work closeout draft", () => {
+  function event(overrides: Partial<WorkEvent>): WorkEvent {
+    return {
+      id: "event-default",
+      projectId: "project-a",
+      sourceType: "user",
+      sourceRef: "source-default",
+      eventType: "user.progressRecorded",
+      factKind: "userConfirmed",
+      occurredAt: "1790000000000",
+      summary: "用户记录进展：默认事项",
+      evidenceRefs: ["message:source-default"],
+      confidence: { score: 100, level: "high", display: "高" },
+      decisionTraceId: "",
+      decisionTrace: {
+        id: "", type: "", subjectId: "", projectId: "", inputEvidence: [],
+        aiUnderstanding: "", recommendation: "",
+        confidence: { score: 100, level: "high", display: "高" },
+        userDecision: "pending", userDecisionNote: "", execution: "pending",
+        executionNote: "", createdAt: "", updatedAt: "",
+      },
+      createdAt: "1790000000000",
+      ...overrides,
+    };
+  }
+
+  const latestRecovery: RecoveryPoint = {
+    id: "recovery-2",
+    projectId: "project-a",
+    completed: "上次已完成的内容",
+    nextStep: "旧下一步",
+    createdAt: "1790000000000",
+    messageCount: 4,
+    fileCount: 1,
+  };
+
+  it("prefills only current-project confirmed progress and accepted engineering evidence", () => {
+    const events = [
+      event({ id: "old-progress", summary: "不应重复：上次收工前的工作" }),
+      event({
+        id: "recovery-marker",
+        sourceRef: "recoveryPoint:recovery-2",
+        summary: "用户记录完成：上次已完成的内容",
+        evidenceRefs: ["recoveryPoint:recovery-2"],
+      }),
+      event({ id: "progress-now", summary: "用户记录进展：完成导入和正文解析" }),
+      event({
+        id: "accepted-codex",
+        sourceType: "codex",
+        eventType: "codex.taskAccepted",
+        factKind: "fact",
+        summary: "Codex 任务人工验收通过：修复资料检索",
+        evidenceRefs: ["codexTask:task-1", "codexReport:result-1"],
+      }),
+      event({
+        id: "git-commit",
+        sourceType: "git",
+        eventType: "git.headChanged",
+        factKind: "fact",
+        summary: "Git HEAD 更新到 abc123：fix: verify document search",
+        evidenceRefs: ["commit:abc123"],
+      }),
+      event({
+        id: "ai-suggestion",
+        sourceType: "system",
+        eventType: "user.progressRecorded",
+        factKind: "suggestion",
+        summary: "AI 建议：完成检索优化",
+      }),
+      event({
+        id: "scan-reminder",
+        sourceType: "scanner",
+        eventType: "project.directoryScanned",
+        factKind: "fact",
+        summary: "扫描发现待处理文件",
+      }),
+      event({
+        id: "foreign-progress",
+        projectId: "project-b",
+        summary: "WTS 的工作不能进入当前项目",
+      }),
+    ];
+
+    const draft = buildWorkCloseoutDraft(events, "project-a", [latestRecovery], "用户确认的当前下一步");
+    expect(draft.completed).toContain("完成导入和正文解析");
+    expect(draft.completed).toContain("修复资料检索");
+    expect(draft.completed).toContain("abc123");
+    expect(draft.completed).not.toContain("上次收工前");
+    expect(draft.completed).not.toContain("AI 建议");
+    expect(draft.completed).not.toContain("待处理文件");
+    expect(draft.completed).not.toContain("WTS");
+    expect(draft.nextStep).toBe("用户确认的当前下一步");
+    expect(draft.evidenceCount).toBe(3);
+  });
+
+  it("does not replay old events if the latest recovery point has no ledger boundary", () => {
+    const draft = buildWorkCloseoutDraft(
+      [event({ id: "old", summary: "旧的真实进展" })],
+      "project-a",
+      [latestRecovery],
+      "",
+    );
+    expect(draft.completed).toBe("");
+    expect(draft.evidenceCount).toBe(0);
+  });
+
+  it("keeps chat and AI suggestions out when no confirmed work evidence exists", () => {
+    const draft = buildWorkCloseoutDraft(
+      [event({ sourceType: "system", factKind: "inference", eventType: "chat.reply", summary: "AI 讨论结论" })],
+      "project-a",
+      [],
+      "",
+    );
+    expect(draft.completed).toBe("");
+    expect(draft.nextStep).toBe("");
+    expect(draft.evidenceCount).toBe(0);
+  });
+});
 
 function codexTask(overrides: Partial<CodexTask>): CodexTask {
   return {
@@ -87,6 +240,88 @@ describe("Codex task prompt binding", () => {
   });
 });
 
+describe("conversation scroll restoration", () => {
+  it("returns to the latest message when the conversation was following the bottom", () => {
+    expect(resolveConversationScrollTop({
+      scrollHeight: 2400,
+      clientHeight: 800,
+      previousScrollTop: 0,
+      followBottom: true,
+    })).toBe(1600);
+  });
+
+  it("preserves a deliberate reading position and clamps it after content changes", () => {
+    expect(resolveConversationScrollTop({
+      scrollHeight: 2400,
+      clientHeight: 800,
+      previousScrollTop: 720,
+      followBottom: false,
+    })).toBe(720);
+    expect(resolveConversationScrollTop({
+      scrollHeight: 900,
+      clientHeight: 800,
+      previousScrollTop: 720,
+      followBottom: false,
+    })).toBe(100);
+  });
+
+  it("reuses the conversation projection across unrelated renders", () => {
+    const messages: WorkspaceMessage[] = [{
+      id: "user-message",
+      author: "user",
+      kind: "requirement",
+      text: "保留最新对话位置。",
+      createdAt: "2026-10-13T00:00:00Z",
+      status: "completed",
+      attachments: [],
+      relatedTask: "",
+      source: "user",
+      modelId: "",
+      evidenceItems: [],
+    }];
+
+    const { result } = renderHook(() => {
+      const [, setUnrelatedState] = useState(0);
+      return {
+        messages: useConversationMessages(messages, "项目说明"),
+        rerenderUnrelated: () => setUnrelatedState((value) => value + 1),
+      };
+    });
+    const firstProjection = result.current.messages;
+
+    act(() => result.current.rerenderUnrelated());
+
+    expect(result.current.messages).toBe(firstProjection);
+  });
+});
+
+describe("Codex run polling stability", () => {
+  it("recognizes unchanged run snapshots", () => {
+    const run = { id: "run-a", taskId: "task-a", status: "running" } as unknown as CodexRun;
+    expect(codexRunsEqual([run], [{ ...run }])).toBe(true);
+  });
+
+  it("keeps real activity and lifecycle changes observable", () => {
+    const run = { id: "run-a", taskId: "task-a", status: "running", recentActivity: ["starting"] } as unknown as CodexRun;
+    expect(codexRunsEqual([run], [{ ...run, recentActivity: ["running tests"] }])).toBe(false);
+    expect(codexRunsEqual([run], [{ ...run, status: "exited" }])).toBe(false);
+  });
+
+  it("checks the visible raw-output tail without serializing the whole log", () => {
+    const run = {
+      id: "run-a",
+      taskId: "task-a",
+      status: "running",
+      rawActivity: Array.from({ length: 5000 }, (_, index) => `line ${index}`),
+    } as unknown as CodexRun;
+    const unchanged = { ...run, rawActivity: [...run.rawActivity!] };
+    const updated = { ...run, rawActivity: [...run.rawActivity!.slice(0, -1), "running tests"] };
+
+    expect(codexRunsEqual([run], [unchanged])).toBe(true);
+    expect(codexRunsEqual([run], [updated])).toBe(false);
+  });
+});
+
 describe("Codex execution observability", () => {
   const run = (overrides: Partial<CodexRun> = {}): CodexRun => ({
     id: "run-a",
@@ -130,9 +365,23 @@ describe("Codex execution observability", () => {
     expect(buildCodexRunObservability(run(), 1000000 + 1000 * 60 * 6 + 1000 * 18)).toMatchObject({
       headline: "Codex 正在执行",
       processText: "进程正常",
-      latestActivity: "stdout：运行测试",
+      latestActivity: "运行测试",
       quiet: true,
     });
+  });
+
+  it("maps real event names without claiming task completion or invented progress", () => {
+    expect(codexActivityStatus("stdout: turn.started")).toBe("Codex 已开始处理任务");
+    expect(codexActivityStatus("stdout：item.started")).toBe("Codex 已开始一项操作");
+    expect(codexActivityStatus("stdout：item.completed")).toBe("Codex 已结束一项操作");
+    expect(codexActivityStatus("stdout：turn.completed")).toBe("Codex 本轮处理已结束");
+    expect(codexActivityStatus("stderr: error: unavailable")).toBe("Codex 报告了执行错误");
+    expect(codexActivityStatus("stdout: future.event")).toBe("Codex 收到新的执行活动");
+    const raw = ["stdout：item.started", "stdout：item.updated"];
+    expect(buildCodexRunObservability(run({ recentActivity: raw })).recentActivity).toEqual(raw);
+    const rawLine = 'stdout：{"type":"turn.started"}';
+    expect(buildCodexRunObservability(run({ rawActivity: [rawLine] })).rawActivity).toEqual([rawLine]);
+    expect(buildCodexRunObservability(run({ recentActivity: [] })).latestActivity).toBe("等待 Codex 输出");
   });
 
   it("does not claim a live process after the backend reports it is gone", () => {
@@ -208,6 +457,60 @@ describe("Codex task draft from current discussion", () => {
 
     expect(buildCodexDraftFromDiscussion(messages)).toBeNull();
   });
+
+  it("derives a specific title from a concrete latest coding request", () => {
+    const messages: WorkspaceMessage[] = [{
+      id: "user-live-status",
+      author: "user",
+      kind: "requirement",
+      text: "修复 Codex 实时执行进展的中文显示。",
+      createdAt: "2026-10-09T00:00:00Z",
+      status: "completed",
+      attachments: [],
+      relatedTask: "",
+      source: "user",
+      modelId: "",
+      evidenceItems: [],
+    }];
+
+    expect(buildCodexDraftFromDiscussion(messages)).toMatchObject({
+      title: "修复 Codex 实时执行进展的中文显示",
+      taskType: "coding",
+    });
+  });
+
+  it("does not create a draft with a generic fallback title", () => {
+    const messages: WorkspaceMessage[] = [
+      {
+        id: "user-generic-coding",
+        author: "user",
+        kind: "requirement",
+        text: "请帮我优化一下。",
+        createdAt: "2026-10-09T00:00:00Z",
+        status: "completed",
+        attachments: [],
+        relatedTask: "",
+        source: "user",
+        modelId: "",
+        evidenceItems: [],
+      },
+      {
+        id: "assistant-generic-coding",
+        author: "ganmaoyuan",
+        kind: "assistant",
+        text: "可以优化一下。",
+        createdAt: "2026-10-09T00:01:00Z",
+        status: "completed",
+        attachments: [],
+        relatedTask: "",
+        source: "deepseek",
+        modelId: "deepseek-v4-flash",
+        evidenceItems: [],
+      },
+    ];
+
+    expect(buildCodexDraftFromDiscussion(messages)).toBeNull();
+  });
 });
 
 describe("Workspace rendering limits", () => {
@@ -236,10 +539,11 @@ describe("Workspace activity language", () => {
 
   it("keeps internal activity enums and paths out of the public view", () => {
     expect(workspaceMessageDisplayLabel({ kind: "fileLocation", status: "completed" })).toBe("文件已整理");
+    expect(workspaceMessageDisplayLabel({ kind: "assistant", status: "interrupted" })).toBe("生成已中断");
     expect(projectAnalysisStatusLabel("success")).toBe("已整理");
     expect(sanitizeWorkspacePublicText("codex-task-1234.md", "task")).toBe("已保存 Codex 任务记录。");
     expect(sanitizeWorkspacePublicText("Result Bridge updated taskId: 1234", "codex")).toBe("Codex 工作记录已更新。");
-    expect(sanitizeWorkspacePublicText("D:\\Example\\Workspace\\internal.json", "monitor")).toBe("相关资料已更新。");
+    expect(sanitizeWorkspacePublicText("D:\\GanMaoYuan\\SelfProject\\internal.json", "monitor")).toBe("相关资料已更新。");
   });
 });
 
@@ -275,7 +579,13 @@ describe("Codex task console actions", () => {
     ["needsReview", "running", null, "需要检查", "accept"],
   ] as const)("keeps task outcome %s authoritative over run %s", (status, runStatus, exitCode, label, action) => {
     const view = buildCodexTaskView(
-      codexTask({ status, gitVerification: { status: "notApplicable", repositoryPath: "", checkedAt: "", reason: "" } }),
+      codexTask({
+        status,
+        ...(["needsReview", "verifying", "awaitingAcceptance"].includes(status)
+          ? { resultId: "result-a", resultReceivedAt: "1" }
+          : {}),
+        gitVerification: { status: "notApplicable", repositoryPath: "", checkedAt: "", reason: "" },
+      }),
       { status: runStatus, exitCode, error: "" },
     );
     expect(view.statusLabel).toBe(label);
@@ -318,6 +628,8 @@ describe("Codex task console actions", () => {
       {
         status: "resultReceived",
         summary: "结果已收到",
+        resultId: "result-a",
+        resultReceivedAt: "1",
         manualAcceptance: [],
         gitVerification: { status: "notApplicable", repositoryPath: "", checkedAt: "", reason: "" },
       },
@@ -333,6 +645,8 @@ describe("Codex task console actions", () => {
       {
         status: "needsReview",
         summary: "taskId 不一致",
+        resultId: "result-a",
+        resultReceivedAt: "2026-08-26T00:00:00Z",
         manualAcceptance: [],
         gitVerification: { status: "mismatch", repositoryPath: "", checkedAt: "", reason: "" },
       },
@@ -344,11 +658,47 @@ describe("Codex task console actions", () => {
     expect(view.secondaryActions).toEqual(["reject"]);
   });
 
+  it("does not offer acceptance when needsReview means the result never arrived", () => {
+    const view = buildCodexTaskView(
+      codexTask({
+        status: "needsReview",
+        remainingIssues: ["应用重启后未收到匹配的 Codex 结果；恢复窗口已结束。"],
+      }),
+      { status: "unknownAfterRestart", exitCode: null, error: "应用重启后未检测到原 Codex 进程。" },
+    );
+
+    expect(view.statusLabel).toBe("结果未回流");
+    expect(view.primaryAction).toBe("checkResult");
+    expect(view.secondaryActions).toEqual([]);
+    expect(view.description).toContain("不会重新执行任务");
+  });
+
+  it("reports missing result scans and does not claim unrelated imports belong to this task", () => {
+    const task = codexTask({ status: "needsReview", expectedResultPath: "D:/project/results/task-a-result.json" });
+    const missing = buildCodexResultCheckFeedback(task, { status: "unknownAfterRestart", error: "" }, { scannedCount: 0, importedCount: 0 });
+    expect(missing).toMatchObject({ tone: "warning", title: "未找到结果文件" });
+    expect(missing.message).toContain("结果目录中没有可读取的结果文件");
+
+    const unrelated = buildCodexResultCheckFeedback(task, { status: "unknownAfterRestart", error: "" }, { scannedCount: 2, importedCount: 1 });
+    expect(unrelated.tone).toBe("warning");
+    expect(unrelated.message).toContain("没有一条绑定到");
+
+    const found = buildCodexResultCheckFeedback(
+      codexTask({ ...task, resultId: "result-a", resultReceivedAt: "1" }),
+      { status: "exited", error: "" },
+      { scannedCount: 2, importedCount: 1 },
+    );
+    expect(found).toMatchObject({ tone: "success", title: "已找到本次任务结果" });
+    expect(found.message).toContain("持久化结果");
+  });
+
   it("only offers acceptance actions while awaiting manual acceptance", () => {
     const view = buildCodexTaskView(
       {
         status: "awaitingAcceptance",
         summary: "完成",
+        resultId: "result-a",
+        resultReceivedAt: "1",
         manualAcceptance: ["打开桌面应用确认"],
         gitVerification: { status: "verified", repositoryPath: "", checkedAt: "", reason: "" },
       },
@@ -567,7 +917,13 @@ describe("Codex task deep link selection", () => {
 
   it("opens a needsReview task from a continue-work taskId", () => {
     const oldTask = codexTask({ taskId: "task-old", status: "awaitingAcceptance", title: "旧任务" });
-    const targetTask = codexTask({ taskId: "task-target", status: "needsReview", title: "检查结果" });
+    const targetTask = codexTask({
+      taskId: "task-target",
+      status: "needsReview",
+      resultId: "result-target",
+      resultSource: "codex",
+      title: "检查结果",
+    });
     const selected = selectCurrentCodexTask([oldTask, targetTask], [{ taskId: "task-old", status: "exited", startedAt: "9" }] as never, "task-target");
 
     expect(selected?.taskId).toBe("task-target");
@@ -576,7 +932,13 @@ describe("Codex task deep link selection", () => {
 
   it("opens an awaitingAcceptance task from a continue-work taskId", () => {
     const readyTask = codexTask({ taskId: "task-ready", status: "ready", title: "新任务" });
-    const targetTask = codexTask({ taskId: "task-accept", status: "awaitingAcceptance", title: "验收任务" });
+    const targetTask = codexTask({
+      taskId: "task-accept",
+      status: "awaitingAcceptance",
+      resultId: "result-accept",
+      resultSource: "codex",
+      title: "验收任务",
+    });
     const selected = selectCurrentCodexTask([readyTask, targetTask], [], "task-accept");
 
     expect(selected?.taskId).toBe("task-accept");
@@ -584,14 +946,14 @@ describe("Codex task deep link selection", () => {
   });
 
   it("does not cross projects when the target task is not loaded", () => {
-    const localTask = codexTask({ taskId: "project-a-task", status: "needsReview", title: "本项目任务" });
+    const localTask = codexTask({ taskId: "project-a-task", status: "ready", title: "本项目任务" });
     const selected = selectCurrentCodexTask([localTask], [], "project-b-task");
 
     expect(selected?.taskId).toBe("project-a-task");
   });
 
   it("safely falls back when a linked task no longer exists", () => {
-    const fallbackTask = codexTask({ taskId: "fallback-task", status: "needsReview", title: "可处理任务" });
+    const fallbackTask = codexTask({ taskId: "fallback-task", status: "ready", title: "可处理任务" });
     const selected = selectCurrentCodexTask([fallbackTask], [], "missing-task");
 
     expect(selected?.taskId).toBe("fallback-task");
@@ -599,7 +961,13 @@ describe("Codex task deep link selection", () => {
 
   it("does not keep jumping to an already completed deep-linked task", () => {
     const completed = codexTask({ taskId: "completed-task", status: "completed", title: "已完成任务" });
-    const active = codexTask({ taskId: "active-task", status: "needsReview", title: "当前问题" });
+    const active = codexTask({
+      taskId: "active-task",
+      status: "needsReview",
+      resultId: "result-active",
+      resultSource: "codex",
+      title: "当前问题",
+    });
     const selected = selectCurrentCodexTask([completed, active], [], "completed-task");
 
     expect(selected?.taskId).toBe("active-task");
@@ -607,11 +975,109 @@ describe("Codex task deep link selection", () => {
 
   it("keeps a just-accepted completed task visible while it is pinned", () => {
     const completed = codexTask({ taskId: "completed-task", status: "completed", title: "刚验收任务" });
-    const active = codexTask({ taskId: "active-task", status: "needsReview", title: "另一个任务" });
+    const active = codexTask({
+      taskId: "active-task",
+      status: "needsReview",
+      resultId: "result-active",
+      resultSource: "codex",
+      title: "另一个任务",
+    });
     const selected = selectCurrentCodexTask([completed, active], [], "completed-task", "completed-task");
 
     expect(selected?.taskId).toBe("completed-task");
     expect(selected?.status).toBe("completed");
+  });
+
+  it("does not let an exited historical run outrank a newer ready task", () => {
+    const oldTask = codexTask({ taskId: "old-task", status: "failed", updatedAt: "2026-10-10T10:00:00Z" });
+    const readyTask = codexTask({ taskId: "ready-task", status: "ready", updatedAt: "2026-10-10T11:00:00Z" });
+    const selected = selectCurrentCodexTask(
+      [oldTask, readyTask],
+      [{ taskId: "old-task", status: "exited", processAlive: false, startedAt: "2026-10-10T10:00:00Z" } as CodexRun],
+    );
+
+    expect(selected?.taskId).toBe("ready-task");
+  });
+
+  it("does not promote a needsReview task without a bound result over a real next task", () => {
+    const staleReview = codexTask({ taskId: "stale-review", status: "needsReview", updatedAt: "2026-10-10T12:00:00Z" });
+    const readyTask = codexTask({ taskId: "ready-task", status: "ready", updatedAt: "2026-10-10T11:00:00Z" });
+
+    expect(selectCurrentCodexTask([staleReview, readyTask], [])?.taskId).toBe("ready-task");
+  });
+
+  it("ignores a stale deep link when its review has no bound result", () => {
+    const staleReview = codexTask({ taskId: "stale-review", status: "needsReview", updatedAt: "2026-10-10T12:00:00Z" });
+    const readyTask = codexTask({ taskId: "ready-task", status: "ready", updatedAt: "2026-10-10T11:00:00Z" });
+
+    expect(selectCurrentCodexTask([staleReview, readyTask], [], "stale-review")?.taskId).toBe("ready-task");
+  });
+
+  it("keeps an explicitly selected historical task inspectable without treating it as default focus", () => {
+    const staleReview = codexTask({ taskId: "stale-review", status: "needsReview" });
+
+    expect(selectCurrentCodexTask([staleReview], [], "stale-review", "stale-review")?.taskId).toBe("stale-review");
+  });
+
+  it("keeps a resultless restarted task inspectable after valid work is considered", () => {
+    const staleRunTask = codexTask({ taskId: "stale-run", status: "awaitingResult" });
+    const unknownRun: CodexRun = {
+      id: "run-stale",
+      taskId: "stale-run",
+      projectId: "project-a",
+      repositoryPath: "",
+      commandExecutable: "codex.exe",
+      commandArgs: [],
+      capabilityProbe: {} as CodexRun["capabilityProbe"],
+      workingDirectory: "",
+      stdinPromptSummary: "",
+      status: "unknownAfterRestart",
+      startedAt: "2026-10-10T10:00:00Z",
+      endedAt: "2026-10-10T10:03:00Z",
+      pid: 42,
+      processAlive: false,
+      exitCode: null,
+      outputLastMessagePath: "",
+      stdoutSummary: "",
+      stderrSummary: "",
+      lastActivityAt: "",
+      recentActivity: [],
+      error: "No matching result file.",
+    };
+
+    expect(selectCurrentCodexTask([staleRunTask], [unknownRun])?.taskId).toBe("stale-run");
+    const readyTask = codexTask({ taskId: "ready-task", status: "ready", updatedAt: "2026-10-10T11:00:00Z" });
+    expect(selectCurrentCodexTask([staleRunTask, readyTask], [unknownRun], "stale-run")?.taskId).toBe("ready-task");
+  });
+
+  it("keeps a process-backed live Codex task ahead of queued work", () => {
+    const liveTask = codexTask({ taskId: "live-task", status: "running", updatedAt: "2026-10-10T10:00:00Z" });
+    const readyTask = codexTask({ taskId: "ready-task", status: "ready", updatedAt: "2026-10-10T12:00:00Z" });
+    const liveRun: CodexRun = {
+      id: "run-live",
+      taskId: "live-task",
+      projectId: "project-a",
+      repositoryPath: "",
+      commandExecutable: "codex.exe",
+      commandArgs: [],
+      capabilityProbe: {} as CodexRun["capabilityProbe"],
+      workingDirectory: "",
+      stdinPromptSummary: "",
+      status: "running",
+      startedAt: "2026-10-10T10:00:00Z",
+      endedAt: "",
+      pid: 42,
+      processAlive: true,
+      exitCode: null,
+      outputLastMessagePath: "",
+      stdoutSummary: "",
+      stderrSummary: "",
+      lastActivityAt: "",
+      recentActivity: [],
+      error: "",
+    };
+
+    expect(selectCurrentCodexTask([readyTask, liveTask], [liveRun])?.taskId).toBe("live-task");
   });
 });
 

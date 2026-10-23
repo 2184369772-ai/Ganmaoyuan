@@ -24,19 +24,27 @@ export function GlobalSearchPanel({
       setIsSearching(false);
       return;
     }
+    let isCurrentQuery = true;
     const timer = window.setTimeout(() => {
       setIsSearching(true);
       void searchProjects(trimmed)
         .then((next) => {
+          if (!isCurrentQuery) return;
           setResults(next);
           setError("");
         })
         .catch((err) => {
+          if (!isCurrentQuery) return;
           setError(String(err));
         })
-        .finally(() => setIsSearching(false));
+        .finally(() => {
+          if (isCurrentQuery) setIsSearching(false);
+        });
     }, 220);
-    return () => window.clearTimeout(timer);
+    return () => {
+      isCurrentQuery = false;
+      window.clearTimeout(timer);
+    };
   }, [query, setError]);
 
   const visibleResults = useMemo(() => results.slice(0, 12), [results]);
@@ -61,7 +69,7 @@ export function GlobalSearchPanel({
       <div className="global-search-head">
         <div>
           <span className="section-label">全局搜索</span>
-          {!compact ? <strong>搜项目、资料摘要、对话、任务和分析结果</strong> : null}
+          {!compact ? <strong>搜项目、资料摘要与 Word/PDF 正文、对话、任务和分析结果</strong> : null}
         </div>
         {isSearching ? <Badge tone="pending">搜索中...</Badge> : null}
       </div>
@@ -73,13 +81,16 @@ export function GlobalSearchPanel({
         autoFocus={autoFocus}
         value={query}
         onChange={(event) => setQuery(event.target.value)}
-        placeholder="输入中文关键词，例如：项目资料 / 下一步 / PRD"
+        placeholder="输入关键词，例如：项目资料 / 下一步 / Word 或 PDF 正文条款"
       />
 
       {query.trim() ? (
         <div className="global-search-results">
           {visibleResults.length ? (
             visibleResults.map((result) => (
+              result.contentType === "searchNotice" ? (
+                <Feedback key={result.id}>{result.snippet}</Feedback>
+              ) : (
               <Card
                 as="article"
                 key={result.id}
@@ -103,6 +114,11 @@ export function GlobalSearchPanel({
                     <span>位置：{result.workspaceRelativePath || result.managedPath || "Workspace"}</span>
                     <span>分类：{formatOwnership(result.ownershipType)}{result.category ? ` / ${result.category}` : ""}</span>
                     <span>用途：{formatDocumentPurpose(result.documentPurpose) || result.documentType || "待确认"}</span>
+                  </div>
+                ) : null}
+                {result.managedPath && !isWorkspaceFile(result) ? (
+                  <div className="global-search-workspace-meta">
+                    <span>项目位置：{result.workspaceRelativePath || result.managedPath}</span>
                   </div>
                 ) : null}
                 <p>{result.snippet || "已命中该项目记录。"}</p>
@@ -144,6 +160,7 @@ export function GlobalSearchPanel({
                   ) : null}
                 </div>
               </Card>
+              )
             ))
           ) : (
             <EmptyState kind="search" />

@@ -1,9 +1,9 @@
-use crate::storage::{now_string, path_to_string, read_json, write_json_atomic};
+use crate::storage::{
+    global_data_dir_from_environment, now_string, path_to_string, read_json, write_json_atomic,
+};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     env, fs,
-    io::Write,
     path::{Path, PathBuf},
 };
 #[cfg(target_os = "windows")]
@@ -12,13 +12,13 @@ use windows::{
     Win32::{
         System::Com::{
             CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
-            COINIT_APARTMENTTHREADED,
+            COINIT_APARTMENTTHREADED, STGM_READ,
         },
         UI::Shell::{IShellLinkW, ShellLink},
     },
 };
 
-const SENDTO_SHORTCUT_NAMES: [&str; 2] = ["感冒院.lnk", "Ganmaoyuan.lnk"];
+const SENDTO_SHORTCUT_NAME: &str = "Ganmaoyuan - SendTo.lnk";
 const SENDTO_ARGUMENTS: &str = "--shell-source windowsSendTo";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -27,11 +27,11 @@ struct ShellIntegrationSettings {
     #[serde(default = "default_true")]
     sendto_enabled: bool,
     #[serde(default)]
+    managed_sendto_shortcut_path: String,
+    #[serde(default)]
+    managed_sendto_target_path: String,
+    #[serde(default)]
     updated_at: String,
-    #[serde(default)]
-    sendto_shortcut_path: Option<String>,
-    #[serde(default)]
-    sendto_shortcut_sha256: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -49,7 +49,10 @@ pub fn maybe_register_sendto_shortcut(current_exe: &Path) -> Result<(), String> 
         if !read_shell_settings()?.sendto_enabled {
             return Ok(());
         }
-        register_sendto_shortcut(current_exe)?;
+        if register_sendto_shortcut(current_exe).is_err() {
+            // A name conflict must not prevent the main application from starting.
+            log::warn!("SendTo registration skipped; existing user shortcuts were preserved.");
+        }
         Ok(())
     }
 }
@@ -74,143 +77,213 @@ pub fn register_sendto_shortcut(current_exe: &Path) -> Result<PathBuf, String> {
             path_to_string(&sendto_dir)
         )
     })?;
+    let shortcut_path = sendto_dir.join(SENDTO_SHORTCUT_NAME);
     let mut settings = read_shell_settings()?;
-    let (shortcut_path, reserved_placeholder) =
-        if let Some(owned_path) = recorded_owned_shortcut(&sendto_dir, &settings) {
-            (owned_path, None)
-        } else {
-            let (path, placeholder) = reserve_sendto_shortcut_path(&sendto_dir)?;
-            (path, Some(placeholder))
-        };
-    if let Err(error) = create_shortcut(
+    let previously_managed = same_file_path(
+        Path::new(&settings.managed_sendto_shortcut_path),
         &shortcut_path,
+    ) && same_file_path(
+        Path::new(&settings.managed_sendto_target_path),
         &current_exe,
-        SENDTO_ARGUMENTS,
-        current_exe.parent().unwrap_or_else(|| Path::new(".")),
-        &current_exe,
-    ) {
-        if let Some(placeholder) = reserved_placeholder {
-            remove_if_placeholder(&shortcut_path, &placeholder);
+    );
+    let existing = match fs::symlink_metadata(&shortcut_path) {
+        Ok(metadata) => {
+            if is_link_or_reparse(&metadata) || !metadata.is_file() {
+                return Err("SendTo 入口同名项目不属于当前安装，已保留且未覆盖。".to_string());
+            }
+            Some(shortcut_matches(
+                &shortcut_path,
+                &current_exe,
+                SENDTO_ARGUMENTS,
+            )?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("检查 SendTo 入口失败：{error}")),
+    };
+    let created_by_this_call =
+        match shortcut_disposition(existing.is_some(), existing.unwrap_or(false)) {
+            ShortcutDisposition::Create => {
+                create_shortcut(
+                    &shortcut_path,
+                    &current_exe,
+                    SENDTO_ARGUMENTS,
+                    current_exe.parent().unwrap_or_else(|| Path::new(".")),
+                    &current_exe,
+                )?;
+                true
+            }
+            ShortcutDisposition::ReuseVerified => false,
+            ShortcutDisposition::PreserveConflict => {
+                return Err("SendTo 入口同名项目不属于当前安装，已保留且未覆盖。".to_string());
+            }
+        };
+    settings.sendto_enabled = true;
+    if created_by_this_call || previously_managed {
+        settings.managed_sendto_shortcut_path = path_to_string(&shortcut_path);
+        settings.managed_sendto_target_path = path_to_string(&current_exe);
+    }
+    settings.updated_at = now_string();
+    if let Err(error) = write_shell_settings(&settings) {
+        if created_by_this_call {
+            if let Ok(metadata) = fs::symlink_metadata(&shortcut_path) {
+                if metadata.is_file()
+                    && !is_link_or_reparse(&metadata)
+                    && shortcut_matches(&shortcut_path, &current_exe, SENDTO_ARGUMENTS)
+                        .unwrap_or(false)
+                {
+                    let _ = fs::remove_file(&shortcut_path);
+                }
+            }
         }
         return Err(error);
     }
-    settings.sendto_shortcut_path = Some(path_to_string(&shortcut_path));
-    settings.sendto_shortcut_sha256 = Some(file_sha256(&shortcut_path)?);
-    settings.sendto_enabled = true;
-    settings.updated_at = now_string();
-    write_shell_settings(&settings)?;
     Ok(shortcut_path)
 }
 
-pub fn unregister_sendto_shortcut() -> Result<(), String> {
+pub fn unregister_sendto_shortcut(current_exe: &Path) -> Result<(), String> {
     let sendto_dir = sendto_dir()?;
     let mut settings = read_shell_settings()?;
-    if let Some(path) = recorded_owned_shortcut(&sendto_dir, &settings) {
-        if path.exists() {
-            fs::remove_file(&path).map_err(|err| {
-                format!(
-                    "删除感冒院创建的 SendTo 入口失败：{}：{err}",
-                    path_to_string(&path)
-                )
-            })?;
+    let recorded_path = PathBuf::from(&settings.managed_sendto_shortcut_path);
+    let current_exe = current_exe
+        .canonicalize()
+        .unwrap_or_else(|_| current_exe.to_path_buf());
+    let allowed_path = recorded_path.file_name().and_then(|name| name.to_str())
+        == Some(SENDTO_SHORTCUT_NAME)
+        && recorded_path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            == sendto_dir.canonicalize().ok()
+        && same_file_path(
+            Path::new(&settings.managed_sendto_target_path),
+            &current_exe,
+        );
+    if allowed_path {
+        match fs::symlink_metadata(&recorded_path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !is_link_or_reparse(&metadata)
+                    && should_remove_managed_shortcut(
+                        true,
+                        shortcut_matches(&recorded_path, &current_exe, SENDTO_ARGUMENTS)?,
+                    ) =>
+            {
+                fs::remove_file(&recorded_path)
+                    .map_err(|err| format!("删除已核验的 SendTo 入口失败：{err}"))?;
+            }
+            // The shortcut was replaced or its target cannot be verified. Keep it.
+            Ok(_) | Err(_) => {}
         }
     }
     settings.sendto_enabled = false;
-    settings.sendto_shortcut_path = None;
-    settings.sendto_shortcut_sha256 = None;
+    settings.managed_sendto_shortcut_path.clear();
+    settings.managed_sendto_target_path.clear();
     settings.updated_at = now_string();
     write_shell_settings(&settings)?;
     Ok(())
 }
 
-fn recorded_owned_shortcut(
-    sendto_dir: &Path,
-    settings: &ShellIntegrationSettings,
-) -> Option<PathBuf> {
-    let path = PathBuf::from(settings.sendto_shortcut_path.as_ref()?);
-    let recorded_hash = settings.sendto_shortcut_sha256.as_deref()?;
-    if path.parent() != Some(sendto_dir)
-        || path.extension().and_then(|ext| ext.to_str()) != Some("lnk")
-    {
-        return None;
-    }
-    let actual_hash = file_sha256(&path).ok()?;
-    if should_remove_owned_shortcut(
-        &path,
-        sendto_dir,
-        Some(&path),
-        Some(recorded_hash),
-        Some(&actual_hash),
-    ) {
-        Some(path)
-    } else {
-        None
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutDisposition {
+    Create,
+    ReuseVerified,
+    PreserveConflict,
+}
+
+fn shortcut_disposition(exists: bool, target_and_args_match: bool) -> ShortcutDisposition {
+    match (exists, target_and_args_match) {
+        (false, _) => ShortcutDisposition::Create,
+        (true, true) => ShortcutDisposition::ReuseVerified,
+        (true, false) => ShortcutDisposition::PreserveConflict,
     }
 }
 
-fn should_remove_owned_shortcut(
-    candidate: &Path,
-    sendto_dir: &Path,
-    recorded_path: Option<&Path>,
-    recorded_hash: Option<&str>,
-    actual_hash: Option<&str>,
+fn should_remove_managed_shortcut(
+    recorded_for_this_install: bool,
+    target_and_args_match: bool,
 ) -> bool {
-    candidate.parent() == Some(sendto_dir)
-        && candidate.extension().and_then(|ext| ext.to_str()) == Some("lnk")
-        && recorded_path == Some(candidate)
-        && recorded_hash.is_some()
-        && recorded_hash == actual_hash
+    recorded_for_this_install && target_and_args_match
 }
 
-fn reserve_sendto_shortcut_path(sendto_dir: &Path) -> Result<(PathBuf, Vec<u8>), String> {
-    let mut candidates = SENDTO_SHORTCUT_NAMES
-        .iter()
-        .map(|name| sendto_dir.join(name))
-        .chain((2_u32..).map(|index| sendto_dir.join(format!("感冒院 (Ganmaoyuan {index}).lnk"))));
-    loop {
-        let candidate = candidates
-            .next()
-            .expect("numbered SendTo names are unbounded");
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                let placeholder = format!("Ganmaoyuan SendTo reservation {}", uuid::Uuid::new_v4());
-                let placeholder = placeholder.into_bytes();
-                if let Err(err) = file.write_all(&placeholder) {
-                    drop(file);
-                    remove_if_placeholder(&candidate, &placeholder);
-                    return Err(format!(
-                        "预留 SendTo 名称失败：{}：{err}",
-                        path_to_string(&candidate)
-                    ));
-                }
-                return Ok((candidate, placeholder));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "预留 SendTo 名称失败：{}：{error}",
-                    path_to_string(&candidate)
-                ));
-            }
-        }
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    path_to_string(&left).eq_ignore_ascii_case(&path_to_string(&right))
+}
+
+fn shortcut_matches(path: &Path, target: &Path, arguments: &str) -> Result<bool, String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (path, target, arguments);
+        Ok(false)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let Some((actual_target, actual_arguments)) = read_shortcut(path)? else {
+            return Ok(false);
+        };
+        Ok(actual_arguments.trim() == arguments && same_file_path(&actual_target, target))
     }
 }
 
-fn remove_if_placeholder(path: &Path, placeholder: &[u8]) {
-    if fs::read(path).ok().as_deref() == Some(placeholder) {
-        let _ = fs::remove_file(path);
-    }
-}
+#[cfg(target_os = "windows")]
+fn read_shortcut(path: &Path) -> Result<Option<(PathBuf, String)>, String> {
+    use std::ptr::null_mut;
 
-fn file_sha256(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path)
-        .map_err(|err| format!("读取 SendTo 快捷方式失败：{}：{err}", path_to_string(path)))?;
-    let digest = Sha256::digest(bytes);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            .ok()
+            .map_err(|err| format!("初始化 Windows Shell COM 失败：{err}"))?;
+        let result = (|| -> Result<Option<(PathBuf, String)>, String> {
+            let shell_link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+                .map_err(|err| format!("读取 Windows 快捷方式失败：{err}"))?;
+            let persist: IPersistFile = shell_link
+                .cast()
+                .map_err(|err| format!("读取快捷方式持久化接口失败：{err}"))?;
+            persist
+                .Load(&HSTRING::from(path_to_string(path)), STGM_READ)
+                .map_err(|err| format!("加载快捷方式失败：{err}"))?;
+            let mut target_buffer = vec![0_u16; 32_768];
+            shell_link
+                .GetPath(&mut target_buffer, null_mut(), 0)
+                .map_err(|err| format!("读取快捷方式目标失败：{err}"))?;
+            let mut arguments_buffer = vec![0_u16; 8_192];
+            shell_link
+                .GetArguments(&mut arguments_buffer)
+                .map_err(|err| format!("读取快捷方式参数失败：{err}"))?;
+            let target = String::from_utf16_lossy(
+                &target_buffer[..target_buffer
+                    .iter()
+                    .position(|value| *value == 0)
+                    .unwrap_or(target_buffer.len())],
+            );
+            let arguments = String::from_utf16_lossy(
+                &arguments_buffer[..arguments_buffer
+                    .iter()
+                    .position(|value| *value == 0)
+                    .unwrap_or(arguments_buffer.len())],
+            );
+            if target.trim().is_empty() {
+                return Ok(None);
+            }
+            Ok(Some((PathBuf::from(target), arguments)))
+        })();
+        CoUninitialize();
+        result
+    }
 }
 
 fn create_shortcut(
@@ -276,26 +349,7 @@ fn shell_settings_path() -> Result<PathBuf, String> {
 }
 
 fn global_data_dir_path() -> Result<PathBuf, String> {
-    if let Some(configured) = env::var_os("GANMAOYUAN_DATA_DIR") {
-        let path = PathBuf::from(configured);
-        fs::create_dir_all(&path)
-            .map_err(|err| format!("创建感冒院数据目录失败：{}：{err}", path_to_string(&path)))?;
-        return Ok(path);
-    }
-    let preferred = PathBuf::from(r"D:\GanMaoYuan\AppData");
-    let fallback = env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("com.ganmaoyuan.desktop");
-    // Keep existing installations together while avoiding a new hard dependency on D:.
-    let path = if preferred.exists() {
-        preferred
-    } else {
-        fallback
-    };
-    fs::create_dir_all(&path)
-        .map_err(|err| format!("创建感冒院数据目录失败：{}：{err}", path_to_string(&path)))?;
-    Ok(path)
+    global_data_dir_from_environment()
 }
 
 fn read_shell_settings() -> Result<ShellIntegrationSettings, String> {
@@ -312,43 +366,76 @@ fn write_shell_settings(settings: &ShellIntegrationSettings) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
-    use super::should_remove_owned_shortcut;
-    use std::path::Path;
+    #[test]
+    fn sendto_name_collision_preserves_unowned_shortcut() {
+        use super::{shortcut_disposition, ShortcutDisposition};
+        assert_eq!(
+            shortcut_disposition(false, false),
+            ShortcutDisposition::Create
+        );
+        assert_eq!(
+            shortcut_disposition(true, true),
+            ShortcutDisposition::ReuseVerified
+        );
+        assert_eq!(
+            shortcut_disposition(true, false),
+            ShortcutDisposition::PreserveConflict
+        );
+    }
 
     #[test]
-    fn unregister_only_removes_exact_recorded_shortcut_bytes() {
-        let directory = Path::new(r"C:\Users\Example\AppData\Roaming\Microsoft\Windows\SendTo");
-        let owned = directory.join("感冒院.lnk");
-        assert!(should_remove_owned_shortcut(
-            &owned,
-            directory,
-            Some(&owned),
-            Some("owned-hash"),
-            Some("owned-hash")
-        ));
-        assert!(!should_remove_owned_shortcut(
-            &owned,
-            directory,
-            Some(&owned),
-            Some("owned-hash"),
-            Some("user-replaced-hash")
-        ));
-        assert!(!should_remove_owned_shortcut(
-            &owned,
-            directory,
-            None,
-            None,
-            Some("owned-hash")
-        ));
-        let outside = Path::new(
-            r"C:\Users\Example\AppData\Roaming\Microsoft\Windows\SendTo\..\Documents\user.lnk",
+    fn only_a_recorded_shortcut_with_matching_target_and_arguments_is_removable() {
+        use super::should_remove_managed_shortcut;
+        assert!(!should_remove_managed_shortcut(false, true));
+        assert!(!should_remove_managed_shortcut(true, false));
+        assert!(should_remove_managed_shortcut(true, true));
+    }
+
+    #[test]
+    fn nsis_never_deletes_sendto_shortcuts_by_legacy_filename() {
+        let script = include_str!("../installer/sendto-installer.nsi");
+        assert!(!script.contains("Delete \"$SENDTO\\感冒院.lnk\""));
+        assert!(!script.contains("Delete \"$SENDTO\\Ganmaoyuan.lnk\""));
+        assert!(script.contains("IsShortcutTarget \"$SENDTO\\Ganmaoyuan - SendTo.lnk\""));
+        assert!(script.contains("WriteRegStr SHCTX \"${UNINSTKEY}\" \"ManagedSendToShortcut\""));
+        assert!(script.contains("ReadRegStr $1 SHCTX \"${UNINSTKEY}\" \"ManagedSendToShortcut\""));
+        assert!(
+            script.contains("ReadRegStr $R0 SHCTX \"${UNINSTKEY}\" \"ManagedStartMenuShortcut\"")
         );
-        assert!(!should_remove_owned_shortcut(
-            outside,
-            directory,
-            Some(outside),
-            Some("same"),
-            Some("same")
-        ));
+        assert!(script.contains("ReadRegStr $R0 SHCTX \"${UNINSTKEY}\" \"ManagedDesktopShortcut\""));
+        assert!(script.contains("WriteRegStr SHCTX \"${UNINSTKEY}\" \"ManagedDesktopShortcut\" \"$DESKTOP\\${PRODUCTNAME}.lnk\""));
+        assert!(script.contains("Preserving an existing desktop shortcut with a different target."));
+        assert!(script.contains("$OldMainBinaryName != \"${PRODUCTNAME}.exe\""));
+        assert!(script.contains("Delete \"$INSTDIR\\${PRODUCTNAME}.exe\""));
+        assert!(!script.contains("Delete \"$INSTDIR\\$OldMainBinaryName\""));
+        assert!(!script.contains("\"$INSTDIR\\$OldMainBinaryName\""));
+    }
+
+    #[test]
+    fn nsis_user_data_cleanup_does_not_follow_reparse_points() {
+        let script = include_str!("../installer/sendto-installer.nsi");
+        let cleanup = script
+            .split("Function un.RemoveUserDataTree")
+            .nth(1)
+            .and_then(|body| body.split("FunctionEnd").next())
+            .expect("user data cleanup function exists");
+        let attribute_check = cleanup
+            .find("GetFileAttributesW(w \"$R0\")")
+            .expect("cleanup checks attributes before traversing");
+        let reparse_guard = cleanup
+            .find("IntOp $R5 $R4 & 0x400")
+            .expect("cleanup detects reparse points");
+        let recursive_call = cleanup
+            .find("Call un.RemoveUserDataTree")
+            .expect("cleanup recursively handles ordinary child directories");
+        assert!(attribute_check < reparse_guard);
+        assert!(reparse_guard < recursive_call);
+        assert!(!cleanup.contains("RMDir /r"));
+        assert!(script.contains("StrCpy $R0 \"$APPDATA\\${BUNDLEID}\""));
+        assert!(script.contains("StrCpy $R0 \"$LOCALAPPDATA\\${BUNDLEID}\""));
+        assert!(!script.contains("RmDir /r \"$APPDATA\\${BUNDLEID}\""));
+        assert!(!script.contains("RmDir /r \"$LOCALAPPDATA\\${BUNDLEID}\""));
+        assert!(script.contains("${If} $DeleteAppDataCheckboxState = 1"));
+        assert!(script.contains("${AndIf} $UpdateMode <> 1"));
     }
 }

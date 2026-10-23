@@ -11,8 +11,9 @@ mod release_service;
 pub mod shell_integration;
 mod storage;
 mod weekly_review;
+pub(crate) mod why_context;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -89,9 +90,11 @@ pub fn run() {
             commands::list_execution_records,
             commands::undo_cleanup_execution_batch,
             commands::load_project,
+            commands::take_storage_recovery_notices,
             commands::create_project,
             commands::import_files,
             commands::send_project_message,
+            commands::retry_interrupted_project_message,
             commands::read_chat_attachment,
             commands::stop_project_message,
             commands::save_project_draft,
@@ -101,6 +104,7 @@ pub fn run() {
             commands::list_codex_tasks,
             commands::rebind_codex_task_prompt,
             commands::mark_codex_task_handed_off,
+            commands::check_codex_cli_readiness,
             commands::start_codex_task_run,
             commands::cancel_codex_task_run,
             commands::accept_codex_task,
@@ -182,7 +186,13 @@ pub fn run() {
             commands::set_state_auto_apply,
         ])
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if project_service::has_active_codex_runs(window.app_handle()) {
+                    api.prevent_close();
+                    log::warn!("Blocked window close while an embedded Codex run is active");
+                    let _ = window.emit("codex-run-close-blocked", ());
+                    return;
+                }
                 window.app_handle().exit(0);
             }
         })

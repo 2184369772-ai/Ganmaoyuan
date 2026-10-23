@@ -2,6 +2,8 @@
     [string]$RepoRoot = "",
     [string]$OutputDir = "",
     [string]$ProjectRoot = "",
+    [string]$GlobalDataDir = "",
+    [string]$WorkspaceRoot = "",
     [switch]$JsonOnly
 )
 
@@ -46,7 +48,7 @@ function Get-FileSha256 {
 
 function Get-LnkTarget {
     param([string]$ShortcutPath)
-    if (-not (Test-Path -LiteralPath $ShortcutPath)) {
+    if ([string]::IsNullOrWhiteSpace($ShortcutPath) -or -not (Test-Path -LiteralPath $ShortcutPath)) {
         return $null
     }
     $shell = New-Object -ComObject WScript.Shell
@@ -141,24 +143,13 @@ if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
     $RepoRoot = Split-Path -Parent $PSScriptRoot
 }
 $RepoRoot = Resolve-FullPath $RepoRoot
-$legacyDataDir = "D:\GanMaoYuan\AppData"
-$globalDataDir = if (-not [string]::IsNullOrWhiteSpace($env:GANMAOYUAN_DATA_DIR)) {
-    Resolve-FullPath $env:GANMAOYUAN_DATA_DIR
-} elseif (Test-Path -LiteralPath $legacyDataDir) {
-    $legacyDataDir
-} else {
-    Join-Path ([Environment]::GetFolderPath("ApplicationData")) "com.ganmaoyuan.desktop"
-}
+$ProjectRoot = Resolve-FullPath $ProjectRoot
+$GlobalDataDir = Resolve-FullPath $GlobalDataDir
+$WorkspaceRoot = Resolve-FullPath $WorkspaceRoot
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
-    $diagnosticsRoot = if (Test-Path -LiteralPath $legacyDataDir) {
-        Split-Path -Parent $legacyDataDir
-    } else {
-        $globalDataDir
-    }
-    $OutputDir = Join-Path $diagnosticsRoot "Diagnostics"
+    $OutputDir = Join-Path $RepoRoot "src-tauri\target\release\diagnostics"
 }
 $OutputDir = Resolve-FullPath $OutputDir
-$ProjectRoot = Resolve-FullPath $ProjectRoot
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
@@ -167,15 +158,33 @@ $packageJsonPath = Join-Path $RepoRoot "package.json"
 $tauriConfigPath = Join-Path $RepoRoot "src-tauri\tauri.conf.json"
 $cargoTomlPath = Join-Path $RepoRoot "src-tauri\Cargo.toml"
 $releaseExe = Join-Path $RepoRoot "src-tauri\target\release\app.exe"
-$nsisInstaller = Join-Path $RepoRoot "src-tauri\target\release\bundle\nsis\Ganmaoyuan_0.1.1_x64-setup.exe"
-$msiInstaller = Join-Path $RepoRoot "src-tauri\target\release\bundle\msi\Ganmaoyuan_0.1.1_x64_en-US.msi"
-$legacyWorkspaceRoot = "D:\GanMaoYuan_Workspace"
-$workspaceRoot = if (Test-Path -LiteralPath $legacyWorkspaceRoot) {
-    $legacyWorkspaceRoot
-} else {
-    Join-Path $globalDataDir "GanMaoYuan_Workspace"
+$packageJson = Read-JsonFile $packageJsonPath
+$tauriConfig = Read-JsonFile $tauriConfigPath
+$version = if ($tauriConfig.version) { $tauriConfig.version } else { $packageJson.version }
+$productName = if ($tauriConfig.productName) { $tauriConfig.productName } else { "Ganmaoyuan" }
+$nsisName = "{0}_{1}_x64-setup.exe" -f $productName, $version
+$msiName = "{0}_{1}_x64_en-US.msi" -f $productName, $version
+$nsisInstaller = Join-Path (Join-Path $RepoRoot "src-tauri\target\release\bundle\nsis") $nsisName
+$msiInstaller = Join-Path (Join-Path $RepoRoot "src-tauri\target\release\bundle\msi") $msiName
+if ([string]::IsNullOrWhiteSpace($GlobalDataDir)) {
+    if (-not [string]::IsNullOrWhiteSpace($env:GANMAOYUAN_DATA_DIR)) {
+        $GlobalDataDir = Resolve-FullPath $env:GANMAOYUAN_DATA_DIR
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        $GlobalDataDir = Join-Path $env:APPDATA "com.ganmaoyuan.desktop"
+    }
 }
-$sendToPath = Join-Path $env:APPDATA "Microsoft\Windows\SendTo\感冒院.lnk"
+if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
+    $documents = [Environment]::GetFolderPath("MyDocuments")
+    if (-not [string]::IsNullOrWhiteSpace($documents)) {
+        $WorkspaceRoot = Join-Path $documents "Ganmaoyuan\Workspace"
+    }
+    $workspaceConfigPath = if ($GlobalDataDir) { Join-Path $GlobalDataDir "workspace-config.json" } else { "" }
+    $workspaceConfig = if ($workspaceConfigPath) { Read-JsonFile $workspaceConfigPath } else { $null }
+    if ($workspaceConfig -and -not [string]::IsNullOrWhiteSpace($workspaceConfig.workspaceRoot)) {
+        $WorkspaceRoot = Resolve-FullPath $workspaceConfig.workspaceRoot
+    }
+}
+$sendToPath = if ($env:APPDATA) { Join-Path $env:APPDATA "Microsoft\Windows\SendTo\感冒院.lnk" } else { "" }
 $desktopCandidates = @(
     (Join-Path ([Environment]::GetFolderPath("Desktop")) "感冒院.lnk"),
     (Join-Path ([Environment]::GetFolderPath("Desktop")) "Ganmaoyuan.lnk"),
@@ -183,25 +192,17 @@ $desktopCandidates = @(
     (Join-Path ([Environment]::GetFolderPath("CommonDesktopDirectory")) "Ganmaoyuan.lnk")
 ) | Select-Object -Unique
 
-$packageJson = Read-JsonFile $packageJsonPath
-$tauriConfig = Read-JsonFile $tauriConfigPath
-$projectManifestPath = if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
-    $null
-} else {
-    Join-Path $ProjectRoot ".ganmaoyuan\project-location-manifest.json"
-}
+$projectManifestPath = if ($ProjectRoot) { Join-Path $ProjectRoot ".ganmaoyuan\project-location-manifest.json" } else { "" }
 $projectManifest = if ($projectManifestPath) { Read-JsonFile $projectManifestPath } else { $null }
-$projectManifestExists = $projectManifestPath -and (Test-Path -LiteralPath $projectManifestPath)
-$registryPath = Join-Path $globalDataDir "projects.json"
-$registry = Read-JsonFile $registryPath
+$registryPath = if ($GlobalDataDir) { Join-Path $GlobalDataDir "projects.json" } else { "" }
+$registry = if ($registryPath) { Read-JsonFile $registryPath } else { $null }
 
 $desktopShortcuts = @($desktopCandidates | ForEach-Object { Get-LnkTarget $_ } | Where-Object { $_ })
 $sendToShortcut = Get-LnkTarget $sendToPath
-$secretScanPaths = @($RepoRoot, $globalDataDir)
-if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
-    $secretScanPaths += (Join-Path $ProjectRoot ".ganmaoyuan")
-}
-$secretSignals = Find-SecretSignals $secretScanPaths
+$secretScanRoots = @($RepoRoot)
+if ($GlobalDataDir) { $secretScanRoots += $GlobalDataDir }
+if ($ProjectRoot) { $secretScanRoots += (Join-Path $ProjectRoot ".ganmaoyuan") }
+$secretSignals = Find-SecretSignals $secretScanRoots
 
 $checks = @()
 $checks += New-Check "package.json exists" (Test-Path -LiteralPath $packageJsonPath) $packageJsonPath
@@ -210,10 +211,10 @@ $checks += New-Check "version matches package and Tauri" ($packageJson.version -
 $checks += New-Check "release app.exe exists" (Test-Path -LiteralPath $releaseExe) $releaseExe
 $checks += New-Check "NSIS installer exists" (Test-Path -LiteralPath $nsisInstaller) $nsisInstaller
 $checks += New-Check "MSI installer exists" (Test-Path -LiteralPath $msiInstaller) $msiInstaller "warning"
-$checks += New-Check "global AppData exists" (Test-Path -LiteralPath $globalDataDir) $globalDataDir
-$checks += New-Check "workspace root exists" (Test-Path -LiteralPath $workspaceRoot) $workspaceRoot "warning"
-$checks += New-Check "project manifest exists" $projectManifestExists $(if ($projectManifestPath) { $projectManifestPath } else { "not requested" }) "warning"
-$checks += New-Check "registry contains projects" (($registry.projects | Measure-Object).Count -gt 0) $registryPath "warning"
+$checks += New-Check "global AppData exists" ($GlobalDataDir -and (Test-Path -LiteralPath $GlobalDataDir)) $(if ($GlobalDataDir) { $GlobalDataDir } else { "APPDATA is unavailable; not scanned" }) "warning"
+$checks += New-Check "workspace root exists" ($WorkspaceRoot -and (Test-Path -LiteralPath $WorkspaceRoot)) $(if ($WorkspaceRoot) { $WorkspaceRoot } else { "Documents folder is unavailable; not scanned" }) "warning"
+$checks += New-Check "project manifest exists" ($projectManifestPath -and (Test-Path -LiteralPath $projectManifestPath)) $(if ($projectManifestPath) { $projectManifestPath } else { "ProjectRoot was not supplied; not scanned" }) "warning"
+$checks += New-Check "registry contains projects" (($registry -and @($registry.projects).Count -gt 0)) $(if ($registryPath) { $registryPath } else { "GlobalDataDir was not resolved; not scanned" }) "warning"
 $checks += New-Check "desktop shortcut target exists" (@($desktopShortcuts | Where-Object { $_.targetExists }).Count -gt 0) (($desktopShortcuts | ConvertTo-Json -Depth 4 -Compress)) "warning"
 $checks += New-Check "SendTo shortcut target exists" ($null -ne $sendToShortcut -and $sendToShortcut.targetExists) ($sendToShortcut | ConvertTo-Json -Depth 4 -Compress) "warning"
 $checks += New-Check "no plaintext API key signals in checked text files" (($secretSignals | Measure-Object).Count -eq 0) (($secretSignals | ConvertTo-Json -Depth 4 -Compress)) "error"
@@ -255,8 +256,8 @@ $report = [pscustomobject]@{
     artifacts = $artifacts
     desktopShortcuts = $desktopShortcuts
     sendToShortcut = $sendToShortcut
-    globalDataDir = $globalDataDir
-    workspaceRoot = $workspaceRoot
+    globalDataDir = $GlobalDataDir
+    workspaceRoot = $WorkspaceRoot
     project = if ($projectManifest) {
         [pscustomobject]@{
             id = $projectManifest.project.id

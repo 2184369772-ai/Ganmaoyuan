@@ -69,13 +69,6 @@ foreach ($item in $matching) {
         Wait-Process -Id $process.Id -Timeout 8 -ErrorAction Stop
     }
     catch {
-        # Tauri can leave an orphaned process after its final window is gone.
-        Stop-Process -Id $process.Id -ErrorAction Stop
-        try {
-            Wait-Process -Id $process.Id -Timeout 5 -ErrorAction Stop
-        }
-        catch {
-            # Process may exit right after Stop-Process; ignore that race.
-        }
+        throw "Ganmaoyuan process PID $($process.Id) did not close gracefully; build was cancelled to protect Codex tasks. The process was not force-terminated."
     }
 }

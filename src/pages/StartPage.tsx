@@ -1,18 +1,20 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useDeferredValue, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAppState } from "../app/AppState";
 import { AppLayout } from "../components/AppLayout";
 import { GlobalSearchPanel } from "../components/GlobalSearchPanel";
 import { DecisionTraceDetails } from "../components/DecisionTraceDetails";
 import { Feedback } from "../components/ui";
+import { formatLocalDateTime } from "../utils/dateTime";
 import {
   chooseImportFiles,
   chooseProjectRoot,
   type MaterialInboxItem,
-  type WorkspaceActivitySummary,
 } from "../features/project/desktopApi";
 
 type StartMode = "idle" | "continue" | "new" | "inbox";
+const INBOX_PAGE_SIZE = 40;
+const FIRST_USE_GUIDE_KEY = "ganmaoyuan-first-use-guide-dismissed-v1";
 
 const semanticLocationOptions = [
   { value: "requirements", label: "需求资料" },
@@ -77,6 +79,13 @@ export function StartPage() {
   } = useAppState();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [mode, setMode] = useState<StartMode>("idle");
+  const [isFirstUseGuideDismissed, setIsFirstUseGuideDismissed] = useState(() => {
+    try {
+      return window.localStorage.getItem(FIRST_USE_GUIDE_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
   const [selectedRoot, setSelectedRoot] = useState("");
   const [projectName, setProjectName] = useState("");
   const [projectRoot, setProjectRoot] = useState("");
@@ -88,8 +97,26 @@ export function StartPage() {
   const [inboxProjectName, setInboxProjectName] = useState("");
   const [inboxProjectRoot, setInboxProjectRoot] = useState("");
   const [inboxDescription, setInboxDescription] = useState("");
+  const [inboxSearchQuery, setInboxSearchQuery] = useState("");
+  const [inboxVisibleCount, setInboxVisibleCount] = useState(INBOX_PAGE_SIZE);
+  const deferredInboxSearchQuery = useDeferredValue(inboxSearchQuery);
 
-  const inboxPendingReviews = materialInbox.filter((item) => item.processingStatus === "pendingReview" || item.processingStatus === "failed");
+  const inboxPendingReviews = useMemo(
+    () => materialInbox.filter((item) => item.processingStatus === "pendingReview" || item.processingStatus === "failed"),
+    [materialInbox],
+  );
+  const filteredInboxItems = useMemo(() => {
+    const query = deferredInboxSearchQuery.trim().toLocaleLowerCase();
+    if (!query) return materialInbox;
+    return materialInbox.filter((item) =>
+      [item.fileName, item.contentSummary, item.businessSummary, item.businessPurpose, item.documentType, item.recommendedCategory, item.errorMessage]
+        .filter(Boolean)
+        .join(" ")
+        .toLocaleLowerCase()
+        .includes(query),
+    );
+  }, [deferredInboxSearchQuery, materialInbox]);
+  const visibleInboxItems = filteredInboxItems.slice(0, inboxVisibleCount);
   const currentHistoryRoot = activeProject?.rootDir || selectedRoot || projects[0]?.rootDir || "";
 
   useEffect(() => {
@@ -120,6 +147,15 @@ export function StartPage() {
     return projects.length ? "开始工作" : "新建项目";
   }
 
+  function dismissFirstUseGuide() {
+    setIsFirstUseGuideDismissed(true);
+    try {
+      window.localStorage.setItem(FIRST_USE_GUIDE_KEY, "true");
+    } catch {
+      // The guide remains dismissed for this session if local storage is unavailable.
+    }
+  }
+
   if (isDesktopReady && !isStartupHydrated) {
     return (
       <AppLayout className="start-shell project-start-shell">
@@ -136,6 +172,16 @@ export function StartPage() {
   async function continueProject() {
     if (!selectedRoot) return;
     await openProjectAndEnter(selectedRoot);
+  }
+
+  async function openExistingProjectFromFolder() {
+    if (!isDesktopReady || isBusy) return;
+    try {
+      const root = await chooseProjectRoot();
+      if (root) await openProjectAndEnter(root);
+    } catch (err) {
+      setError(String(err));
+    }
   }
 
   async function createNewProject() {
@@ -347,7 +393,7 @@ export function StartPage() {
       )}
       header={(
         <header className="start-topbar">
-          <button type="button" className="icon-btn" onClick={() => navigate("/settings")} aria-label="设置">
+          <button type="button" className="icon-btn" onClick={() => navigate("/settings", { state: { returnTo: "/" } })} aria-label="设置">
             ⚙
           </button>
         </header>
@@ -364,10 +410,21 @@ export function StartPage() {
 
         {mode === "idle" ? (
           <div className="today-entry">
+            {projects.length === 0 && !isFirstUseGuideDismissed ? (
+              <section className="first-use-guide" aria-labelledby="first-use-guide-title">
+                <div>
+                  <span className="section-label">第一次使用</span>
+                  <h2 id="first-use-guide-title">先选一个项目，再开始工作</h2>
+                  <p>新建项目用于开始新工作；打开已有项目可接入电脑上的项目文件夹；继续工作会恢复已登记项目的进度。</p>
+                  <p>资料可添加到当前项目；还没选项目时先放入 Inbox，之后再确认归属。AI 回复和本机 Codex 都可以稍后启用。</p>
+                </div>
+                <button type="button" className="btn btn-ghost" onClick={dismissFirstUseGuide}>知道了</button>
+              </section>
+            ) : null}
             <div className="today-entry-head">
               <div>
-                <span className="section-label">今天应该做什么</span>
-                <h2>{todayWorkspace?.status === "ready" ? "从真实进度继续" : "先建立项目记录"}</h2>
+                <span className="section-label">工作空间</span>
+                <h2>{todayWorkspace?.status === "ready" ? "从最近项目继续" : "开始一个项目"}</h2>
               </div>
               <button
                 type="button"
@@ -392,34 +449,38 @@ export function StartPage() {
                 <button
                   type="button"
                   className="btn btn-large"
+                  disabled={!isDesktopReady || isBusy}
+                  onClick={() => void openExistingProjectFromFolder()}
+                >
+                  打开已有项目
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-large"
+                  disabled={isBusy}
                   onClick={() => void chooseImportFiles().then((paths) => void importToInbox(paths))}
                 >
-                  导入资料
+                  先导入到 Inbox
                 </button>
               </div>
             </div>
+            {projects.length === 0 ? (
+              <p className="start-import-hint">资料先暂存到 Inbox；确认项目归属后再纳入项目。</p>
+            ) : null}
             <div className="today-layout">
-              <section className="today-primary-column">
-                <div className="today-summary-card">
-                  <span className="section-label">上次做到哪里</span>
-                  {todayWorkspace?.lastProgress.length ? (
-                    <p className="today-last-progress">上次做到：{todayWorkspace.lastProgress.filter(Boolean).join("；")}</p>
-                  ) : (
-                    <p className="inline-placeholder">暂无恢复点，不生成虚假进度或建议。</p>
-                  )}
-                </div>
-
-                <div className="today-section-block">
-                  <div className="today-section-head">
-                    <div>
-                      <span className="section-label">最近项目</span>
-                      <strong>{projects.length ? "最近进入的项目" : "还没有已注册项目"}</strong>
-                    </div>
-                    {projects.length > 5 ? <button type="button" className="btn" onClick={() => setMode("continue")}>查看全部项目</button> : null}
+              <section className="today-section-block">
+                <div className="today-section-head">
+                  <div>
+                    <span className="section-label">最近项目</span>
+                    <strong>{projects.length ? "最近进入的项目" : "还没有已注册项目"}</strong>
                   </div>
-                  {projects.length ? (
-                    <div className="today-focus-list">
-                      {projects.slice(0, 5).map((project) => (
+                  {projects.length > 5 ? <button type="button" className="btn" onClick={() => setMode("continue")}>查看全部项目</button> : null}
+                </div>
+                {projects.length ? (
+                  <div className="today-focus-list">
+                    {projects.slice(0, 5).map((project) => {
+                      const currentFocus = todayWorkspace?.focusProjects.find((item) => item.projectId === project.id);
+                      return (
                         <button
                           key={project.id}
                           type="button"
@@ -428,119 +489,21 @@ export function StartPage() {
                         >
                           <div className="today-focus-topline">
                             <strong>{project.name}</strong>
-                            <span>{project.lastOpenedAt ? new Date(Number(project.lastOpenedAt)).toLocaleString("zh-CN") : "尚未进入"}</span>
+                            <span>{project.lastOpenedAt ? formatLocalDateTime(project.lastOpenedAt) : "尚未进入"}</span>
                           </div>
-                          <p>{project.nextStep || "打开项目查看当前 Focus"}</p>
+                          <div className="today-focus-bottomline">
+                            <p>{currentFocus?.nextStep || "暂无用户确认的下一步"}</p>
+                            <span>继续项目 <span aria-hidden="true">→</span></span>
+                          </div>
                         </button>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="ui-empty">
-                      <p>还没有可恢复的项目记录。</p>
-                    </div>
-                  )}
-                </div>
-
-                <details className="today-more-details">
-                  <summary>
-                    <span>更多动态</span>
-                    <strong>建议、待关注与文件变化</strong>
-                  </summary>
-                  <div className="today-more-content">
-                <div className="today-section-block today-workspace-activity">
-                  <div className="today-section-head">
-                    <div>
-                      <span className="section-label">文件空间变化</span>
-                      <strong>{formatWorkspaceActivityTitle(todayWorkspace?.workspaceActivity)}</strong>
-                    </div>
+                      );
+                    })}
                   </div>
-                  {todayWorkspace?.workspaceActivity?.recentItems?.length ? (
-                    <div className="today-tertiary-list">
-                      {todayWorkspace.workspaceActivity.recentItems.slice(0, 4).map((item) => (
-                        <button
-                          key={`${item.kind}-${item.title}-${item.occurredAt}`}
-                          type="button"
-                          className="today-tertiary-item"
-                          disabled={!item.managedPath}
-                          onClick={() => item.managedPath && void openFolderPath(item.managedPath)}
-                        >
-                          <span>{formatWorkspaceActivityKind(item.kind)} · {item.category || "Workspace"}</span>
-                          <strong>{item.title}</strong>
-                          {item.summary ? <small>{item.summary}</small> : null}
-                        </button>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="ui-empty">
-                      <p>暂无新的 Workspace 整理记录。</p>
-                    </div>
-                  )}
-                </div>
-
-              <section className="today-secondary-column">
-                <div className="today-section-block">
-                  <div className="today-section-head">
-                    <div>
-                      <span className="section-label">今天建议</span>
-                      <strong>优先处理 1 到 3 件真实事项</strong>
-                    </div>
+                ) : (
+                  <div className="ui-empty">
+                    <p>还没有可恢复的项目记录。</p>
                   </div>
-                  {todayWorkspace?.recommendedActions.length ? (
-                    <div className="today-actions-list">
-                      {todayWorkspace.recommendedActions.map((item, index) => (
-                        <article key={`${item.relatedProject}-${index}`} className="today-action-item">
-                          <div className="today-action-topline">
-                            <div className="today-action-main">
-                              <strong>{item.action}</strong>
-                              <small>{item.relatedProject} · 来源：{item.source || "现有记录"}</small>
-                            </div>
-                            <span className="today-action-state">
-                              {item.itemType === "fact" ? "事实" : item.itemType === "suggestion" ? "建议" : "待确认"}
-                              {item.confidence?.display ? ` · ${item.confidence.display}` : ""}
-                            </span>
-                          </div>
-                          <p>{item.reason}</p>
-                          <div className="today-action-footer">
-                            <small>{item.category || "工作项"}</small>
-                            {item.evidence.length ? <p className="inline-placeholder">依据：{item.evidence.join("；")}</p> : null}
-                          </div>
-                          {item.decisionTrace ? (
-                            <details className="today-action-details">
-                              <summary>查看原因</summary>
-                              <DecisionTraceDetails trace={item.decisionTrace} />
-                            </details>
-                          ) : null}
-                        </article>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="ui-empty">
-                      <p>当前资料不足，暂不生成额外建议。</p>
-                    </div>
-                  )}
-                </div>
-
-                <div className="today-section-block today-tertiary-block">
-                  <div className="today-section-head">
-                    <div>
-                      <span className="section-label">待关注</span>
-                      <strong>阻塞与待确认</strong>
-                    </div>
-                  </div>
-                  <div className="today-tertiary-list">
-                    <article className="today-tertiary-item today-tertiary-reminder">
-                      <span>阻塞提醒</span>
-                      <strong>{todayWorkspace?.blockers.length ? `有 ${todayWorkspace.blockers.length} 项需要处理` : "当前没有阻塞"}</strong>
-                    </article>
-                    <article className="today-tertiary-item today-tertiary-reminder">
-                      <span>待确认</span>
-                      <strong>{todayWorkspace?.pendingItems.length ? `还有 ${todayWorkspace.pendingItems.length} 项待处理` : "当前没有待确认项"}</strong>
-                    </article>
-                  </div>
-                </div>
-              </section>
-                  </div>
-                </details>
+                )}
               </section>
             </div>
           </div>
@@ -548,7 +511,7 @@ export function StartPage() {
 
         {mode === "continue" ? (
           <div className="start-flow-panel">
-            <h2>继续历史任务</h2>
+            <h2>选择项目继续</h2>
             <select value={selectedRoot} onChange={(event) => setSelectedRoot(event.target.value)}>
               <option value="">选择已有项目</option>
               {projects.map((project) => (
@@ -576,8 +539,9 @@ export function StartPage() {
             <h2>新建项目</h2>
             <input value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="项目名称" />
             <button type="button" className="btn" onClick={() => void chooseProjectRoot().then((path) => path && setProjectRoot(path))}>
-              {projectRoot || "选择项目根目录"}
+              {projectRoot || "选择项目文件夹"}
             </button>
+            <p className="start-import-hint">项目文件夹用于保存感冒院的工作记录；已有项目请用“打开已有项目”接入。</p>
             <button type="button" className="btn" onClick={() => void chooseImportFiles().then(setFilePaths)}>
               {filePaths.length ? `已选择 ${filePaths.length} 个资料文件` : "导入已有资料"}
             </button>
@@ -625,9 +589,28 @@ export function StartPage() {
               </button>
             </div>
             <div className="inbox-dropzone">拖入资料到这里，或使用“继续导入到 Inbox”批量选择文件。</div>
+            <div className="inbox-list-toolbar">
+              <label className="inbox-search-field">
+                <span className="sr-only">搜索 Inbox 资料</span>
+                <input
+                  type="search"
+                  value={inboxSearchQuery}
+                  onChange={(event) => {
+                    setInboxSearchQuery(event.target.value);
+                    setInboxVisibleCount(INBOX_PAGE_SIZE);
+                  }}
+                  placeholder="按文件名或摘要搜索"
+                />
+              </label>
+              <span className="inbox-result-count">
+                {filteredInboxItems.length === materialInbox.length
+                  ? `${materialInbox.length} 条资料`
+                  : `${filteredInboxItems.length} / ${materialInbox.length} 条资料`}
+              </span>
+            </div>
             <div className="inbox-list">
-              {materialInbox.length ? (
-                materialInbox.map((item) => (
+              {visibleInboxItems.length ? (
+                visibleInboxItems.map((item) => (
                   <article key={item.id} className="inbox-item">
                     <div className="inbox-item-head">
                       <div className="inbox-item-title-group">
@@ -646,7 +629,6 @@ export function StartPage() {
                             formatCategoryLabel(item.recommendedCategory) ||
                             "待检查"}
                         </strong>
-                        <p>{formatInboxNextStep(item)}</p>
                       </div>
                       <div className="inbox-hero-side">
                         <span>{item.ownershipType ? ownershipLabel(item.ownershipType) : "待确认"}</span>
@@ -892,10 +874,22 @@ export function StartPage() {
                     ) : null}
                   </article>
                 ))
-              ) : (
-                <p>暂时还没有收到文件。</p>
-              )}
+              ) : null}
             </div>
+            {!filteredInboxItems.length ? (
+              <div className="ui-empty"><p>{materialInbox.length ? "没有匹配的资料。" : "Inbox 为空。导入资料后，它们会在这里等待归属确认。"}</p></div>
+            ) : null}
+            {filteredInboxItems.length > visibleInboxItems.length ? (
+              <div className="inbox-load-more">
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => setInboxVisibleCount((count) => count + INBOX_PAGE_SIZE)}
+                >
+                  加载更多 · 还剩 {filteredInboxItems.length - visibleInboxItems.length} 条
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : null}
         </div>
@@ -1038,34 +1032,6 @@ function formatReceivedTime(timestamp: string) {
   }
   const pad = (value: number) => String(value).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
-}
-
-function formatWorkspaceActivityTitle(activity?: WorkspaceActivitySummary) {
-  if (!activity || activity.newManagedFiles === 0) {
-    return "暂无新的整理记录";
-  }
-  const parts = [
-    activity.projectFiles ? `项目资料 ${activity.projectFiles}` : "",
-    activity.generalFiles ? `通用资料 ${activity.generalFiles}` : "",
-    activity.temporaryFiles ? `临时资料 ${activity.temporaryFiles}` : "",
-  ].filter(Boolean);
-  return parts.length ? parts.join(" · ") : `已整理 ${activity.newManagedFiles} 个文件`;
-}
-
-function formatWorkspaceActivityKind(kind: string) {
-  const labels: Record<string, string> = {
-    managed: "已整理",
-    active: "活跃",
-    versioned: "新版本",
-    archived: "归档",
-    missing: "缺失",
-    superseded: "已撤销",
-    failed: "失败",
-    undoConflict: "撤销冲突",
-    received: "已接收",
-    understood: "已理解",
-  };
-  return labels[kind] || kind || "记录";
 }
 
 const OWNERSHIP_LABELS: Record<string, string> = {

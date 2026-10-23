@@ -4,8 +4,10 @@ import {
   acceptCodexTask,
   readChatAttachment,
   rejectCodexTask,
+  retryInterruptedProjectMessage,
   scanProjectWorkspace,
   sendProjectMessage,
+  takeStorageRecoveryNotices,
 } from "./desktopApi";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -88,5 +90,24 @@ describe("Project chat image attachments", () => {
       projectRoot: "isolated-project",
       relativePath: ".ganmaoyuan/chat-attachments/message/screen.png",
     });
+  });
+});
+
+describe("chat and storage recovery", () => {
+  beforeEach(() => { vi.mocked(invoke).mockReset(); });
+
+  it("retries the selected interrupted assistant message within its project", async () => {
+    vi.mocked(invoke).mockResolvedValue({ project: {}, messages: [], streamMessageId: "assistant-retry" });
+    await retryInterruptedProjectMessage("project-a", "assistant-interrupted");
+    expect(invoke).toHaveBeenCalledWith("retry_interrupted_project_message", {
+      projectRoot: "project-a",
+      interruptedMessageId: "assistant-interrupted",
+    });
+  });
+
+  it("retrieves structured storage fallback warnings for visible UI feedback", async () => {
+    vi.mocked(invoke).mockResolvedValue([{ fileName: "project-location-manifest.json", primaryState: "内容损坏", backupAge: "约 1 天前", message: "读取 .bak" }]);
+    await takeStorageRecoveryNotices();
+    expect(invoke).toHaveBeenCalledWith("take_storage_recovery_notices");
   });
 });

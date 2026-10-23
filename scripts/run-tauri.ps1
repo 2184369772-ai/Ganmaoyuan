@@ -40,6 +40,20 @@ try {
         $currentAppDir = Join-Path $repoRoot "..\builds\current\release"
         $currentApp = Join-Path $currentAppDir "app.exe"
         New-Item -ItemType Directory -Force -Path $currentAppDir | Out-Null
+        $currentAppFullPath = [System.IO.Path]::GetFullPath($currentApp)
+        $runningCurrent = Get-CimInstance Win32_Process |
+            Where-Object {
+                $_.Name -eq "app.exe" -and
+                $_.ExecutablePath -and
+                [System.IO.Path]::GetFullPath($_.ExecutablePath).Equals(
+                    $currentAppFullPath,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+        if ($runningCurrent) {
+            $pids = ($runningCurrent | Select-Object -ExpandProperty ProcessId) -join ", "
+            throw "current app.exe 仍在运行（PID $pids）；为保护 Codex 任务，本次构建不会覆盖或重启它。请在任务完成后重新执行部署。"
+        }
         Copy-Item -Force (Join-Path $repoRoot "src-tauri\target\release\app.exe") $currentApp
         Write-Host "Updated stable desktop app: $currentApp"
     }

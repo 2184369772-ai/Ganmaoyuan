@@ -621,6 +621,8 @@ pub struct WorkspaceMessage {
     pub model_id: String,
     #[serde(default)]
     pub evidence_items: Vec<MessageEvidenceItem>,
+    #[serde(default)]
+    pub reply_to_message_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -1158,6 +1160,10 @@ pub struct ProjectManifest {
     pub improvement_candidates: Vec<ImprovementCandidate>,
     #[serde(default)]
     pub v1_readiness: V1Readiness,
+    #[serde(default)]
+    pub recovered_from_backup: bool,
+    #[serde(default)]
+    pub recovery_notice: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -2186,6 +2192,8 @@ pub struct ProjectFactCaptureRequest {
     pub reason: String,
     #[serde(default)]
     pub action_source_ref: String,
+    #[serde(default)]
+    pub external_ai_source_file_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -2314,6 +2322,19 @@ pub struct CodexCliCapabilityProbe {
     pub checked_at: String,
     #[serde(default)]
     pub failure_reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexCliReadiness {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub checked_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -2460,6 +2481,8 @@ pub struct CodexRun {
     pub last_activity_at: String,
     #[serde(default)]
     pub recent_activity: Vec<String>,
+    #[serde(default)]
+    pub raw_activity: Vec<String>,
     #[serde(default)]
     pub error: String,
 }
@@ -2771,9 +2794,13 @@ pub struct ProjectContextPacket {
     #[serde(default)]
     pub decisions: Vec<ProjectContextDecision>,
     #[serde(default)]
+    pub rationale_context: crate::why_context::ProjectRationaleContext,
+    #[serde(default)]
     pub git_facts: Option<ProjectContextGitFacts>,
     #[serde(default)]
     pub risks: Vec<String>,
+    #[serde(default)]
+    pub read_warnings: Vec<String>,
     #[serde(default)]
     pub next_step: String,
     #[serde(default)]
@@ -2814,6 +2841,8 @@ pub struct DeepSeekAuthorization {
     pub granted_at: String,
     #[serde(default)]
     pub granted_by: String,
+    #[serde(default)]
+    pub scope_version: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]

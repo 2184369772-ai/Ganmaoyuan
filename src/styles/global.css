@@ -8,19 +8,19 @@
   --space-7: 28px;
   --space-8: 32px;
   --space-10: 40px;
-  --page-gutter: 30px;
-  --page-gutter-start: 24px;
+  --page-gutter: clamp(16px, 1.4vw, 26px);
+  --page-gutter-start: clamp(16px, 1.25vw, 24px);
   --content-sm: 620px;
   --content-md: 720px;
   --content-lg: 760px;
   --content-xl: 960px;
   --form-width: 760px;
   --form-wide-width: 820px;
-  --page-shell-max: 1540px;
-  --page-shell-work-max: 1640px;
-  --today-shell-max: 1400px;
-  --workspace-thread-max: 1320px;
-  --workspace-sidebar-width: clamp(360px, 24vw, 420px);
+  --page-shell-max: 1840px;
+  --page-shell-work-max: 1840px;
+  --today-shell-max: 1760px;
+  --workspace-thread-max: 1560px;
+  --workspace-sidebar-width: clamp(320px, 21vw, 400px);
   --settings-sidebar-width: 240px;
   --left-sidebar-width: min(320px, calc(100% - 44px));
   --control-height: 40px;
@@ -81,7 +81,6 @@ body,
 #root {
   height: 100%;
   min-height: 100%;
-  scrollbar-gutter: stable;
 }
 
 #root {
@@ -93,11 +92,13 @@ body,
 html,
 body {
   margin: 0;
+  padding: 0;
   overflow-x: hidden;
   overflow-y: auto;
 }
 
 body {
+  display: block;
   background: var(--bg);
   color: var(--fg);
   font: 14px/1.5 var(--font-body);
@@ -295,7 +296,7 @@ button {
 }
 
 .page-shell {
-  width: min(var(--page-shell-max), calc(100% - 2 * var(--space-6)));
+  width: min(var(--page-shell-max), calc(100% - 2 * var(--page-gutter)));
   max-width: 100%;
   margin: 0 auto;
 }
@@ -314,7 +315,7 @@ button {
 .start-shell {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  width: 100vw;
+  width: 100%;
   max-width: none;
   padding: 0;
   overflow-x: hidden;
@@ -324,7 +325,7 @@ button {
   display: flex;
   flex-direction: column;
   position: relative;
-  width: 100vw;
+  width: 100%;
   max-width: none;
   min-height: 100dvh;
   overflow-x: clip;
@@ -1334,7 +1335,8 @@ body::-webkit-scrollbar-thumb:hover,
   width: 100%;
   max-width: none;
   height: 100dvh;
-  min-height: 100dvh;
+  min-height: 0;
+  max-height: 100dvh;
   padding: 0;
   overflow: clip;
 }
@@ -2112,6 +2114,34 @@ body::-webkit-scrollbar-thumb:hover,
   overflow-wrap: anywhere;
 }
 
+.message-operation-receipts {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.message-operation-receipt {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent-strong);
+  border-radius: 0 8px 8px 0;
+  background: color-mix(in oklch, var(--accent) 7%, var(--surface));
+}
+
+.message-operation-receipt > strong {
+  color: var(--accent-strong);
+  font-size: 13px;
+}
+
+.message-operation-receipt > p {
+  overflow-wrap: anywhere;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
 .understanding-panel {
   width: min(var(--content-lg), 100%);
   padding: 0;
@@ -2303,6 +2333,12 @@ details.answer-evidence {
   margin: 0;
   color: color-mix(in oklch, var(--fg) 88%, var(--muted));
   line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.evidence-record-id {
+  color: var(--muted);
+  font-size: 11px;
   overflow-wrap: anywhere;
 }
 
@@ -2866,6 +2902,32 @@ details.answer-evidence {
 .work-capture-open-actions .project-context-list li > div > span {
   color: var(--muted);
   font-size: 13px;
+}
+
+.external-ai-paragraph-list {
+  display: grid;
+  gap: var(--space-2);
+  max-height: 220px;
+  overflow: auto;
+  padding: 2px;
+}
+
+.external-ai-paragraph-list .btn {
+  justify-content: flex-start;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: left;
+  white-space: normal;
+}
+
+.work-capture-field > small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.work-capture-actions {
+  flex-wrap: wrap;
+  gap: var(--space-2);
 }
 
 .codex-console {

@@ -327,6 +327,7 @@ export type WorkspaceMessage = {
     managedPath: string;
     sourceRecordId: string;
   }>;
+  replyToMessageId?: string;
 };
 
 export type TaskRecord = {
@@ -500,6 +501,13 @@ export type CodexCliCapabilityProbe = {
   failureReason: string;
 };
 
+export type CodexCliReadiness = {
+  status: "ready" | "notInstalled" | "notLoggedIn" | "incompatible" | "unknown";
+  message: string;
+  version: string;
+  checkedAt: string;
+};
+
 export type CodexRun = {
   id: string;
   taskId: string;
@@ -521,6 +529,7 @@ export type CodexRun = {
   stderrSummary: string;
   lastActivityAt: string;
   recentActivity: string[];
+  rawActivity?: string[];
   error: string;
 };
 
@@ -671,10 +680,20 @@ export type ProjectManifest = {
   knowledgePatternCandidates?: KnowledgePatternCandidate[];
   improvementCandidates?: ImprovementCandidate[];
   v1Readiness?: V1Readiness;
+  recoveredFromBackup?: boolean;
+  recoveryNotice?: string | null;
   deepseekAuthorization: {
     grantedAt: string;
     grantedBy: string;
+    scopeVersion?: number;
   };
+};
+
+export type StorageRecoveryNotice = {
+  fileName: string;
+  primaryState: string;
+  backupAge: string;
+  message: string;
 };
 
 export type DataHealthRecord = {
@@ -1328,6 +1347,7 @@ export type ProjectFactCaptureRequest = {
   content: string;
   reason?: string;
   actionSourceRef?: string;
+  externalAiSourceFileId?: string;
 };
 
 export type ActivityProjection = {
@@ -1488,8 +1508,35 @@ export type ProjectContextPacket = {
   files: ProjectContextFile[];
   codexResult: ProjectContextCodexResult | null;
   decisions: ProjectContextDecision[];
+  rationaleContext: {
+    status: string;
+    warnings: string[];
+    entries: Array<{
+      id: string;
+      title: string;
+      types: string[];
+      status: string;
+      evidence: string;
+      source: string;
+      see: string[];
+      supersededBy: string;
+      verification: string;
+      reason: string;
+      rejectedAlternatives: string[];
+      body: string;
+      sourceFile: string;
+      lineStart: number;
+      lineEnd: number;
+      decisionRefs: string[];
+      gitRefs: string[];
+      taskRefs: string[];
+      verifiedLinks: string[];
+      unresolvedConflict: boolean;
+    }>;
+  };
   gitFacts: ProjectContextGitFacts | null;
   risks: string[];
+  readWarnings: string[];
   nextStep: string;
   freshness: { generatedAt: string; factsSyncedAt: string; status: string };
   sparse: boolean;
@@ -1762,6 +1809,10 @@ export async function loadProject(projectRoot: string) {
   return invoke<ProjectManifest>("load_project", { projectRoot });
 }
 
+export async function takeStorageRecoveryNotices() {
+  return invoke<StorageRecoveryNotice[]>("take_storage_recovery_notices");
+}
+
 export async function markProjectOpened(projectRoot: string) {
   return invoke<ProjectSummary>("mark_project_opened", { projectRoot });
 }
@@ -1781,6 +1832,13 @@ export async function sendProjectMessage(
 ) {
   const payload = imageAttachments.length ? { projectRoot, text, imageAttachments } : { projectRoot, text };
   return invoke<MessageResult>("send_project_message", payload);
+}
+
+export async function retryInterruptedProjectMessage(projectRoot: string, interruptedMessageId: string) {
+  return invoke<MessageResult>("retry_interrupted_project_message", {
+    projectRoot,
+    interruptedMessageId,
+  });
 }
 
 export async function readChatAttachment(projectRoot: string, relativePath: string) {
@@ -1821,6 +1879,10 @@ export async function markCodexTaskHandedOff(projectRoot: string, taskId: string
 
 export async function startCodexTaskRun(projectRoot: string, taskId: string) {
   return invoke<CodexRun>("start_codex_task_run", { projectRoot, taskId });
+}
+
+export async function checkCodexCliReadiness() {
+  return invoke<CodexCliReadiness>("check_codex_cli_readiness");
 }
 
 export async function cancelCodexTaskRun(projectRoot: string, taskId: string) {
@@ -2089,10 +2151,15 @@ export async function createLocalBackup(projectRoots: string[], destinationDir: 
   return invoke<LocalBackupResult>("create_local_backup", { projectRoots, destinationDir });
 }
 
-export async function restoreLocalBackup(backupDir: string, restoreProjectsBaseDir: string) {
+export async function restoreLocalBackup(
+  backupDir: string,
+  restoreProjectsBaseDir: string,
+  confirmed: boolean,
+) {
   return invoke<BackupRestoreResult>("restore_local_backup", {
     backupDir,
     restoreProjectsBaseDir,
+    confirmed,
   });
 }
 
