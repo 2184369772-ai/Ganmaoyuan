@@ -189,10 +189,10 @@ function Assert-TestOwnedShortcutRemoved {
 $failure = $null
 try {
     New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
-    Set-Content -Encoding ASCII -LiteralPath $outsideFile -Value "unrelated user data marker"
+    [System.IO.File]::WriteAllText($outsideFile, "unrelated user data marker", [System.Text.Encoding]::ASCII)
     New-Item -ItemType Directory -Force -Path $dataRoot, $localDataRoot | Out-Null
-    Set-Content -Encoding ASCII -LiteralPath $dataMarker -Value "preserve-app-data"
-    Set-Content -Encoding ASCII -LiteralPath $localDataMarker -Value "preserve-local-data"
+    [System.IO.File]::WriteAllText($dataMarker, "preserve-app-data", [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText($localDataMarker, "preserve-local-data", [System.Text.Encoding]::ASCII)
 
     foreach ($link in @($desktopLink, $sendToLink, $startMenuLink)) {
         if (Test-Path -LiteralPath $link) {
@@ -329,8 +329,8 @@ try {
         Add-Check "baseline owns expected shortcut $(Split-Path -Leaf $link)" ($null -ne $snapshot -and $snapshot.target -eq $baselineApp)
     }
 
-    Set-Content -Encoding ASCII -LiteralPath $dataMarker -Value "preserve-cross-release-app-data"
-    Set-Content -Encoding ASCII -LiteralPath $localDataMarker -Value "preserve-cross-release-local-data"
+    [System.IO.File]::WriteAllText($dataMarker, "preserve-cross-release-app-data", [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText($localDataMarker, "preserve-cross-release-local-data", [System.Text.Encoding]::ASCII)
     Invoke-Installer "cross-release-v0.1.1-to-current" @("/D=$baselineInstallRoot") | Out-Null
     $upgradedApp = Join-Path $baselineInstallRoot "app.exe"
     Add-Check "cross-release upgrade installed current application" (Test-Path -LiteralPath $upgradedApp -PathType Leaf)
