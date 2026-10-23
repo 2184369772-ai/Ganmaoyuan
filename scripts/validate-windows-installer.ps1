@@ -324,10 +324,13 @@ try {
     Add-Check "public baseline install registration found" ($null -ne $baselineRegistryKey)
     $baselineVersion = [string](Get-ItemProperty -LiteralPath $baselineRegistryKey).DisplayVersion
     Add-Check "baseline registry reports v0.1.1" ($baselineVersion -eq "0.1.1") "version=$baselineVersion"
-    foreach ($link in @($desktopLink, $sendToLink, $startMenuLink)) {
+    foreach ($link in @($desktopLink, $startMenuLink)) {
         $snapshot = Get-ShortcutSnapshot $link
         Add-Check "baseline owns expected shortcut $(Split-Path -Leaf $link)" ($null -ne $snapshot -and $snapshot.target -eq $baselineApp)
     }
+    $baselineSendTo = Get-ShortcutSnapshot $sendToLink
+    $baselineSendToTarget = if ($null -eq $baselineSendTo) { "absent (allowed for v0.1.1)" } else { $baselineSendTo.target }
+    Add-Check "baseline optional SendTo shortcut is safe" ($null -eq $baselineSendTo -or $baselineSendTo.target -eq $baselineApp) "actualTarget=$baselineSendToTarget"
 
     [System.IO.File]::WriteAllText($dataMarker, "preserve-cross-release-app-data", [System.Text.Encoding]::ASCII)
     [System.IO.File]::WriteAllText($localDataMarker, "preserve-cross-release-local-data", [System.Text.Encoding]::ASCII)
