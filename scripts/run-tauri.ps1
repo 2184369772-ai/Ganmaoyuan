@@ -1,0 +1,64 @@
+﻿param(
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$TauriArgs
+)
+
+$ErrorActionPreference = "Stop"
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$firstArg = if ($TauriArgs.Count -gt 0) { $TauriArgs[0] } else { "" }
+
+if ($firstArg -eq "build") {
+    & (Join-Path $PSScriptRoot "prepare-tauri-build.ps1")
+
+    # Prevent local checkout and Cargo cache paths from being embedded in release binaries.
+    $pathMappings = @(
+        "--remap-path-prefix=$repoRoot=/ganmaoyuan/source"
+    )
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $pathMappings += "--remap-path-prefix=$($env:USERPROFILE)=/ganmaoyuan/build-user"
+    }
+    $encodedSeparator = [char]31
+    $existingFlags = if ([string]::IsNullOrEmpty($env:CARGO_ENCODED_RUSTFLAGS)) {
+        @()
+    } else {
+        @($env:CARGO_ENCODED_RUSTFLAGS -split [regex]::Escape([string]$encodedSeparator))
+    }
+    $env:CARGO_ENCODED_RUSTFLAGS = ($existingFlags + $pathMappings) -join $encodedSeparator
+}
+
+Push-Location $repoRoot
+try {
+    & npx.cmd tauri @TauriArgs
+    if ($LASTEXITCODE -eq 0 -and $firstArg -eq "build") {
+        # Tauri builds every declared release binary. Only fall back to Cargo if
+        # a future Tauri change omits the console bridge from the bundle build.
+        $contextBridge = Join-Path $repoRoot "src-tauri\target\release\ganmaoyuan-context.exe"
+        if (-not (Test-Path -LiteralPath $contextBridge)) {
+            & cargo build --manifest-path (Join-Path $repoRoot "src-tauri\Cargo.toml") --release --bin ganmaoyuan-context
+        }
+        $currentAppDir = Join-Path $repoRoot "..\builds\current\release"
+        $currentApp = Join-Path $currentAppDir "app.exe"
+        New-Item -ItemType Directory -Force -Path $currentAppDir | Out-Null
+        $currentAppFullPath = [System.IO.Path]::GetFullPath($currentApp)
+        $runningCurrent = Get-CimInstance Win32_Process |
+            Where-Object {
+                $_.Name -eq "app.exe" -and
+                $_.ExecutablePath -and
+                [System.IO.Path]::GetFullPath($_.ExecutablePath).Equals(
+                    $currentAppFullPath,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+        if ($runningCurrent) {
+            $pids = ($runningCurrent | Select-Object -ExpandProperty ProcessId) -join ", "
+            throw "current app.exe 仍在运行（PID $pids）；为保护 Codex 任务，本次构建不会覆盖或重启它。请在任务完成后重新执行部署。"
+        }
+        Copy-Item -Force (Join-Path $repoRoot "src-tauri\target\release\app.exe") $currentApp
+        Write-Host "Updated stable desktop app: $currentApp"
+    }
+    exit $LASTEXITCODE
+}
+finally {
+    Pop-Location
+}

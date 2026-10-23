@@ -1,0 +1,165 @@
+{
+  "meta": {
+    "name": "感冒院桌面工作台",
+    "description": "从 Linear、AFFiNE、Twenty、AppFlowy、Plane、Raycast、Open WebUI 和 LobeHub 中提取结构与交互气质，重构为本地优先的 AI 时代项目工作台。",
+    "source_references": [
+      "https://linear.app/",
+      "https://affine.pro/",
+      "https://twenty.com/",
+      "https://appflowy.io/",
+      "https://plane.so/",
+      "https://www.raycast.com/",
+      "https://openwebui.com/",
+      "https://lobehub.com/"
+    ],
+    "created_at": "2026-07-27"
+  },
+  "design_system": {
+    "color": {
+      "palette_type": "monochromatic",
+      "primary": { "hex": "oklch(22% 0.02 240)", "role": "主文本与高对比结构" },
+      "secondary": { "hex": "oklch(50% 0.018 240)", "role": "辅助说明与低优先级信息" },
+      "accent": { "hex": "oklch(58% 0.16 145)", "role": "当前选择、确认动作、积极状态" },
+      "neutral": { "scale": "灰白到深灰的窄幅层级", "usage": "背景、面板、边框、抽屉" },
+      "semantic": {
+        "success": "oklch(62% 0.14 150)",
+        "warning": "oklch(72% 0.13 85)",
+        "error": "oklch(58% 0.17 28)",
+        "info": "oklch(59% 0.12 245)"
+      },
+      "surface": {
+        "background": "oklch(98% 0.005 250)",
+        "card": "oklch(100% 0 0)",
+        "elevated": "oklch(95% 0.006 250)"
+      },
+      "contrast_strategy": "subtle layers"
+    },
+    "typography": {
+      "font_families": {
+        "heading": "-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui, sans-serif",
+        "body": "-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui, sans-serif",
+        "mono": "'JetBrains Mono', 'IBM Plex Mono', ui-monospace, Menlo, monospace"
+      },
+      "font_style_notes": "正文紧凑，列表和状态采用 tabular numerics，标题克制不营销化。"
+    },
+    "spacing": {
+      "base_unit": "4px",
+      "scale": "4 / 8 / 12 / 16 / 20 / 24 / 32",
+      "content_density": "compact",
+      "section_rhythm": "高频操作区紧，摘要区略松"
+    },
+    "layout": {
+      "grid_system": "桌面三层壳层",
+      "max_content_width": "1440px",
+      "columns": "左侧全局导航 + 主内容 + 右侧上下文/详情",
+      "gutter": "18px",
+      "breakpoints": "1280 / 1440 / 1920",
+      "alignment_tendency": "strict grid"
+    },
+    "shape": {
+      "border_radius": {
+        "small": "6px",
+        "medium": "10px",
+        "large": "14px",
+        "pill": "999px"
+      },
+      "border_usage": "subtle 1px",
+      "divider_style": "hairline neutral"
+    },
+    "elevation": {
+      "shadow_style": "soft diffused",
+      "levels": {
+        "low": "轻微卡片阴影",
+        "medium": "抽屉与命令面板",
+        "high": "模态与悬浮层"
+      },
+      "depth_cues": "shadows"
+    },
+    "iconography": {
+      "style": "线性图标",
+      "stroke_weight": "1.5px",
+      "size_scale": "16 / 18 / 20",
+      "preferred_set": "Lucide-like"
+    },
+    "motion": {
+      "easing": "cubic-bezier(0.2, 0.8, 0.2, 1)",
+      "duration_scale": {
+        "micro": "120ms",
+        "normal": "180ms",
+        "macro": "260ms"
+      },
+      "entrance_pattern": "轻淡入 + 1px 位移",
+      "exit_pattern": "淡出",
+      "philosophy": "minimal functional"
+    },
+    "components": {
+      "button_style": "细边框默认按钮 + 单强调色主按钮",
+      "input_style": "桌面密度输入框",
+      "card_style": "硬边框 + 小阴影",
+      "navigation_pattern": "左侧主导航 + 页面内二级导航",
+      "modal_style": "桌面居中模态与抽屉并用",
+      "list_style": "紧凑表格与行列表混合",
+      "component_notes": "抽屉、命令面板和状态标签是核心组件。"
+    }
+  },
+  "design_style": {
+    "aesthetic": {
+      "mood": ["安静", "可信", "专业", "本地优先"],
+      "visual_metaphor": "个人工程师的数字工作室",
+      "era_influence": "现代桌面生产力工具",
+      "genre": "desktop productivity",
+      "personality_traits": ["克制", "高效率", "有秩序"],
+      "adjectives": ["静", "稳", "工程化"]
+    },
+    "visual_language": {
+      "complexity": "moderate",
+      "ornamentation": "subtle accents",
+      "whitespace_usage": "用空白建立层级而非做展示",
+      "visual_weight_distribution": "列表和工作区优先",
+      "focal_strategy": "distributed interest",
+      "contrast_level": "中高",
+      "texture_usage": "极弱渐层与柔和玻璃感"
+    },
+    "composition": {
+      "hierarchy_method": "typographic hierarchy",
+      "balance_type": "asymmetric",
+      "flow_direction": "从左侧导航到中心工作区再到右侧上下文",
+      "grouping_strategy": "按项目、文件、状态、记忆分层",
+      "negative_space_role": "减少压迫感并强化结构"
+    },
+    "interaction_feel": {
+      "feedback_style": "明确但不喧宾夺主",
+      "hover_behavior": "轻背景变化 + 细边框高亮",
+      "transition_personality": "snappy",
+      "loading_style": "阶段进度 + 语言化提示",
+      "microinteraction_density": "中等"
+    },
+    "brand_voice_in_ui": {
+      "tone": "冷静、直白、专业",
+      "formality": "中等",
+      "cta_style": "direct imperative",
+      "empty_state_approach": "给明确下一步",
+      "error_tone": "普通语言解释，不展示技术栈噪音"
+    }
+  },
+  "visual_effects": {
+    "overview": {
+      "effect_intensity": "subtle-accent",
+      "performance_tier": "lightweight",
+      "fallback_strategy": "纯 CSS",
+      "primary_technology": "CSS only"
+    },
+    "background_effects": {
+      "type": "gradient-animation",
+      "description": "极弱的角落漫反射质感，避免平板背景",
+      "technology": "CSS radial gradient",
+      "params": {
+        "color_palette": "中性灰 + 低饱和绿色",
+        "speed": "none",
+        "density": "sparse",
+        "opacity": "low",
+        "blend_mode": "normal"
+      }
+    }
+  }
+}

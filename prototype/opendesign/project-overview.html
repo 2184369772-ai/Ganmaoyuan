@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>感冒院 · 专注工作</title>
+    <link rel="stylesheet" href="assets/app.css" />
+  </head>
+  <body data-page-id="focus-work">
+    <main class="focus-shell" data-od-id="focus-work-page">
+      <header class="focus-topbar" data-od-id="focus-topbar">
+        <div class="focus-top-left">
+          <button class="icon-btn" type="button" data-action="open-side-panel" aria-label="打开菜单">☰</button>
+        </div>
+        <div class="focus-title" data-od-id="focus-title">
+          <span>感冒院 · 当前项目</span>
+          <strong>感冒院</strong>
+        </div>
+        <div class="focus-actions">
+          <button class="ghost-btn has-count" type="button" data-action="open-materials-drawer">资料 <span>4</span></button>
+          <button class="ghost-btn" type="button" data-action="open-wrap-panel">收工</button>
+        </div>
+      </header>
+
+      <section class="focus-workspace" data-od-id="focus-workspace">
+        <div class="focus-task" data-od-id="current-task">
+          <p class="eyebrow">当前任务</p>
+          <h1>收敛感冒院正式页面与导航逻辑</h1>
+          <p class="next-step">下一步：只保留启动页、专注工作页和设置页，把待整理资料、搜索、项目记忆和 AI 上下文全部收进抽屉或命令面板。</p>
+          <div class="focus-meta">
+            <span>当前项目：感冒院</span>
+            <span>当前阶段：UI 与交互设计</span>
+            <span>相关资料：4 份</span>
+          </div>
+        </div>
+
+        <section class="focus-section" data-od-id="work-content">
+          <div class="section-label">当前工作内容</div>
+          <p>这轮只做导航逻辑收敛，不再新增正式页面和常驻入口。主界面只保留真正持续工作的内容，其他能力全部按需打开。</p>
+        </section>
+
+        <section class="focus-section" data-od-id="session-output">
+          <div class="section-label">本次产出</div>
+          <ul class="quiet-list">
+            <li>正式页面统一为三页结构。</li>
+            <li>左侧菜单改为覆盖式抽屉，不再长期占位。</li>
+            <li>资料、待整理、搜索、AI 上下文与项目记忆改为按需查看。</li>
+          </ul>
+        </section>
+      </section>
+
+      <form class="focus-input" data-od-id="focus-input">
+        <label class="input-box">
+          <span>工作记录</span>
+          <textarea rows="2" aria-label="记录当前工作">继续清理旧页面入口，确保所有操作都回到当前工作，不再跳到另一套页面结构。</textarea>
+        </label>
+        <button type="button" class="btn btn-primary" data-action="save-focus-note">记录</button>
+      </form>
+    </main>
+
+    <aside class="side-panel" data-side-panel aria-hidden="true" data-od-id="global-menu-drawer">
+      <div class="panel-head">
+        <div>
+          <span class="eyebrow">菜单</span>
+          <h2>按需打开</h2>
+        </div>
+        <button class="icon-btn" type="button" data-action="close-side-panel" aria-label="关闭菜单">×</button>
+      </div>
+      <nav class="overlay-nav">
+        <button class="nav-link as-button" type="button" data-action="open-utility-drawer" data-utility-kind="switch-project">切换项目</button>
+        <button class="nav-link as-button" type="button" data-action="open-utility-drawer" data-utility-kind="inbox">待整理资料 <span>3</span></button>
+        <button class="nav-link as-button" type="button" data-action="open-utility-drawer" data-utility-kind="library">全部资料</button>
+        <button class="nav-link as-button" type="button" data-action="open-utility-drawer" data-utility-kind="memory">项目记忆</button>
+        <a class="nav-link" href="settings.html">设置</a>
+      </nav>
+    </aside>
+
+    <aside class="materials-drawer" data-materials-drawer aria-hidden="true" data-od-id="materials-drawer">
+      <div class="panel-head">
+        <div>
+          <span class="eyebrow">相关资料</span>
+          <h2>当前任务相关的 4 份资料</h2>
+        </div>
+        <button class="icon-btn" type="button" data-action="close-materials-drawer" aria-label="关闭资料抽屉">×</button>
+      </div>
+      <div class="material-list">
+        <article class="material-item">
+          <strong>感冒院项目定义 v0.1</strong>
+          <span>DOCX · 定义产品定位、目标用户和第一版边界。</span>
+          <button class="ghost-btn" type="button" data-action="show-toast" data-message="已请求打开 感冒院项目定义 v0.1">打开</button>
+        </article>
+        <article class="material-item">
+          <strong>感冒院 v0.1 PRD</strong>
+          <span>DOCX · 梳理导入、整理、搜索与上下文生成流程。</span>
+          <button class="ghost-btn" type="button" data-action="show-toast" data-message="已请求打开 感冒院 v0.1 PRD">打开</button>
+        </article>
+        <article class="material-item">
+          <strong>用户工作流分析 v0.1</strong>
+          <span>PDF · 记录每天打开、继续、收工与第二天恢复路径。</span>
+          <button class="ghost-btn" type="button" data-action="show-toast" data-message="已请求打开 用户工作流分析 v0.1">打开</button>
+        </article>
+        <article class="material-item">
+          <strong>UI/UX 设计任务书</strong>
+          <span>Markdown · 约束本轮只收敛导航，不扩展正式功能页面。</span>
+          <button class="ghost-btn" type="button" data-action="show-toast" data-message="已请求打开 UI/UX 设计任务书">打开</button>
+        </article>
+      </div>
+    </aside>
+
+    <aside class="utility-drawer" data-utility-drawer aria-hidden="true" data-od-id="utility-drawer">
+      <div class="panel-head">
+        <div>
+          <span class="eyebrow" data-utility-eyebrow>菜单项</span>
+          <h2 data-utility-title>辅助功能</h2>
+        </div>
+        <button class="icon-btn" type="button" data-action="close-utility-drawer" aria-label="关闭抽屉">×</button>
+      </div>
+      <div class="utility-body" data-utility-body></div>
+      <div class="drawer-actions" data-utility-actions></div>
+    </aside>
+
+    <aside class="wrap-panel" data-wrap-panel aria-hidden="true" data-od-id="daily-wrap-panel">
+      <div class="panel-head">
+        <div>
+          <span class="eyebrow">今日收工</span>
+          <h2>保存恢复点</h2>
+        </div>
+        <button class="icon-btn" type="button" data-action="close-wrap-panel" aria-label="关闭收工面板">×</button>
+      </div>
+      <label class="wrap-field">
+        <span>今天完成了什么？</span>
+        <textarea rows="4">统一正式页面只保留三页，并开始清理旧页面入口与不稳定菜单行为。</textarea>
+      </label>
+      <label class="wrap-field">
+        <span>下一步是什么？</span>
+        <textarea rows="3">继续把旧页面全部收成兼容入口，确保任何关闭弹层后都能回到当前工作。</textarea>
+      </label>
+      <label class="switch-line">
+        <input type="checkbox" checked />
+        <span>保存当前任务、工作记录和相关资料为恢复点</span>
+      </label>
+      <div class="drawer-actions">
+        <button class="ghost-btn" type="button" data-action="close-wrap-panel">继续工作</button>
+        <button class="btn btn-primary" type="button" data-action="finish-day">确认收工</button>
+      </div>
+    </aside>
+
+    <div class="command-palette" data-command-palette aria-hidden="true">
+      <div class="command-card">
+        <div class="command-search">
+          <span>⌘</span>
+          <input type="text" placeholder="输入命令..." data-command-input />
+          <kbd>Esc</kbd>
+        </div>
+        <div class="command-list" data-command-list>
+          <button class="command-item active" type="button" data-action="open-utility-drawer" data-utility-kind="switch-project"><strong>切换项目</strong><span>查看最近项目并切换</span></button>
+          <button class="command-item" type="button" data-action="open-utility-drawer" data-utility-kind="inbox"><strong>待整理资料</strong><span>处理低置信度结果与失败项</span></button>
+          <button class="command-item" type="button" data-action="open-utility-drawer" data-utility-kind="library"><strong>全部资料</strong><span>查看当前任务相关资料入口</span></button>
+          <button class="command-item" type="button" data-action="open-utility-drawer" data-utility-kind="memory"><strong>项目记忆</strong><span>查看最近决策与恢复点</span></button>
+          <button class="command-item" type="button" data-action="open-utility-drawer" data-utility-kind="search"><strong>搜索资料</strong><span>打开最近搜索与命中摘要</span></button>
+          <button class="command-item" type="button" data-action="open-quick-record"><strong>快速记录</strong><span>记录想法、决定、待办或问题</span></button>
+          <button class="command-item" type="button" data-action="open-utility-drawer" data-utility-kind="ai-context"><strong>AI 上下文</strong><span>生成给 OpenDesign / Codex 的上下文</span></button>
+          <button class="command-item" type="button" data-action="open-wrap-panel"><strong>今日收工</strong><span>保存恢复点并生成下一步</span></button>
+          <a class="command-item" href="settings.html"><strong>打开设置</strong><span>项目管理、文件索引、AI、外观与安全</span></a>
+        </div>
+      </div>
+    </div>
+
+    <div class="quick-record" data-quick-record aria-hidden="true">
+      <div class="record-card">
+        <div class="record-head">
+          <h3>快速记录</h3>
+          <button class="icon-btn" type="button" data-action="close-quick-record" aria-label="关闭">×</button>
+        </div>
+        <textarea placeholder="记录想法、决定、问题或下一步……" rows="6"></textarea>
+        <div class="record-actions">
+          <button class="ghost-btn" type="button" data-action="close-quick-record">取消</button>
+          <button class="btn btn-primary" type="button" data-action="save-record">保存并继续工作</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" data-toast><span data-toast-text>操作已记录</span></div>
+    <script src="assets/app.js"></script>
+  </body>
+</html>
