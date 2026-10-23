@@ -131,6 +131,7 @@ jobs:
             -EvidenceDirectory (Join-Path $releaseDir "validation-evidence") `
             -ExpectedSha256 $record.installerSha256 `
             -ExpectedAppSha256 $record.appSha256 `
+            -ExpectedAppPath $appArtifact `
             -ExpectedVersion $record.version `
             -BaselineInstallerPath (Join-Path $env:RUNNER_TEMP "Ganmaoyuan_0.1.1_x64-setup.exe") `
             -ExpectedBaselineSha256 "05D32A3D2E90D4F86740494561DF0CF4804A2E3C15DB0F45E55E731CA80622BC"

@@ -8,6 +8,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ExpectedAppSha256,
     [Parameter(Mandatory = $true)]
+    [string]$ExpectedAppPath,
+    [Parameter(Mandatory = $true)]
     [string]$ExpectedVersion,
     [Parameter(Mandatory = $true)]
     [string]$BaselineInstallerPath,
@@ -26,13 +28,16 @@ if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSp
 $runnerTemp = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
 $installer = [System.IO.Path]::GetFullPath($InstallerPath)
 $baselineInstaller = [System.IO.Path]::GetFullPath($BaselineInstallerPath)
+$expectedApp = [System.IO.Path]::GetFullPath($ExpectedAppPath)
 $evidenceRoot = [System.IO.Path]::GetFullPath($EvidenceDirectory)
 if (-not $installer.StartsWith($runnerTemp + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
-    -not $baselineInstaller.StartsWith($runnerTemp + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+    -not $baselineInstaller.StartsWith($runnerTemp + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+    -not $expectedApp.StartsWith($runnerTemp + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "待验收安装包必须位于临时 Runner 目录内。"
 }
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $baselineInstaller -PathType Leaf)) {
+    -not (Test-Path -LiteralPath $baselineInstaller -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $expectedApp -PathType Leaf)) {
     throw "找不到待验收安装包。"
 }
 if (-not $evidenceRoot.StartsWith($runnerTemp + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -200,10 +205,15 @@ try {
     Invoke-Installer "collision-install" @("/D=$installRoot") | Out-Null
     $installedApp = Join-Path $installRoot "app.exe"
     Add-Check "application installed" (Test-Path -LiteralPath $installedApp -PathType Leaf)
+    $expectedAppHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $expectedApp).Hash.ToUpperInvariant()
     $installedAppHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installedApp).Hash.ToUpperInvariant()
     $installedAppItem = Get-Item -LiteralPath $installedApp
     $installedAppVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($installedApp)
-    $appHashDetail = "expected=$($ExpectedAppSha256.ToUpperInvariant()); actual=$installedAppHash; size=$($installedAppItem.Length); fileVersion=$($installedAppVersion.FileVersion); productVersion=$($installedAppVersion.ProductVersion); path=$installedApp"
+    $expectedAppCopy = Join-Path $evidenceRoot "expected-build-app.exe"
+    $installedAppCopy = Join-Path $evidenceRoot "installed-app.exe"
+    Copy-Item -LiteralPath $expectedApp -Destination $expectedAppCopy -Force
+    Copy-Item -LiteralPath $installedApp -Destination $installedAppCopy -Force
+    $appHashDetail = "expected=$($ExpectedAppSha256.ToUpperInvariant()); artifact=$expectedAppHash; actual=$installedAppHash; size=$($installedAppItem.Length); fileVersion=$($installedAppVersion.FileVersion); productVersion=$($installedAppVersion.ProductVersion); expectedPath=$expectedApp; installedPath=$installedApp"
     Add-Check "installed application matches build provenance" ($installedAppHash -eq $ExpectedAppSha256.ToUpperInvariant()) $appHashDetail
     $installRegistryKey = Get-TestInstallRegistryKey
     Add-Check "isolated install registry entry found" ($null -ne $installRegistryKey) "The test must only modify the registry entry owned by this temporary installation."
