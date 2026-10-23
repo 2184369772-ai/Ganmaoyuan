@@ -200,7 +200,11 @@ try {
     Invoke-Installer "collision-install" @("/D=$installRoot") | Out-Null
     $installedApp = Join-Path $installRoot "app.exe"
     Add-Check "application installed" (Test-Path -LiteralPath $installedApp -PathType Leaf)
-    Add-Check "installed application matches build provenance" ((Get-FileHash -Algorithm SHA256 -LiteralPath $installedApp).Hash.ToUpperInvariant() -eq $ExpectedAppSha256.ToUpperInvariant())
+    $installedAppHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installedApp).Hash.ToUpperInvariant()
+    $installedAppItem = Get-Item -LiteralPath $installedApp
+    $installedAppVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($installedApp)
+    $appHashDetail = "expected=$($ExpectedAppSha256.ToUpperInvariant()); actual=$installedAppHash; size=$($installedAppItem.Length); fileVersion=$($installedAppVersion.FileVersion); productVersion=$($installedAppVersion.ProductVersion); path=$installedApp"
+    Add-Check "installed application matches build provenance" ($installedAppHash -eq $ExpectedAppSha256.ToUpperInvariant()) $appHashDetail
     $installRegistryKey = Get-TestInstallRegistryKey
     Add-Check "isolated install registry entry found" ($null -ne $installRegistryKey) "The test must only modify the registry entry owned by this temporary installation."
     foreach ($item in @(
